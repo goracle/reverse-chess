@@ -1,0 +1,4 @@
+pygame
+numpy
+pyautogui
+pygad  # optional, only needed for GENETICS mode
