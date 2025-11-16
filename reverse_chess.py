@@ -10,7 +10,7 @@ import numpy as np
 from tkinter import *
 from tkinter import messagebox
 import tkinter
-Tk().wm_withdraw() #to hide the main window
+#Tk().wm_withdraw() #to hide the main window
 
 import os
 os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
