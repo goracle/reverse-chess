@@ -60,7 +60,7 @@ The rules are simple...ish.
 
 * Blind Alley Rules - The game is programmed to avoid (some) common blind alleys, which are immediate impossible situations you could place your opponent in.  It will not let you do that, usually.  For instance, you cannot give your opponent a column of pawns such that they automatically lose.
 
-* Strategy * - You are trying to force your opponent to make a mistake and trap themselves (leading to a loss) or to clutter the board.
+* Strategy - You are trying to force your opponent to make a mistake and trap themselves (leading to a loss) or to clutter the board.
 
 ## Contributing
 
