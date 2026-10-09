@@ -119,12 +119,14 @@ class Rules:
     """Tunable rule switches.
 
     win_requires_all_pieces_on_board
-        False (current behaviour of the original code): a team wins when every
-        piece *that is on the board* is home.  True (what the README and the
-        old, unused ``check_winning`` describe): both teams must also have
-        every piece on the board, i.e. the full starting position is restored.
-        With False, black can win in three king moves; flip this to True
-        before training a network.
+        False (the intended rule, and the default): a team wins when every
+        piece *currently on the board* is home.  Gifts are the weapon: a piece
+        given back to the opponent joins *their* to-do list (it must now get
+        home too), so the opening is a tempo race.  E.g. black's king can walk
+        home in three moves, and the defender's answer is to gift black a
+        piece in reply.  True is a stricter experimental variant (everything,
+        both teams, must be back on the board and home); it is not the
+        game as designed.
     fifty_move_limit
         Draw after this many consecutive plies with no gift and no pawn move.
     repetition_limit
