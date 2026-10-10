@@ -14,6 +14,7 @@ import random
 import sys
 import time
 
+import engine
 from engine import Game, Rules
 
 GOLDEN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden_engine.txt")
@@ -35,6 +36,10 @@ def replay():
 
 
 if __name__ == "__main__":
+    print("backend: %s" % ("native (Rust)" if engine.NATIVE else "pure Python"))
+    if "--record" in sys.argv and engine.NATIVE:
+        sys.exit("refusing to --record with the native backend: the golden record must "
+                 "come from the Python reference.  Run:  RC_ENGINE=py python check_engine.py --record")
     t = time.time()
     lines = replay()
     took = time.time() - t

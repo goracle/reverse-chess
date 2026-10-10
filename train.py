@@ -45,7 +45,9 @@ for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
 import argparse
 import csv
 import faulthandler
+import glob
 import signal
+import sys
 import multiprocessing as mp
 import time
 from collections import Counter
@@ -57,6 +59,25 @@ import torch
 import net as netlib
 import returns
 import rollout
+
+# ---- terminal colours (off when piped, or when NO_COLOR is set) -------------
+_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+
+
+def _c(code, text):
+    return "\033[%sm%s\033[0m" % (code, text) if _COLOR else str(text)
+
+
+def _health(text, value, good, ok, higher_better=False):
+    """Green / yellow / red by rule-of-thumb thresholds; dim if value is nan."""
+    if value != value:
+        return _c("2", text)
+    if not higher_better:
+        code = "32" if value <= good else "33" if value <= ok else "31"
+    else:
+        code = "32" if value >= good else "33" if value >= ok else "31"
+    return _c(code, text)
+
 
 
 # --------------------------------------------------------------------------
@@ -87,6 +108,9 @@ def assemble(games, draw_value, shape_coef=0.0, gamma=1.0, gae_lambda=1.0):
         "value": np.concatenate([g["value"] for g in games]),
         "ret": np.concatenate(rets),
         "adv": np.concatenate(advs),
+        # how far through its game each decision was (0 = first move, 1 = last); diagnostics only
+        "phase": np.concatenate([np.arange(len(g["player"])) / max(len(g["player"]) - 1, 1)
+                                 for g in games]).astype(np.float32),
     }
 
 
@@ -127,14 +151,15 @@ def collate(data, adv, mb, device):
     }
 
 
-def per_decision_logp(logits, owner, counts):
+def per_decision_logp(logits, owner, counts, amax=None):
     """Log-softmax of the flat legal-action logits within each decision.
 
     Returns ``(logp (B, Amax), mask (B, Amax))``; padded slots hold a huge
     negative number and are False in the mask.
     """
     b = counts.shape[0]
-    amax = int(counts.max())
+    if amax is None:
+        amax = int(counts.max())          # GPU->CPU sync; callers should pass amax
     offsets = torch.cumsum(counts, 0) - counts
     rank = torch.arange(owner.shape[0], device=owner.device) - offsets[owner]
     padded = torch.full((b, amax), -1e9, device=logits.device, dtype=logits.dtype)
@@ -151,41 +176,62 @@ def ppo_update(model, opt, data, args, device, rng):
     """A few epochs of PPO on one iteration's data; returns averaged statistics."""
     adv = data["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    stats = {k: [] for k in ("pg", "vf", "ent", "kl", "clipfrac")}
+    names = ("pg", "vf", "ent", "kl", "clipfrac")
+    stats = {k: [] for k in names}
+    prev = None          # previous step's stats, still on the device
+
+    def read(t):
+        """Copy one step's stats to the host (waits for that step); returns its kl."""
+        vals = t.tolist()
+        for k, v in zip(names, vals):
+            stats[k].append(v)
+        return vals[3]
+
     stop = False
     for _ in range(args.epochs):
         for mb in make_batches(data["counts"], args.minibatch, args.max_actions, rng):
-            b = collate(data, adv, mb, device)
-            logits, value = model(b["board"], b["scalars"], b["owner"], b["comps"])
-            logp_all, mask = per_decision_logp(logits, b["owner"], b["counts"])
-            rows = torch.arange(len(mb), device=device)
-            logp = logp_all[rows, b["chosen"]]
+            amax = int(data["counts"][mb].max())      # host-side, so no GPU sync
+            b = collate(data, adv, mb, device)        # CPU work; overlaps the GPU still busy with the previous step
+            if prev is not None:
+                kl = read(prev)
+                prev = None
+                if kl > 1.5 * args.target_kl:         # policy moved too far; stop this iteration
+                    stop = True
+                    break
+            try:
+                logits, value = model(b["board"], b["scalars"], b["owner"], b["comps"])
+                logp_all, mask = per_decision_logp(logits, b["owner"], b["counts"], amax)
+                rows = torch.arange(len(mb), device=device)
+                logp = logp_all[rows, b["chosen"]]
 
-            ratio = torch.exp(logp - b["old_logp"])
-            clipped = torch.clamp(ratio, 1 - args.clip, 1 + args.clip)
-            pg_loss = -torch.min(ratio * b["adv"], clipped * b["adv"]).mean()
-            vf_loss = torch.mean((value - b["ret"]) ** 2)
-            probs = logp_all.exp()                       # exactly 0 in padded slots
-            entropy = -(probs * logp_all.masked_fill(~mask, 0.0)).sum(1).mean()
-            loss = pg_loss + args.vf_coef * vf_loss - args.ent_coef * entropy
+                ratio = torch.exp(logp - b["old_logp"])
+                clipped = torch.clamp(ratio, 1 - args.clip, 1 + args.clip)
+                pg_loss = -torch.min(ratio * b["adv"], clipped * b["adv"]).mean()
+                vf_loss = torch.mean((value - b["ret"]) ** 2)
+                probs = logp_all.exp()                       # exactly 0 in padded slots
+                entropy = -(probs * logp_all.masked_fill(~mask, 0.0)).sum(1).mean()
+                loss = pg_loss + args.vf_coef * vf_loss - args.ent_coef * entropy
 
-            opt.zero_grad(set_to_none=True)
-            loss.backward()
+                opt.zero_grad(set_to_none=True)
+                loss.backward()
+            except RuntimeError as e:      # still raises; just says which shapes were involved
+                print("\n!! %s on a minibatch of %d decisions, %d actions, amax %d: %s"
+                      % (device, len(mb), b["owner"].shape[0], amax, str(e).splitlines()[0]), flush=True)
+                raise
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
 
-            with torch.no_grad():
-                kl = float((b["old_logp"] - logp).mean())
-                stats["pg"].append(float(pg_loss))
-                stats["vf"].append(float(vf_loss))
-                stats["ent"].append(float(entropy))
-                stats["kl"].append(kl)
-                stats["clipfrac"].append(float(((ratio - 1).abs() > args.clip).float().mean()))
-            if kl > 1.5 * args.target_kl:     # policy moved too far; stop this iteration
-                stop = True
-                break
+            with torch.no_grad():                     # stays on the device; read next time round
+                prev = torch.stack([
+                    pg_loss.detach(), vf_loss.detach(), entropy.detach(),
+                    (b["old_logp"] - logp).mean(),
+                    # == ((ratio - 1).abs() > clip).float().mean(), but pure float arithmetic:
+                    # the bool -> float cast raises UR_RESULT_ERROR_INVALID_ARGUMENT on Iris Xe.
+                    ((ratio - 1).abs() - args.clip).sign().clamp(min=0).mean()])
         if stop:
             break
+    if prev is not None:
+        read(prev)
     return {k: float(np.mean(v)) for k, v in stats.items()}
 
 
@@ -225,6 +271,13 @@ def parse_args():
     g.add_argument("--draw-value", type=float, default=0.0,
                    help="reward for a draw (try -0.1 if games keep drawing)")
     g.add_argument("--max-stale", type=int, default=2)
+    g.add_argument("--pool-power", type=float, default=2.0,
+                   help="how strongly to favour the older snapshots that beat the current net "
+                        "(0 = pick uniformly, 2 = default, higher = focus harder on the toughest)")
+    g.add_argument("--pool-frac", type=float, default=0.25,
+                   help="fraction of games played against a random older iter_*.pt snapshot "
+                        "instead of the current net (stops self-play from cycling; "
+                        "0 = pure self-play, the old behaviour)")
     g.add_argument("--shape-coef", type=float, default=0.0,
                    help="weight of potential-based progress shaping (0 = off; try 1.0 with "
                         "--gae-lambda 0.95).  See returns.py for why this is safe.")
@@ -269,11 +322,36 @@ def parse_args():
     return args
 
 
+POOL_SCORE = {}   # snapshot path -> (decayed score sum, decayed game count): current net vs that snapshot
+
+
+def _pool_weights(snaps, power):
+    """Sampling weights over snapshots: the ones that beat the current net get picked more.
+    power=0 -> uniform.  Snapshots with few games are treated as 0.5 (an even match)."""
+    w = []
+    for p in snaps:
+        sc, c = POOL_SCORE.get(p, (0.0, 0.0))
+        s = (sc + 1.0) / (c + 2.0)
+        w.append((1.0 - s) ** power + 0.05)           # the 0.05 floor keeps every snapshot in play
+    w = np.asarray(w)
+    return w / w.sum()
+
+
 def top_up(pending, pool, args, next_seed):
     """Keep ``queue_factor * workers`` self-play games outstanding (running, queued
     or finished-but-not-yet-used), so every worker stays fed while the learner trains."""
+    snaps = (sorted(glob.glob(os.path.join("runs", args.name, "iter_*.pt")))
+             if args.pool_frac > 0 else [])
+    weights = _pool_weights(snaps, args.pool_power) if snaps else None
     while len(pending) < args.queue_factor * args.workers:
-        pending.append(pool.submit(rollout.selfplay_task, next_seed()))
+        seed = next_seed()
+        pick = np.random.default_rng(seed + 1)               # picks opponent and colour
+        if snaps and pick.random() < args.pool_frac:
+            pending.append(pool.submit(rollout.selfplay_task, seed,
+                                       snaps[int(pick.choice(len(snaps), p=weights))],
+                                       "b" if pick.random() < 0.5 else "w"))
+        else:
+            pending.append(pool.submit(rollout.selfplay_task, seed))
 
 
 def run_eval(pool, args, next_seed):
@@ -363,8 +441,8 @@ def main():
             # without this the queue is already partly drained when learning starts.
             top_up(pending, pool, args, next_seed)
             t_collect = time.time() - t0
-            print("      collected %d games / %d plies in %.0fs; learning on %s ..."
-                  % (len(games), plies, t_collect, device), flush=True)
+            print(_c("2", "      collected %d games / %d plies in %.0fs; learning on %s ..."
+                     % (len(games), plies, t_collect, device)), flush=True)
 
             # ---- learn ---------------------------------------------------
             t1 = time.time()
@@ -380,7 +458,9 @@ def main():
 
             # ---- report ---------------------------------------------------
             n = len(games)
-            winners = Counter(g["winner"] or "draw" for g in games)
+            winners = Counter(g["winner"] or "draw" for g in games if not g["opp"])
+            vs_past = [g for g in games if g["opp"]]
+            avg_plies = sum(g["plies"] for g in games) / n
             reasons = Counter(g["reason"][:64] for g in games)
             ret_var = float(np.var(data["ret"]))
             expl_var = (1 - float(np.var(data["ret"] - data["value"])) / ret_var
@@ -388,7 +468,7 @@ def main():
             row = {
                 "version": version, "games": n, "plies": plies, "stale": stale,
                 "black": winners["b"], "white": winners["w"], "draw": winners["draw"],
-                "avg_plies": round(plies / n, 1),
+                "avg_plies": round(avg_plies, 1),
                 "avg_legal": round(float(data["counts"].mean()), 1),
                 "plies_per_s": round(plies / max(t_collect, 1e-9), 1),
                 **{k: round(v, 5) for k, v in stats.items()},
@@ -396,20 +476,52 @@ def main():
                 "collect_s": round(t_collect, 1), "learn_s": round(t_learn, 1),
                 "elapsed_min": round((time.time() - t_start) / 60, 1),
             }
-            print("v%-4d %3d games %5d plies (b %d w %d d %d, avg %.0f plies, %.0f legal) | "
-                  "%.0f plies/s | pg %+.3f vf %.3f ent %.2f kl %.4f clip %.2f ev %.2f | "
-                  "collect %.0fs learn %.0fs%s"
-                  % (version, n, plies, winners["b"], winners["w"], winners["draw"],
-                     plies / n, data["counts"].mean(), plies / max(t_collect, 1e-9),
-                     stats["pg"], stats["vf"], stats["ent"], stats["kl"],
-                     stats["clipfrac"], expl_var, t_collect, t_learn,
-                     ("  [%d stale dropped]" % stale) if stale else ""), flush=True)
-            print("      ended by:", dict(reasons.most_common(8)), flush=True)
+            print(
+                _c("1;37", "v%-4d" % version) + " "
+                + _c("1", "%3d games %5d plies" % (n, plies)) + " ("
+                + _c("94", "b %d" % winners["b"]) + " "
+                + _c("93", "w %d" % winners["w"]) + " "
+                + _c("90", "d %d" % winners["draw"])
+                + ", avg %.0f plies, %.0f legal) | " % (avg_plies, data["counts"].mean())
+                + _c("36", "%.0f plies/s" % (plies / max(t_collect, 1e-9))) + " | "
+                + _c("2", "pg") + " %+.3f " % stats["pg"]
+                + _c("2", "vf") + " %.3f " % stats["vf"]
+                + _c("2", "ent") + " " + _health("%.2f" % stats["ent"], stats["ent"], 0.3, 0.1, True) + " "
+                + _c("2", "kl") + " " + _health("%.4f" % stats["kl"], stats["kl"], 0.03, 0.045) + " "
+                + _c("2", "clip") + " " + _health("%.2f" % stats["clipfrac"], stats["clipfrac"], 0.25, 0.4) + " "
+                + _c("2", "ev") + " " + _health("%.2f" % expl_var, expl_var, 0.5, 0.2, True) + " | "
+                + _c("36", "collect %.0fs learn %.0fs" % (t_collect, t_learn))
+                + ((_c("33", "  [%d stale dropped]" % stale)) if stale else ""),
+                flush=True)
+            print(_c("2", "      ended by: %s" % dict(reasons.most_common(8))), flush=True)
+            if vs_past:
+                for g in vs_past:                     # remember how the current net does against each snapshot
+                    s = 1.0 if g["winner"] == g["net_team"] else 0.5 if g["winner"] is None else 0.0
+                    sc, c = POOL_SCORE.get(g["opp"], (0.0, 0.0))
+                    POOL_SCORE[g["opp"]] = (sc * 0.97 + s, c * 0.97 + 1.0)   # recent games count more
+                pw = sum(g["winner"] == g["net_team"] for g in vs_past)
+                pd = sum(g["winner"] is None for g in vs_past)
+                hard = sorted(((sc + 1) / (c + 2), p) for p, (sc, c) in POOL_SCORE.items() if c >= 3)[:3]
+                print(_c("2", "      vs older snapshots (%d games): " % len(vs_past))
+                      + _c("36", "+%d =%d -%d" % (pw, pd, len(vs_past) - pw - pd))
+                      + _c("2", "   toughest: " + ", ".join("v%d %.2f" % (int(os.path.basename(p)[5:10]), s)
+                                                           for s, p in hard)), flush=True)
+            # ev split by how far through the game the decision was: if the value head works,
+            # the last bucket (outcome nearly decided) should be much higher than the first.
+            err = data["ret"] - data["value"]
+            parts = []
+            for lo, hi, label in ((0, .33, "first third"), (.33, .66, "middle"),
+                                  (.66, .9, "late"), (.9, 1.01, "last 10%")):
+                m = (data["phase"] >= lo) & (data["phase"] < hi)
+                v = float(np.var(data["ret"][m])) if m.any() else 0.0
+                e = 1 - float(np.var(err[m])) / v if v > 1e-8 else float("nan")
+                parts.append("%s %s" % (label, _health("%.2f" % e, e, 0.5, 0.2, True)))
+            print(_c("2", "      ev by game phase: ") + _c("2", " | ").join(parts), flush=True)
 
             if args.eval_every and version % args.eval_every == 0:
                 w, d, l, score, ev = run_eval(pool, args, next_seed)
-                print("      EVAL v%d vs random: +%d =%d -%d  score %.3f"
-                      % (ev, w, d, l, score), flush=True)
+                print(_c("1;35", "      EVAL v%d vs random: +%d =%d -%d  score %.3f"
+                         % (ev, w, d, l, score)), flush=True)
                 row.update(eval_score=round(score, 3), eval_w=w, eval_d=d, eval_l=l)
 
             if writer is None:

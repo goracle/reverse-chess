@@ -46,6 +46,19 @@ def _current_model():
     return _STATE["model"], _STATE["version"]
 
 
+_OPP = {}      # snapshot path -> model; small LRU so a worker never holds many old nets
+
+
+def _opponent_model(path):
+    model = _OPP.pop(path, None)
+    if model is None:
+        model, _ = netlib.load_checkpoint(path)
+    _OPP[path] = model                       # most recently used goes last
+    while len(_OPP) > 6:
+        _OPP.pop(next(iter(_OPP)))
+    return model
+
+
 class _Recorder:
     """Collects one game's decisions."""
 
@@ -85,20 +98,32 @@ class _Recorder:
         }
 
 
-def selfplay_task(seed: int) -> dict:
-    """Play one game, the current network against itself, sampling its policy."""
+def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
+    """Play one game with the current network, sampling its policy.
+
+    With ``opp_path=None`` the current network plays itself and every decision is
+    recorded.  With a snapshot path, the current network plays ``net_team`` against
+    that older network; only the current network's decisions are recorded (the
+    learner must not train on moves it did not make).
+    """
     model, version = _current_model()
+    opp = _opponent_model(opp_path) if opp_path else None
     rng = np.random.default_rng(seed)
     game = Game(_STATE["rules"])
     rec = _Recorder()
     start = time.time()
     while not game.done:
         team = game.turn
-        phi = potential(game, team)
-        action, sample = netlib.choose_action(model, game, rng)
-        rec.add(team, sample, phi)
+        if opp is not None and team != net_team:
+            action, _ = netlib.choose_action(opp, game, rng)          # not recorded
+        else:
+            phi = potential(game, team)
+            action, sample = netlib.choose_action(model, game, rng)
+            rec.add(team, sample, phi)
         game.step(action)
     result = rec.finish(game, version, time.time() - start)
+    result["opp"] = opp_path                                  # None = plain self-play
+    result["net_team"] = net_team if opp_path else None
     game.close()                  # see Game.close: otherwise every game leaks
     return result
 
