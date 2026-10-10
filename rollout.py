@@ -98,7 +98,9 @@ def selfplay_task(seed: int) -> dict:
         action, sample = netlib.choose_action(model, game, rng)
         rec.add(team, sample, phi)
         game.step(action)
-    return rec.finish(game, version, time.time() - start)
+    result = rec.finish(game, version, time.time() - start)
+    game.close()                  # see Game.close: otherwise every game leaks
+    return result
 
 
 def eval_task(seed: int, net_team: str) -> dict:
@@ -114,5 +116,7 @@ def eval_task(seed: int, net_team: str) -> dict:
             actions = game.legal_actions()
             action = actions[int(rng.integers(len(actions)))]
         game.step(action)
-    return {"net_team": net_team, "winner": game.winner, "plies": game.ply,
-            "version": version, "reason": game.end_reason}
+    result = {"net_team": net_team, "winner": game.winner, "plies": game.ply,
+              "version": version, "reason": game.end_reason}
+    game.close()
+    return result

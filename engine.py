@@ -424,6 +424,19 @@ class Game:
         self.actions: Dict[Action, Move] = {}
         self._begin_turn()
 
+    def close(self):
+        """Break the Game <-> Piece reference cycle so the game can be freed.
+
+        ``self.board`` is a numpy object array holding Pieces, and every Piece
+        holds ``.game``.  numpy arrays are invisible to Python's cycle
+        collector, so without this the Game (and its move cache, Move/Action
+        objects, ...) is never reclaimed.  Call it when a game is finished
+        with; the Game must not be used afterwards.
+        """
+        self.board.fill(None)
+        self._moves_cache.clear()
+        self.actions = {}
+
     @staticmethod
     def _home_of(team: str, ptype: str):
         """(rows, cols) of the squares where a piece of this type is home."""
