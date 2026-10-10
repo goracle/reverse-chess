@@ -52,6 +52,48 @@ MOVE_CACHE_LIMIT = 250_000              # entries; the cache is flushed when ful
 
 _PTYPE_INDEX = {ptype: i for i, ptype in enumerate(PTYPES)}
 
+_KNIGHT_STEPS = ((1, 2), (2, 1), (-1, 2), (-2, 1), (1, -2), (2, -1), (-1, -2), (-2, -1))
+_KING_STEPS = ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (1, -1), (-1, 1), (-1, -1))
+_RAYS = tuple((dr, dc, ("r", "q")) for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1))) + \
+        tuple((dr, dc, ("b", "q")) for dr, dc in ((1, 1), (1, -1), (-1, 1), (-1, -1)))
+
+_GEOM_CACHE: Dict[tuple, tuple] = {}
+
+
+def _geom_dsts(ptype: str, team: str, src: Tuple[int, int]) -> tuple:
+    """Squares a piece of this type *could* reach from ``src`` by geometry alone
+    (ignoring blockers, checks and gifts).  A superset of what check_legal_move()
+    can accept, so move generation tests ~10 squares instead of all 64.
+    Pure function of its arguments, so it is memoised forever."""
+    key = (ptype, team, src)
+    hit = _GEOM_CACHE.get(key)
+    if hit is not None:
+        return hit
+    sr, sc = src
+    out = set()
+    for r in range(SIZE):
+        for c in range(SIZE):
+            dr, dc = r - sr, c - sc
+            if dr == 0 and dc == 0:
+                continue
+            if ptype == "k":
+                ok = max(abs(dr), abs(dc)) == 1 or (sr == r == back_row(team))  # + reverse castle
+            elif ptype == "r":
+                ok = dr == 0 or dc == 0
+            elif ptype == "n":
+                ok = (abs(dr), abs(dc)) in ((1, 2), (2, 1))
+            elif ptype == "q":
+                ok = dr == 0 or dc == 0 or abs(dr) == abs(dc)
+            elif ptype == "b":
+                ok = abs(dr) == abs(dc)
+            else:  # pawn
+                ok = dr == pawn_step(team) and abs(dc) <= 1
+            if ok:
+                out.add((r, c))
+    _GEOM_CACHE[key] = res = tuple(sorted(out))
+    return res
+_PIECE_NAMES = {"p": "pawn", "k": "king", "r": "rook", "b": "bishop", "q": "queen", "n": "knight"}
+
 
 # --------------------------------------------------------------------------
 # Small geometry helpers
@@ -343,6 +385,7 @@ class Game:
     def __init__(self, rules: Optional[Rules] = None):
         self.rules = rules or Rules()
         self._moves_cache: dict = {}
+        self._witness: dict = {}          # team -> (piece index, dst) that last proved it could move
         self.reset()
 
     # ------------------------------------------------------------------
@@ -353,6 +396,7 @@ class Game:
         self.board = np.full((SIZE, SIZE), None, dtype=object)
         self._snap: Optional[bytes] = None
         self._moves_cache.clear()
+        self._witness.clear()
         self.pieces: Dict[str, List[Piece]] = {}
         self.kings: Dict[str, Piece] = {}
         uid = 0
@@ -568,29 +612,78 @@ class Game:
                 return src == rook.pos and dst == (back, rook_home)
         return False
 
+    def _team_attacks(self, team: str, target: Pos) -> bool:
+        """Does any on-board piece of ``team`` attack ``target`` (an occupied
+        square, normally the enemy king)?  Looks outward from the target along
+        its rays instead of asking every piece, which is much cheaper.
+        Same attack rules as check_attacking()."""
+        board = self.board
+        tr, tc = target
+        for dr, dc in _KNIGHT_STEPS:
+            r, c = tr + dr, tc + dc
+            if 0 <= r < SIZE and 0 <= c < SIZE:
+                p = board[r, c]
+                if p is not None and p.team == team and p.ptype == "n":
+                    return True
+        for dr, dc in _KING_STEPS:
+            r, c = tr + dr, tc + dc
+            if 0 <= r < SIZE and 0 <= c < SIZE:
+                p = board[r, c]
+                if p is not None and p.team == team and p.ptype == "k":
+                    return True
+        # a pawn attacks in the forward-chess direction (black down, white up)
+        pr = tr - (1 if team == "b" else -1)
+        if 0 <= pr < SIZE:
+            for pc in (tc - 1, tc + 1):
+                if 0 <= pc < SIZE:
+                    p = board[pr, pc]
+                    if p is not None and p.team == team and p.ptype == "p":
+                        return True
+        for dr, dc, kinds in _RAYS:
+            r, c = tr + dr, tc + dc
+            while 0 <= r < SIZE and 0 <= c < SIZE:
+                p = board[r, c]
+                if p is not None:
+                    if p.team == team and p.ptype in kinds:
+                        return True
+                    break
+                r += dr
+                c += dc
+        return False
+
     def _discovered_check(self, piece: Piece, dst: Pos, demote: bool) -> bool:
         """After moving ``piece`` to ``dst``, would any piece of its team attack
         the enemy king?  (True means the move is illegal.)"""
-        src, old_ptype, saved = piece.pos, piece.ptype, self._snap
-        piece.update(dst, ignore_lock=True)
-        if demote:
-            piece.demote()
+        board = self.board
+        src, old_ptype, old_promoted = piece.pos, piece.ptype, piece.promoted
+        # Hypothetical position, edited in place (no snapshot invalidation:
+        # everything is restored before returning).
+        board[src] = None
+        board[dst] = piece
+        if demote and piece.promoted:
+            piece.ptype, piece.promoted = "p", False
         try:
-            return any(self.attacking_king(p) for p in self.on_board(piece.team))
+            return self._team_attacks(piece.team, self.kings[other_team(piece.team)].pos)
         finally:
-            piece.update(src, ignore_lock=True)
-            if demote and piece.ptype != old_ptype:
-                piece.promote(old_ptype)
-            self._snap = saved  # the position is exactly restored
+            piece.ptype, piece.promoted = old_ptype, old_promoted
+            board[dst] = None
+            board[src] = piece
 
     def _king_pawn_ok(self, team: str, newpos: Optional[Pos]) -> bool:
         """No enemy pawn standing on its home row may attack ``team``'s king
         (at ``newpos`` if the king is the piece being moved)."""
-        target = newpos if newpos is not None else self.kings[team].pos
-        for p in self.pieces[other_team(team)]:
-            if (p.ontheboard and p.ptype == "p" and p.at_home()
-                    and self.check_attacking(p, target)):
-                return False
+        tr, tc = newpos if newpos is not None else self.kings[team].pos
+        enemy = other_team(team)
+        home = pawn_home_row(enemy)
+        # a home-row pawn attacks only the row one step ahead of it (forward-chess)
+        if tr != home + (1 if enemy == "b" else -1):
+            return True
+        board = self.board
+        for pc in (tc - 1, tc + 1):
+            if 0 <= pc < SIZE:
+                p = board[home, pc]
+                if p is not None and p.team == enemy and p.ptype == "p" and p.at_home():
+                    return False
         return True
 
     # ------------------------------------------------------------------
@@ -605,27 +698,33 @@ class Game:
         """
         if piece.locked or not piece.ontheboard:
             return []
-        key = (self.snapshot(), piece.uid)
-        cached = self._moves_cache.get(key)
-        if cached is not None:
-            return cached
+        key = None
+        if not first_only or self._snap is not None:   # fingerprinting costs more than a peek saves
+            key = (self.snapshot(), piece.uid)
+            cached = self._moves_cache.get(key)
+            if cached is not None:
+                return cached
         src = piece.pos
         can_demote = piece.promoted and src[0] == promotion_row(piece.team)
         found: List[MoveOption] = []
-        for r in range(SIZE):
-            for c in range(SIZE):
-                dst = (r, c)
-                if dst == src or self.board[r, c] is not None:
-                    continue
-                chk = self.check_legal_move(src, dst)
+        # Only squares reachable by geometry (same row-major order as the old
+        # 64-square scan, so the resulting action order is unchanged).
+        dsts = _geom_dsts(piece.ptype, piece.team, src)
+        if can_demote:
+            dsts = sorted(set(dsts) | set(_geom_dsts("p", piece.team, src)))
+        board = self.board
+        for dst in dsts:
+            if board[dst] is not None:
+                continue
+            chk = self.check_legal_move(src, dst)
+            if chk.legal:
+                found.append(MoveOption(dst, False, chk.forced_give, chk.reverse_castle))
+            if can_demote:
+                chk = self.check_legal_move(src, dst, as_pawn=True)
                 if chk.legal:
-                    found.append(MoveOption(dst, False, chk.forced_give, chk.reverse_castle))
-                if can_demote:
-                    chk = self.check_legal_move(src, dst, as_pawn=True)
-                    if chk.legal:
-                        found.append(MoveOption(dst, True, chk.forced_give, chk.reverse_castle))
-                if first_only and found:
-                    return found
+                    found.append(MoveOption(dst, True, chk.forced_give, chk.reverse_castle))
+            if first_only and found:
+                return found
         if len(self._moves_cache) >= MOVE_CACHE_LIMIT:
             self._moves_cache.clear()
         self._moves_cache[key] = found
@@ -633,7 +732,22 @@ class Game:
 
     def has_legal_move(self, team: str) -> bool:
         """Does ``team`` have at least one raw move?  (Stops at the first.)"""
-        return any(self.piece_moves(p, first_only=True) for p in self.on_board(team))
+        pieces = self.pieces[team]
+        # Consecutive positions are nearly identical, so the move that proved
+        # the team could move last time almost always still works: try it first.
+        w = self._witness.get(team)
+        if w is not None:
+            p = pieces[w[0]]
+            if p.ontheboard and not p.locked and self.check_legal_move(p.pos, w[1]).legal:
+                return True
+        for i, p in enumerate(pieces):
+            if p.ontheboard:
+                found = self.piece_moves(p, first_only=True)
+                if found:
+                    if not found[0].demote:
+                        self._witness[team] = (i, found[0].dst)
+                    return True
+        return False
 
     # ------------------------------------------------------------------
     # Gifts
@@ -670,13 +784,22 @@ class Game:
         return ok
 
     def _gift_legal_uncached(self, mover, src, dst, spawn, spawn_pos, promoting, memo) -> bool:
+        return self._gift_problem(mover, src, dst, spawn, spawn_pos, promoting, memo) is None
+
+    def _gift_problem(self, mover, src, dst, spawn, spawn_pos, promoting, memo) -> Optional[str]:
+        """Why giving back ``spawn`` on ``spawn_pos`` is illegal, or None if it is legal.
+
+        The text is a clause meant to follow "...because"; explain_illegal()
+        shows it to the player.
+        """
         gteam = spawn.team  # the team receiving the gift
+        gname = full_name(gteam).capitalize()
         if spawn.ontheboard:
-            return False
+            return "that piece is already on the board"
         if self.board[spawn_pos] is not None and spawn_pos != src:
-            return False
+            return "the square for the gift is occupied"
         if spawn.ptype == "b" and not self._bishop_colour_ok(gteam, spawn_pos):
-            return False  # a team's bishops must stay on opposite colours
+            return "a team's two bishops must stand on opposite-coloured squares"
 
         had_moves = memo.get(("had", gteam))
         if had_moves is None:
@@ -689,10 +812,10 @@ class Game:
         try:
             # A gift may not leave the receiving team with nothing to play.
             if had_moves and not self.has_legal_move(gteam):
-                return False
+                return "it would leave %s with no legal move" % gname
             # ... nor wall its bishops off from their home squares.
             if not self.bishop_wall_check(gteam):
-                return False
+                return "it would wall a %s bishop off from its home square" % gname
         finally:
             spawn.remove()
             mover.update(src, ignore_lock=True)
@@ -701,13 +824,14 @@ class Game:
         # Extra rules for a gifted pawn that stays a pawn.
         if spawn.ptype == "p" and not promoting:
             if not self._pawn_spawn_home_ok(spawn, spawn_pos, dst if mover.ptype == "k" else None):
-                return False  # would be a locked pawn attacking the enemy king
+                return ("the gifted pawn would stand on its home row attacking your king, "
+                        "and a home-row pawn can never give check")
             if not self.pawn_scan(gteam, spawn_pos):
-                return False  # the team's pawns could no longer all get home
+                return "%s's pawns could then no longer all reach their own home squares" % gname
             # Pawns are never given back on their own team's back row.
             if spawn_pos[0] == back_row(gteam):
-                return False
-        return True
+                return "pawns are never given back on their own back row"
+        return None
 
     def _bishop_colour_ok(self, team: str, spawn_pos: Pos) -> bool:
         """A new bishop must not share a square colour with the team's other one."""
@@ -864,6 +988,152 @@ class Game:
         finally:
             self._undo(move)
             self._snap = saved
+
+    # ------------------------------------------------------------------
+    # Teaching aid: why is this move not available?
+    # ------------------------------------------------------------------
+    def lock_reason(self, piece: Piece) -> str:
+        """Why a locked piece can never move."""
+        if piece.ptype == "p":
+            return "This pawn is on its home row, so it is locked: home pawns never move again."
+        return "This piece just reverse-castled, so it is locked on its home square."
+
+    def explain_illegal(self, src: Pos, dst: Pos) -> str:
+        """Plain-English reason the side to move cannot play ``src`` -> ``dst``.
+
+        Returns "" when some action from src to dst is in fact legal.  Slow
+        (it re-derives the legality of every gift), so call it only in
+        response to a user click, never inside search or training loops.
+        """
+        piece = self.board[src]
+        if piece is None:
+            return "There is no piece on that square."
+        if piece.team != self.turn:
+            return "That is not your piece."
+        if any(a.src == src and a.dst == dst for a in self.actions):
+            return ""
+        if piece.locked:
+            return self.lock_reason(piece)
+        if self.board[dst] is not None:
+            return ("That square is occupied. Nothing is ever captured in reverse chess, "
+                    "so you can only move to an empty square.")
+
+        # Step 1: is the bare movement (ignoring gifts) legal at all?
+        can_demote = piece.promoted and src[0] == promotion_row(piece.team)
+        options: List[MoveOption] = []
+        plain = self.check_legal_move(src, dst)
+        if plain.legal:
+            options.append(MoveOption(dst, False, plain.forced_give, plain.reverse_castle))
+        pawn = None
+        if can_demote:
+            pawn = self.check_legal_move(src, dst, as_pawn=True)
+            if pawn.legal:
+                options.append(MoveOption(dst, True, pawn.forced_give, pawn.reverse_castle))
+        if not options:
+            why = self._movement_reason(piece, src, dst, plain, as_pawn=False)
+            if pawn is not None:
+                why += " (Stepping off as a pawn instead: %s)" % self._movement_reason(
+                    piece, src, dst, pawn, as_pawn=True)
+            return why
+
+        # Step 2: the movement is fine, so a gift rule or the stalemate rule must object.
+        offboard = self.offboard_by_type(other_team(piece.team))
+        memo: dict = {}
+        problems: Dict[str, List[Optional[str]]] = {}
+        for opt in options:
+            for action in self._candidate_actions(piece, opt, offboard):
+                label, why = self._action_problem(piece, opt, action, offboard, memo)
+                if why:
+                    labels = problems.setdefault(why, [])
+                    if label not in labels:
+                        labels.append(label)
+        if not problems:
+            return "That move is not available."
+        parts = []
+        for why, labels in problems.items():
+            bits = []
+            if None in labels:
+                bits.append("moving without a gift")
+            gifts = [lab for lab in labels if lab]
+            if gifts:
+                bits.append("giving back a " + "/".join(gifts))
+            parts.append("%s: %s" % (" or ".join(bits), why))
+        if all(opt.forced_give for opt in options):
+            head = "A diagonal pawn step must give a piece back, but no gift works here. "
+        else:
+            head = "That move is not available. "
+        return head + "; ".join(parts) + "."
+
+    def _movement_reason(self, piece: Piece, src: Pos, dst: Pos, chk: MoveCheck,
+                         as_pawn: bool) -> str:
+        """Explain a failed check_legal_move() in plain English."""
+        if chk.reason == "bad movement for piece type":
+            return self._shape_reason(piece, "p" if as_pawn else piece.ptype, src, dst)
+        return {
+            "piece(s) in the way": "Another piece is in the way (only knights jump).",
+            "would attack the enemy king": (
+                "That would leave one of your pieces attacking the enemy king. In reverse "
+                "chess that would mean their king had just walked into check, so it is illegal."),
+            "attacked by a pawn at home": (
+                "An enemy pawn standing on its home row attacks that square, and a home-row "
+                "pawn can never give check, so your king may not stand there."),
+            "reverse castle into check": (
+                "A king may not reverse-castle onto a square an enemy piece attacks."),
+        }.get(chk.reason, chk.reason or "That move is not available.")
+
+    def _shape_reason(self, piece: Piece, ptype: str, src: Pos, dst: Pos) -> str:
+        """Why src -> dst is the wrong geometry for ``ptype``."""
+        team = piece.team
+        if ptype == "n":
+            return "Knights move in an L: two squares one way and one square the other."
+        if ptype == "k":
+            return ("Kings move one square in any direction. The only longer move is a "
+                    "reverse castle: a lone king and rook on the back row, with the king "
+                    "on the c/g file and the rook beside it.")
+        if ptype == "r":
+            return "Rooks move in straight lines along a row or column."
+        if ptype == "b":
+            return "Bishops move along diagonals."
+        if ptype == "q":
+            return "Queens move along rows, columns and diagonals."
+        # pawn
+        dr = dst[0] - src[0]
+        if dr != pawn_step(team):
+            return ("A pawn takes exactly one step per move, toward its home row: %s the "
+                    "board for %s." % ("up" if pawn_step(team) < 0 else "down", full_name(team)))
+        if dst[0] in (0, SIZE - 1):
+            return "A pawn can never step onto a back row."
+        if abs(dst[1] - src[1]) > 1:
+            return "A pawn's step shifts at most one column (a diagonal step)."
+        return ("A diagonal pawn step un-captures, so it must give back an opponent piece, "
+                "but every %s piece is already on the board." % full_name(other_team(team)))
+
+    def _action_problem(self, mover: Piece, opt: MoveOption, action: Action,
+                        offboard: Dict[str, Piece], memo: dict):
+        """(label, reason) for one candidate action; reason is None if it is playable.
+
+        ``label`` is None for the gift-less action, else the gifted piece's name.
+        """
+        if action.gift is None:
+            label = None
+        else:
+            label = _PIECE_NAMES[action.gift]
+            spawn = offboard[action.gift]
+            opp = other_team(mover.team)
+            spawn_pos = ((pawn_home_row(opp), action.src[1]) if action.en_passant
+                         else action.src)
+            promoting = spawn.ptype == "p" and action.promote is not None
+            why = self._gift_problem(mover, action.src, action.dst, spawn, spawn_pos,
+                                     promoting, memo)
+            if why:
+                return label, why
+        move = self._make_move(action, opt, offboard, memo)
+        if move is None:
+            return label, "it is not allowed"
+        if not self._leaves_reply(move):
+            return label, ("it would leave your opponent with no legal move at all, "
+                           "which the game forbids")
+        return label, None
 
     # ------------------------------------------------------------------
     # Execute / undo

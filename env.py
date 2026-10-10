@@ -52,8 +52,10 @@ _COUNT_TYPES = ("p", "r", "b", "q", "n")
 _MAX_OFFBOARD = {"p": 8, "r": 2, "b": 2, "q": 1, "n": 2}
 #: Scalars: own off-board counts (5), opponent off-board counts (5),
 #: quiet-ply fraction, game-length fraction, repetition count, extra-turn flag,
-#: own-all-on-board, opponent-all-on-board.
-NUM_SCALARS = 16
+#: own-all-on-board, opponent-all-on-board, mover-is-black.  (The board is
+#: flipped for black, so this is the only way the net can tell the colours
+#: apart; the start positions differ and black moves first.)
+NUM_SCALARS = 17
 
 OBSERVATION_SHAPES = {"board": (NUM_BOARD_PLANES, SIZE, SIZE), "scalars": (NUM_SCALARS,)}
 
@@ -65,10 +67,39 @@ def canonical_square(team: str, pos: Tuple[int, int]) -> Tuple[int, int]:
     return pos if team == "w" else (SIZE - 1 - pos[0], pos[1])
 
 
+# --------------------------------------------------------------------------
+# Progress potential (reward shaping)
+# --------------------------------------------------------------------------
+
+#: One piece of "burden" is worth 1/POTENTIAL_SCALE; chosen so the potential
+#: mostly stays inside [-1, 1] (at most 16 pieces per side).
+POTENTIAL_SCALE = 16.0
+
+
+def burden(game: Game, team: str) -> int:
+    """How many of ``team``'s on-board pieces are not yet home.  A team wins
+    when this reaches 0 (the game's actual win condition), and a gift to a
+    team raises its burden by one, so this is the game's own notion of
+    "how much work is left"."""
+    return sum(1 for p in game.pieces[team] if p.ontheboard and not p.at_home())
+
+
+def potential(game: Game, team: str) -> float:
+    """Progress potential Phi_team(state): the opponent's remaining burden
+    minus our own, scaled.  Zero-sum (Phi_opp = -Phi_team), like the game.
+
+    Used only for *potential-based* reward shaping (see returns.py):
+    r' = r + coef * (gamma * Phi(next) - Phi(now)), with Phi(terminal) = 0.
+    That form provably leaves the set of optimal policies unchanged, so the
+    net cannot learn to farm it; it only makes progress visible sooner.
+    """
+    return (burden(game, other_team(team)) - burden(game, team)) / POTENTIAL_SCALE
+
+
 def encode_observation(game: Game, max_plies: Optional[int] = None) -> Dict[str, np.ndarray]:
     """Encode the position for the side to move.
 
-    Returns ``{"board": float32 (18, 8, 8), "scalars": float32 (16,)}``.
+    Returns ``{"board": float32 (18, 8, 8), "scalars": float32 (17,)}``.
     ``max_plies`` normalises the game-length feature (defaults to the rules'
     cap, or 400 when the game is uncapped).
     """
@@ -106,6 +137,7 @@ def encode_observation(game: Game, max_plies: Optional[int] = None) -> Dict[str,
                         and game.last_move.team == me)
     scalars[14] = float(game.all_on_board(me))
     scalars[15] = float(game.all_on_board(other_team(me)))
+    scalars[16] = float(me == "b")
     return {"board": board, "scalars": scalars}
 
 

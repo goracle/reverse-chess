@@ -6,21 +6,28 @@
     python play.py --black random           # you play white against a random black
     python play.py --black random --white random --delay 100   # watch a game
     python play.py --white mymodule:policy  # plug in your own agent (see below)
+    python play.py --white ckpt:runs/run1/latest.pt   # play a network from train.py
 
 How to play
 -----------
-* Click one of your pieces: its legal destinations get a green dot.
+* Pieces with a legal move have a blue outline.  Click one: its legal
+  destinations get a dot.
+* Click any other square to be told why that move is illegal.
 * Click a destination.  If the move needs a decision (un-promote? which piece
   to give back? reverse en passant? promote the gifted pawn to what?) a menu
   appears in the window.  Esc cancels back to the board.
 * The panel on the right shows which pieces are still off the board for each
   team (those are the pieces the *other* side can give back) and how many of
   a team's on-board pieces are home.
+* Padlocks: grey = locked for good (home pawns, castled king/rook); orange =
+  blocked in right now (e.g. a bishop behind its own pawns).
 * Keys: R = new game, Esc = cancel selection/menu.
 
 Custom agents
 -------------
-``--black`` / ``--white`` accept ``human``, ``random`` or ``module:function``.
+``--black`` / ``--white`` accept ``human``, ``random``, ``ckpt:PATH`` (a trained
+network that samples from its policy), ``ckpt-greedy:PATH`` (same, but always the
+most likely move) or ``module:function``.
 The function is called as ``function(game)`` and must return one of
 ``game.legal_actions()``.  A trained network fits here directly.
 
@@ -28,6 +35,7 @@ Only pygame and numpy are needed; there is no tkinter and no pop-up window.
 """
 import argparse
 import importlib
+import math
 import random
 from collections import Counter, defaultdict
 
@@ -42,7 +50,7 @@ from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team
 SQ = 100                         # pixels per square
 BOARD_PX = SQ * SIZE
 PANEL_W = 240
-STATUS_H = 44
+STATUS_H = 92
 WIN_W = BOARD_PX + PANEL_W
 WIN_H = BOARD_PX + STATUS_H
 
@@ -51,11 +59,14 @@ DARK = (118, 150, 86)
 SELECT = (230, 220, 60)
 LAST = (205, 210, 106)
 DOT = (40, 120, 220)
+MOVABLE = (60, 150, 255)
+LOCKED = (95, 95, 110)
+BLOCKED = (230, 110, 40)
 PANEL_BG = (38, 38, 42)
 STATUS_BG = (24, 24, 28)
 TEXT = (235, 235, 235)
 MUTED = (150, 150, 155)
-BAD = (240, 120, 100)
+BAD = (255, 190, 110)
 GOOD = (130, 220, 130)
 
 NAMES = {'p': 'pawn', 'k': 'king', 'r': 'rook', 'b': 'bishop', 'q': 'queen', 'n': 'knight'}
@@ -96,6 +107,31 @@ def next_choice(candidates):
 
 
 # --------------------------------------------------------------------------
+# Small drawing helpers
+# --------------------------------------------------------------------------
+
+def wrap(text, font, width):
+    """Split ``text`` into lines no wider than ``width`` pixels."""
+    lines, line = [], ""
+    for word in text.split():
+        trial = (line + " " + word).strip()
+        if font.size(trial)[0] <= width or not line:
+            line = trial
+        else:
+            lines.append(line)
+            line = word
+    lines.append(line)
+    return lines
+
+
+def draw_padlock(surface, x, y, colour):
+    """A small padlock whose top-left corner is (x, y)."""
+    pygame.draw.arc(surface, colour, pygame.Rect(x + 3, y, 10, 14), 0, math.pi, 3)
+    pygame.draw.rect(surface, colour, (x, y + 7, 16, 12), border_radius=2)
+    pygame.draw.circle(surface, (20, 20, 20), (x + 8, y + 13), 2)
+
+
+# --------------------------------------------------------------------------
 # Agents
 # --------------------------------------------------------------------------
 
@@ -105,6 +141,12 @@ def load_agent(spec, rng):
         return None
     if spec == 'random':
         return lambda game: rng.choice(game.legal_actions())
+    if spec.startswith(('ckpt:', 'ckpt-greedy:')):    # a network trained by train.py
+        kind, _, path = spec.partition(':')
+        import numpy as np
+        from net import make_agent                    # imports torch only when asked for
+        return make_agent(path, greedy=(kind == 'ckpt-greedy'),
+                          rng=np.random.default_rng(rng.randrange(2 ** 32)))
     module, _, name = spec.partition(':')
     if not name:
         raise SystemExit("agent must be 'human', 'random' or 'module:function', got %r" % spec)
@@ -122,7 +164,8 @@ class App:
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
         self.font = pygame.font.SysFont(None, 28)
         self.font_big = pygame.font.SysFont(None, 38)
-        self.font_small = pygame.font.SysFont(None, 21)
+        self.font_small = pygame.font.SysFont(None, 20)
+        self.font_status = pygame.font.SysFont(None, 25)
         self._sprites = {}
         self.agents = agents          # {'b': fn|None, 'w': fn|None}
         self.rules = rules
@@ -145,6 +188,22 @@ class App:
         self.by_src = defaultdict(list)
         for action in self.game.legal_actions():
             self.by_src[action.src].append(action)
+        # Pieces that are not (permanently) locked but cannot move right now.
+        # For the side to move this means "no playable action"; for the other
+        # side, "no raw move".  Computed once per ply, not once per frame.
+        self.blocked = set()
+        game = self.game
+        if not game.done:
+            for team in TEAMS:
+                for piece in game.on_board(team):
+                    if piece.locked:
+                        continue
+                    if team == game.turn:
+                        stuck = piece.pos not in self.by_src
+                    else:
+                        stuck = not game.piece_moves(piece, first_only=True)
+                    if stuck:
+                        self.blocked.add(piece.pos)
 
     def cancel(self):
         self.selected = None
@@ -182,19 +241,29 @@ class App:
         if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX):
             return
         sq = (y // SQ, x // SQ)
-        piece = self.game.board[sq]
-        if piece is not None and piece.team == self.game.turn:
-            if sq in self.by_src:
+        game = self.game
+        piece = game.board[sq]
+        if piece is not None and piece.team == game.turn:
+            if sq == self.selected:       # click again to deselect
+                self.cancel()
+            elif sq in self.by_src:
                 self.selected = sq
                 self.message = ""
-            else:
-                self.selected = None
-                self.message = "That piece has no legal moves."
-        elif self.selected is not None and sq in {a.dst for a in self.by_src.get(self.selected, [])}:
+            else:                         # select it anyway so clicks can explain why
+                self.selected = sq
+                self.message = (game.lock_reason(piece) if piece.locked else
+                                "This piece has no legal moves right now.  Click any "
+                                "square to see why that move is illegal.")
+            return
+        if self.selected is None:
+            self.message = "Click one of your pieces first (blue outline = it can move)."
+            return
+        if sq in {a.dst for a in self.by_src.get(self.selected, [])}:
             self.candidates = [a for a in self.by_src[self.selected] if a.dst == sq]
             self.resolve()
         else:
-            self.selected = None
+            self.message = (game.explain_illegal(self.selected, sq)
+                            or "That move is not available.")
 
     def resolve(self):
         """Play the move, or open a menu for the next undecided choice."""
@@ -250,6 +319,7 @@ class App:
         game = self.game
         last = game.last_move
         dests = {a.dst for a in self.by_src.get(self.selected, [])}
+        movable = self.human_to_move()
         for r in range(SIZE):
             for c in range(SIZE):
                 rect = pygame.Rect(c * SQ, r * SQ, SQ, SQ)
@@ -269,8 +339,11 @@ class App:
                         label = self.font_small.render("P", True, (20, 20, 20))
                         self.screen.blit(label, label.get_rect(center=centre))
                     if piece.locked:     # can never move again
-                        pygame.draw.circle(self.screen, (70, 70, 80),
-                                           (c * SQ + 14, r * SQ + SQ - 14), 7)
+                        draw_padlock(self.screen, c * SQ + 6, r * SQ + SQ - 26, LOCKED)
+                    elif (r, c) in self.blocked:   # cannot move right now
+                        draw_padlock(self.screen, c * SQ + 6, r * SQ + SQ - 26, BLOCKED)
+                if movable and (r, c) in self.by_src:
+                    pygame.draw.rect(self.screen, MOVABLE, rect, 4)
                 if (r, c) in dests:
                     pygame.draw.circle(self.screen, DOT, rect.center, 11)
 
@@ -299,10 +372,11 @@ class App:
                 self.text("x%d" % count, (cx + 34, cy + 8), self.font,
                           TEXT if count else MUTED)
             y += 2 * 38 + 16
-        legend = ["P badge: promoted piece", "grey dot: locked in place",
+        legend = ["blue outline: can move", "grey lock: locked for good",
+                  "orange lock: blocked right now", "gold P: promoted piece",
                   "R: new game   Esc: cancel"]
         for i, line in enumerate(legend):
-            self.text(line, (x0, BOARD_PX - 70 + i * 22), self.font_small, MUTED)
+            self.text(line, (x0, WIN_H - 8 - (len(legend) - i) * 21), self.font_small, MUTED)
 
     def draw_status(self):
         game = self.game
@@ -320,7 +394,12 @@ class App:
             extra = (" - extra turn (reverse en passant)"
                      if last is not None and last.extra_turn and last.team == game.turn else "")
             line = "%s to move (%s)%s" % (name, kind, extra)
-        self.text(line, (14, BOARD_PX + 12))
+        lines = wrap(line, self.font_status, WIN_W - 28)
+        if len(lines) > 3:
+            lines = lines[:3]
+            lines[-1] = lines[-1].rstrip(" .,;:") + " ..."
+        for i, text in enumerate(lines):
+            self.text(text, (14, BOARD_PX + 8 + i * 26), self.font_status, colour)
 
     def draw_menu(self):
         dim, values = self.pending
