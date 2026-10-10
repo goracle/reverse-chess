@@ -44,6 +44,8 @@ for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
 
 import argparse
 import csv
+import faulthandler
+import signal
 import multiprocessing as mp
 import time
 from collections import Counter
@@ -289,6 +291,8 @@ def run_eval(pool, args, next_seed):
 
 def main():
     args = parse_args()
+    if hasattr(signal, "SIGUSR1"):          # kill -USR1 <pid> prints where every thread is, then carries on
+        faulthandler.register(signal.SIGUSR1, all_threads=True)
     device = pick_device(args.device)
     torch.set_num_threads(args.learner_threads)
     torch.manual_seed(args.seed)
@@ -359,6 +363,8 @@ def main():
             # without this the queue is already partly drained when learning starts.
             top_up(pending, pool, args, next_seed)
             t_collect = time.time() - t0
+            print("      collected %d games / %d plies in %.0fs; learning on %s ..."
+                  % (len(games), plies, t_collect, device), flush=True)
 
             # ---- learn ---------------------------------------------------
             t1 = time.time()
