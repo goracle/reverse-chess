@@ -134,6 +134,19 @@ class PolicyValueNet(nn.Module):
 # Playing with a network (used by self-play workers and by play.py)
 # --------------------------------------------------------------------------
 
+def action_components_array(game: Game) -> np.ndarray:
+    """``env.action_components`` for every legal action, as a fresh ``(n, 6)`` uint8
+    array in ``game.legal_actions()`` order (canonical frame of the side to move).
+
+    The engine already holds the actions as integers; the only thing left to do is
+    flip rows for black.  Row r -> 7 - r is r ^ 7, so on ``row * 8 + col`` it is ``^ 56``.
+    """
+    comps = game.action_array().copy()
+    if game.turn == "b":
+        comps[:, :2] ^= 56
+    return comps
+
+
 def choose_action(model: PolicyValueNet, game: Game, rng: np.random.Generator,
                   greedy: bool = False):
     """Pick an action for the side to move.
@@ -143,11 +156,10 @@ def choose_action(model: PolicyValueNet, game: Game, rng: np.random.Generator,
     ``(board uint8 (18,8,8), scalars f32 (17,), comps uint8 (n,6),
        chosen index, log-prob of the choice, value estimate)``.
     """
-    team = game.turn
     obs = encode_observation(game)
     actions = game.legal_actions()
     n = len(actions)
-    comps = np.asarray([action_components(a, team) for a in actions], dtype=np.uint8)
+    comps = action_components_array(game)
     with torch.inference_mode():
         logits, value = model(
             torch.from_numpy(obs["board"])[None],
@@ -159,9 +171,11 @@ def choose_action(model: PolicyValueNet, game: Game, rng: np.random.Generator,
     if greedy:
         idx = int(np.argmax(logp))
     else:
-        probs = np.exp(logp.astype(np.float64))
-        probs /= probs.sum()
-        idx = int(rng.choice(n, p=probs))
+        # The same draw as ``rng.choice(n, p=probs)`` (one uniform, searchsorted on the
+        # normalised cumulative sum) without that call's argument validation.
+        cdf = np.cumsum(np.exp(logp.astype(np.float64)))
+        cdf /= cdf[-1]
+        idx = min(int(cdf.searchsorted(rng.random(), side="right")), n - 1)
     sample = (obs["board"].astype(np.uint8), obs["scalars"], comps, idx,
               float(logp[idx]), float(value[0]))
     return actions[idx], sample

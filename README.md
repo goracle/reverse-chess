@@ -69,3 +69,13 @@ Contributions, issues, and ideas for new (and worse) features are welcome!
 ## License
 
 *GPL-3.0 license*
+
+## Native engine (optional, much faster self-play)
+
+`native/` is a dependency-free Rust port of the engine's move generation.
+`./build_native.sh` builds it and puts `librc_engine.so` next to `engine.py`;
+`engine.py` then uses it automatically (pure Python is the fallback).
+
+* `python check_native.py` - plays random games on both backends in lockstep and
+  fails on the first difference, then prints plies/second for each.
+* `RC_ENGINE=py` forces pure Python, `RC_ENGINE=native` makes a missing library an error.

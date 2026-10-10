@@ -37,6 +37,10 @@ Coordinates are ``(row, col)`` with row 0 at the top.  Teams are ``'b'`` and
 from __future__ import annotations
 
 import copy
+import ctypes
+import os
+import struct
+import threading
 from dataclasses import dataclass
 from typing import Dict, List, NamedTuple, Optional, Tuple
 
@@ -59,6 +63,76 @@ _RAYS = tuple((dr, dc, ("r", "q")) for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -
         tuple((dr, dc, ("b", "q")) for dr, dc in ((1, 1), (1, -1), (-1, 1), (-1, -1)))
 
 _GEOM_CACHE: Dict[tuple, tuple] = {}
+
+
+# --------------------------------------------------------------------------
+# Optional native (Rust) move generator
+# --------------------------------------------------------------------------
+# native/ holds a dependency-free Rust cdylib that re-implements Game._enumerate
+# and Game._losing_reason.  Build it with ./build_native.sh; this module loads
+# it through ctypes and silently falls back to the pure-Python code when it is
+# missing.  RC_ENGINE=py forces pure Python, RC_ENGINE=native makes a missing
+# library an error (so a benchmark can never quietly run the slow path).
+
+def _load_native():
+    mode = os.environ.get("RC_ENGINE", "auto").lower()
+    if mode in ("py", "python", "pure"):
+        return None
+    here = os.path.dirname(os.path.abspath(__file__))
+    names = ("librc_engine.so", "librc_engine.dylib", "rc_engine.dll")
+    dirs = (here, os.path.join(here, "native", "target", "release"))
+    err = "no librc_engine library found (run ./build_native.sh)"
+    for d in dirs:
+        for name in names:
+            path = os.path.join(d, name)
+            if not os.path.exists(path):
+                continue
+            try:
+                lib = ctypes.CDLL(path)
+                lib.rc_abi_version.restype = ctypes.c_int32
+                if lib.rc_abi_version() != 1:
+                    err = "%s has the wrong ABI version" % path
+                    continue
+                lib.rc_enumerate.restype = ctypes.c_int32
+                lib.rc_enumerate.argtypes = [ctypes.c_char_p, ctypes.c_uint32,
+                                             ctypes.c_void_p, ctypes.c_uint32]
+                lib.rc_losing.restype = ctypes.c_int32
+                lib.rc_losing.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
+                return lib
+            except (OSError, AttributeError) as exc:
+                err = "could not load %s: %s" % (path, exc)
+    if mode == "native":
+        raise ImportError("RC_ENGINE=native but " + err)
+    return None
+
+
+_LIB = _load_native()
+NATIVE = _LIB is not None          # True when the Rust move generator is in use
+_TLS = threading.local()           # per-thread action buffer for rc_enumerate
+_BUF_CAP = 4096                    # actions; grown automatically on overflow
+_SQ = tuple((r, c) for r in range(SIZE) for c in range(SIZE))
+_GIFT_CODES = (None,) + tuple(PTYPES)                  # wire code -> gifted piece type
+_PROMO_CODES = (None,) + PROMOTION_TYPES               # wire code -> promotion type
+
+
+def _native_enumerate(state: bytes, team_index: int):
+    """(n, raw): n > 0 playable actions (6 bytes each in raw), 0 none valid, -2 valid but none playable."""
+    buf = getattr(_TLS, "buf", None)
+    cap = getattr(_TLS, "cap", 0)
+    if buf is None:
+        cap = _BUF_CAP
+        buf = _TLS.buf = ctypes.create_string_buffer(6 * cap)
+        _TLS.cap = cap
+    while True:
+        n = _LIB.rc_enumerate(state, team_index, buf, cap)
+        if n != -1:
+            break
+        cap *= 4
+        buf = _TLS.buf = ctypes.create_string_buffer(6 * cap)
+        _TLS.cap = cap
+    if n < 0 and n != -2:
+        raise RuntimeError("native engine failed (code %d)" % n)
+    return n, (ctypes.string_at(buf, 6 * n) if n > 0 else b"")
 
 
 def _geom_dsts(ptype: str, team: str, src: Tuple[int, int]) -> tuple:
@@ -383,7 +457,12 @@ class Game:
     move_log     list of every Action played, in order.
     """
 
-    def __init__(self, rules: Optional[Rules] = None):
+    def __init__(self, rules: Optional[Rules] = None, native: Optional[bool] = None):
+        """``native``: None = use the Rust move generator when it is available,
+        False = force the pure-Python one, True = require the Rust one."""
+        if native and _LIB is None:
+            raise RuntimeError("native engine requested but librc_engine is not built")
+        self._use_native = (_LIB is not None) if native is None else bool(native)
         self.rules = rules or Rules()
         self._moves_cache: dict = {}
         self._witness: dict = {}          # team -> [(piece index, dst), ...] recent proofs that it could move
@@ -397,6 +476,8 @@ class Game:
         """Return to the starting position (two kings, everything else off)."""
         self.board = np.full((SIZE, SIZE), None, dtype=object)
         self._snap: Optional[bytes] = None
+        self._pk: Optional[bytes] = None
+        self._raw: Optional[bytes] = None     # native action bytes for the current turn
         self._moves_cache.clear()
         self._witness.clear()
         self._has_move.clear()
@@ -440,6 +521,7 @@ class Game:
         self._moves_cache.clear()
         self._has_move.clear()
         self.actions = {}
+        self._raw = None
 
     @staticmethod
     def _home_of(team: str, ptype: str):
@@ -455,12 +537,33 @@ class Game:
     def _dirty(self):
         """Invalidate the cached snapshot after any state change."""
         self._snap = None
+        self._pk = None
 
     def snapshot(self) -> bytes:
         """Compact, hashable fingerprint of the board (cached until it changes)."""
         if self._snap is None:
             self._snap = bytes(0 if p is None else p.code() for p in self.board.flat)
         return self._snap
+
+    def _pack(self) -> bytes:
+        """State in the 128-byte wire format of native/src/lib.rs (cached until it changes)."""
+        pk = self._pk
+        if pk is None:
+            buf = bytearray(128)
+            i = 0
+            index = _PTYPE_INDEX
+            for team in TEAMS:
+                for p in self.pieces[team]:
+                    if p.ontheboard:
+                        pos = p.pos
+                        buf[i] = 1 | (2 if p.promoted else 0) | (4 if p.locked else 0)
+                        buf[i + 1] = pos[0] * 8 + pos[1]
+                    else:
+                        buf[i + 1] = 255
+                    buf[i + 2] = index[p.ptype]
+                    i += 4
+            self._pk = pk = bytes(buf)
+        return pk
 
     def on_board(self, team: str) -> List[Piece]:
         """The team's pieces that are currently on the board."""
@@ -482,6 +585,23 @@ class Game:
     def legal_actions(self) -> List[Action]:
         """All legal actions for the side to move (empty when the game is over)."""
         return list(self.actions)
+
+    def action_array(self) -> np.ndarray:
+        """Legal actions as an ``(n, 6)`` uint8 array, in ``legal_actions()`` order.
+
+        Columns: src, dst (absolute squares, row * 8 + col), demote, gift code
+        (0 = none, else 1 + index in chessassets.PTYPES), en_passant, promote code
+        (0 = none, else 1 + index in PROMOTION_TYPES) -- ``env.action_components``
+        before the board is flipped for black.  Treat it as read-only.
+        """
+        raw = self._raw
+        if raw is not None and len(raw) == 6 * len(self.actions):
+            return np.frombuffer(raw, dtype=np.uint8).reshape(-1, 6)
+        rows = [(a.src[0] * SIZE + a.src[1], a.dst[0] * SIZE + a.dst[1], int(a.demote),
+                 0 if a.gift is None else 1 + _PTYPE_INDEX[a.gift], int(a.en_passant),
+                 0 if a.promote is None else 1 + PROMOTION_TYPES.index(a.promote))
+                for a in self.actions]
+        return np.array(rows, dtype=np.uint8).reshape(-1, 6)
 
     def position_key(self) -> bytes:
         """Board fingerprint plus side to move: what repetition counts."""
@@ -717,7 +837,9 @@ class Game:
             return []
         key = None
         if not first_only or self._snap is not None:   # fingerprinting costs more than a peek saves
-            key = (self.snapshot(), piece.uid)
+            # the square matters: two same-type pieces can swap places without
+            # changing the fingerprint, and then uid alone would hit stale moves
+            key = (self.snapshot(), piece.uid, piece.pos)
             cached = self._moves_cache.get(key)
             if cached is not None:
                 return cached
@@ -973,11 +1095,6 @@ class Game:
         """Resolve a candidate into a Move, or None if the gift is illegal."""
         mover = self.board[action.src]
         opp = other_team(mover.team)
-        partner = partner_src = spawn = spawn_pos = None
-        if opt.reverse_castle:
-            partner = next(p for p in self.board[action.src[0]]
-                           if p is not None and p is not mover)
-            partner_src = partner.pos
         if action.gift is not None:
             spawn = offboard[action.gift]
             # Reverse en passant places the pawn on its home row; otherwise the
@@ -987,11 +1104,35 @@ class Game:
             promoting = spawn.ptype == "p" and action.promote is not None
             if not self._gift_legal(mover, action.dst, spawn, spawn_pos, promoting, memo):
                 return None
+        return self._build_move(action, opt, offboard)
+
+    def _build_move(self, action: Action, opt: MoveOption,
+                    offboard: Dict[str, Piece]) -> Move:
+        """Bind an (already validated) Action to concrete pieces."""
+        mover = self.board[action.src]
+        opp = other_team(mover.team)
+        partner = partner_src = spawn = spawn_pos = None
+        if opt.reverse_castle:
+            partner = next(p for p in self.board[action.src[0]]
+                           if p is not None and p is not mover)
+            partner_src = partner.pos
+        if action.gift is not None:
+            spawn = offboard[action.gift]
+            spawn_pos = ((pawn_home_row(opp), action.src[1]) if action.en_passant
+                         else action.src)
         return Move(action=action, team=mover.team, mover=mover, src=action.src,
                     dst=action.dst, mover_ptype=mover.ptype, demote=opt.demote,
                     reverse_castle=opt.reverse_castle, partner=partner,
                     partner_src=partner_src, spawn=spawn, spawn_pos=spawn_pos,
                     promote_to=action.promote, extra_turn=action.en_passant)
+
+    def _resolve(self, action: Action) -> Move:
+        """Move for an action the native generator already validated (built lazily,
+        only for the one action that is actually played)."""
+        mover = self.board[action.src]
+        chk = self.check_legal_move(action.src, action.dst, as_pawn=action.demote)
+        opt = MoveOption(action.dst, action.demote, chk.forced_give, chk.reverse_castle)
+        return self._build_move(action, opt, self.offboard_by_type(other_team(mover.team)))
 
     def _enumerate(self):
         """Return (valid, playable) action dicts for the side to move.
@@ -1212,14 +1353,27 @@ class Game:
         self.winner = winner
         self.end_reason = reason
         self.actions = {}
+        self._raw = None
 
     def _begin_turn(self):
         """Work out the side to move's legal actions, or end the game."""
         team = self.turn
         self.actions = {}
-        valid, playable = ({}, {})
-        if self.has_legal_move(team):
-            valid, playable = self._enumerate()
+        self._raw = None
+        if self._use_native:
+            n, raw = _native_enumerate(self._pack(), 0 if team == "b" else 1)
+            if n > 0:
+                # Moves are bound to pieces lazily (see _resolve): only the one played.
+                self.actions = dict.fromkeys(
+                    Action(_SQ[s], _SQ[d], bool(dm), _GIFT_CODES[g], bool(ep), _PROMO_CODES[pr])
+                    for s, d, dm, g, ep, pr in struct.iter_unpack("6B", raw))
+                self._raw = raw
+                return
+            valid, playable = (n == -2), {}
+        else:
+            valid, playable = ({}, {})
+            if self.has_legal_move(team):
+                valid, playable = self._enumerate()
         if not valid:
             # No legal move: you lose, unless you are already home.
             winner = team if self.check_for_win(team) else other_team(team)
@@ -1234,9 +1388,11 @@ class Game:
         """Play ``action``.  Afterwards check ``done``/``winner``/``legal_actions()``."""
         if self.done:
             raise IllegalActionError("the game is over (%s)" % self.end_reason)
-        move = self.actions.get(action)
-        if move is None:
+        if action not in self.actions:
             raise IllegalActionError("illegal action: %r" % (action,))
+        move = self.actions[action]
+        if move is None:                      # native generator: bind to pieces now
+            move = self._resolve(action)
         self._execute(move)
         self.ply += 1
         self.last_move = move
@@ -1297,7 +1453,23 @@ class Game:
         return self._losing_reason(team) is not None
 
     def _losing_reason(self, team: str) -> Optional[str]:
-        """Return why ``team`` can no longer win, or None.
+        """Return why ``team`` can no longer win, or None (native when available)."""
+        if not self._use_native:
+            return self._losing_reason_py(team)
+        code = _LIB.rc_losing(self._pack(), 0 if team == "b" else 1)
+        if code == 0:
+            return None
+        name = full_name(team)
+        if code == 1:
+            return "pawn wall-off prevents %s from winning" % name
+        if code == 2:
+            return "no way for all of %s's pawns to get home" % name
+        if code == 3:
+            return "no way for all of %s's bishops to get home" % name
+        raise RuntimeError("native engine failed (code %d)" % code)
+
+    def _losing_reason_py(self, team: str) -> Optional[str]:
+        """Pure-Python reference for _losing_reason: why ``team`` can no longer win, or None.
 
         Three kinds of dead end are detected:
           * all pawns are home (a solid wall) yet a non-knight piece is still
