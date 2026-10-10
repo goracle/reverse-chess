@@ -1,0 +1,45 @@
+--- a/engine.py
++++ b/engine.py
+@@ -424,6 +424,19 @@
+         self.actions: Dict[Action, Move] = {}
+         self._begin_turn()
+ 
++    def close(self):
++        """Break the Game <-> Piece reference cycle so the game can be freed.
++
++        ``self.board`` is a numpy object array holding Pieces, and every Piece
++        holds ``.game``.  numpy arrays are invisible to Python's cycle
++        collector, so without this the Game (and its move cache, Move/Action
++        objects, ...) is never reclaimed.  Call it when a game is finished
++        with; the Game must not be used afterwards.
++        """
++        self.board.fill(None)
++        self._moves_cache.clear()
++        self.actions = {}
++
+     @staticmethod
+     def _home_of(team: str, ptype: str):
+         """(rows, cols) of the squares where a piece of this type is home."""
+--- a/rollout.py
++++ b/rollout.py
+@@ -98,7 +98,9 @@
+         action, sample = netlib.choose_action(model, game, rng)
+         rec.add(team, sample, phi)
+         game.step(action)
+-    return rec.finish(game, version, time.time() - start)
++    result = rec.finish(game, version, time.time() - start)
++    game.close()                  # see Game.close: otherwise every game leaks
++    return result
+ 
+ 
+ def eval_task(seed: int, net_team: str) -> dict:
+@@ -114,5 +116,7 @@
+             actions = game.legal_actions()
+             action = actions[int(rng.integers(len(actions)))]
+         game.step(action)
+-    return {"net_team": net_team, "winner": game.winner, "plies": game.ply,
+-            "version": version, "reason": game.end_reason}
++    result = {"net_team": net_team, "winner": game.winner, "plies": game.ply,
++              "version": version, "reason": game.end_reason}
++    game.close()
++    return result
