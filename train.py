@@ -192,8 +192,13 @@ def ppo_update(model, opt, data, args, device, rng):
 # --------------------------------------------------------------------------
 
 def pick_device(choice):
+    """auto -> CUDA, else an Intel GPU (torch.xpu, PyTorch >= 2.5), else CPU."""
     if choice == "auto":
-        return "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            return "cuda"
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            return "xpu"
+        return "cpu"
     return choice
 
 
@@ -209,7 +214,7 @@ def parse_args():
     g = ap.add_argument_group("parallelism / memory")
     g.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     g.add_argument("--learner-threads", type=int, default=4)
-    g.add_argument("--device", default="auto", help="auto | cpu | cuda (learner only)")
+    g.add_argument("--device", default="auto", help="auto | cpu | cuda | xpu (learner only; workers always use the CPU)")
     g.add_argument("--move-cache", type=int, default=50_000,
                    help="engine move-cache entries per worker (memory knob)")
     g = ap.add_argument_group("self-play")
@@ -225,9 +230,11 @@ def parse_args():
     g.add_argument("--gae-lambda", type=float, default=1.0,
                    help="GAE lambda; 1.0 = plain Monte-Carlo (old behaviour); 0.95 is typical "
                         "and is needed for shaping to have any effect")
-    g.add_argument("--queue-factor", type=int, default=6,
+    g.add_argument("--queue-factor", type=int, default=10,
                    help="games queued per worker; workers keep playing while the learner "
-                        "trains, so this must be deep enough that they never run dry")
+                        "trains, so this must be deep enough that they never run dry "
+                        "(roughly learn-time x plies/s / avg-game-plies / workers).  Deeper "
+                        "means staler games; those older than --max-stale are dropped")
     g = ap.add_argument_group("network")
     g.add_argument("--channels", type=int, default=64)
     g.add_argument("--blocks", type=int, default=4)
@@ -258,6 +265,13 @@ def parse_args():
         args.eval_every, args.eval_games, args.save_every = 2, 8, 1
         args.minibatch = 64
     return args
+
+
+def top_up(pending, pool, args, next_seed):
+    """Keep ``queue_factor * workers`` self-play games outstanding (running, queued
+    or finished-but-not-yet-used), so every worker stays fed while the learner trains."""
+    while len(pending) < args.queue_factor * args.workers:
+        pending.append(pool.submit(rollout.selfplay_task, next_seed()))
 
 
 def run_eval(pool, args, next_seed):
@@ -316,7 +330,7 @@ def main():
         max_workers=args.workers, mp_context=mp.get_context("spawn"),
         initializer=rollout.init_worker,
         initargs=(latest, {"max_plies": args.max_plies}, args.move_cache))
-    pending = set()
+    pending = []          # futures in submission order (oldest first)
     t_start = time.time()
     log_file = open(log_path, "a", newline="")
     writer = None
@@ -326,17 +340,24 @@ def main():
             t0 = time.time()
             games, plies, stale = [], 0, 0
             while plies < args.plies_per_iter:
-                while len(pending) < args.queue_factor * args.workers:   # keep every worker fed, even while learning
-                    pending.add(pool.submit(rollout.selfplay_task, next_seed()))
-                done, _ = wait(pending, return_when=FIRST_COMPLETED)
-                for fut in done:
-                    pending.discard(fut)
+                top_up(pending, pool, args, next_seed)
+                ready = [f for f in pending if f.done()]    # oldest first
+                if not ready:
+                    wait(pending, return_when=FIRST_COMPLETED)
+                    continue
+                for fut in ready:
+                    pending.remove(fut)
                     result = fut.result()                    # re-raises worker errors
                     if version - result["version"] > args.max_stale:
                         stale += 1
                         continue
                     games.append(result)
                     plies += len(result["player"])
+                    if plies >= args.plies_per_iter:
+                        break                               # leave the rest for the next update
+            # Refill *before* learning: the workers keep playing during the update, and
+            # without this the queue is already partly drained when learning starts.
+            top_up(pending, pool, args, next_seed)
             t_collect = time.time() - t0
 
             # ---- learn ---------------------------------------------------

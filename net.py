@@ -176,8 +176,20 @@ def save_checkpoint(path: str, model: PolicyValueNet, version: int,
     """Atomically write a checkpoint (workers may be reading the old one)."""
     tmp = path + ".tmp"
     torch.save({"version": version, "cfg": model.cfg,
-                "state_dict": model.state_dict(), "opt": opt_state}, tmp)
+                "state_dict": _to_cpu(model.state_dict()), "opt": _to_cpu(opt_state)}, tmp)
     os.replace(tmp, path)
+
+
+def _to_cpu(obj):
+    """Copy tensors in a (nested) state dict to the CPU, so checkpoints load anywhere
+    (workers always run on the CPU, even when the learner trains on a GPU)."""
+    if torch.is_tensor(obj):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_cpu(v) for v in obj)
+    return obj
 
 
 def load_checkpoint(path: str, device: str = "cpu") -> Tuple[PolicyValueNet, dict]:
