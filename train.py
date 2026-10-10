@@ -49,8 +49,9 @@ import glob
 import signal
 import sys
 import multiprocessing as mp
+import re
 import time
-from collections import Counter
+from collections import Counter, deque
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 import numpy as np
@@ -60,24 +61,84 @@ import net as netlib
 import returns
 import rollout
 
-# ---- terminal colours (off when piped, or when NO_COLOR is set) -------------
-_COLOR = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+# ---- terminal colours --------------------------------------------------------
+# Off when piped or when NO_COLOR is set; FORCE_COLOR=1 turns them on regardless.
+#
+# The log is built so it can be read at a glance:
+#   * every line of an iteration starts with a coloured TAG (v57, train, time, learner,
+#     steps, ended, vs old, phase, EVAL), so the eye can jump to the line it wants;
+#   * inside a line the text is the terminal's normal colour; only numbers that carry a
+#     judgement are coloured:  green = healthy,  yellow = watch,  red = a problem
+#     (for the time lines: share of the learner's wall time spent there);
+#   * nothing is dimmed, so nothing has to be squinted at.
+# Tags are black on a mid-tone colour and the rest uses the standard bold hues, which are
+# readable on both dark and light terminals.
+_COLOR = ((sys.stdout.isatty() and "NO_COLOR" not in os.environ)
+          or bool(os.environ.get("FORCE_COLOR")))
+
+GOOD, WATCH, BAD = "1;32", "1;33", "1;31"
+BLACK_TEAM, WHITE_TEAM = "1;34", "1;33"
 
 
 def _c(code, text):
     return "\033[%sm%s\033[0m" % (code, text) if _COLOR else str(text)
 
 
+def _tag(label, bg):
+    """Line prefix: the label in black on a 256-colour background, padded to a fixed width."""
+    return _c("1;38;5;16;48;5;%d" % bg, " %-7s " % label) + " "
+
+
 def _health(text, value, good, ok, higher_better=False):
-    """Green / yellow / red by rule-of-thumb thresholds; dim if value is nan."""
+    """Green / yellow / red (all bold) by rule-of-thumb thresholds; plain if value is nan."""
     if value != value:
-        return _c("2", text)
+        return text
     if not higher_better:
-        code = "32" if value <= good else "33" if value <= ok else "31"
+        code = GOOD if value <= good else WATCH if value <= ok else BAD
     else:
-        code = "32" if value >= good else "33" if value >= ok else "31"
+        code = GOOD if value >= good else WATCH if value >= ok else BAD
     return _c(code, text)
 
+
+def _share(text, seconds, total):
+    """Colour a duration by its share of ``total``: >= 40% red, >= 20% yellow, else plain."""
+    f = seconds / max(total, 1e-9)
+    return _c(BAD if f >= 0.4 else WATCH if f >= 0.2 else "1", text)
+
+
+_REASON_SHORT = {
+    "draw: no gift or pawn move in 50 plies": "draw: 50 idle plies",
+    "draw: position repeated 3 times": "draw: repetition",
+    "draw: move limit reached": "draw: move limit",
+    "draw: every legal move leaves the opponent without a legal move": "draw: no safe move",
+    "draw: both teams satisfy a winning condition": "draw: both won",
+}
+
+
+def _short_reason(r):
+    """Shorter wording for the game-ending reasons, so a whole iteration fits on a line or two."""
+    if r in _REASON_SHORT:
+        return _REASON_SHORT[r]
+    m = re.match(r"^(black|white) wins: no way for all of (black|white)'s (\w+) to get home", r)
+    if m:
+        return "%s wins: %s's %s stuck" % m.groups()
+    m = re.match(r"^(black|white) wins: pawn wall-off prevents (black|white) from winning", r)
+    if m:
+        return "%s wins: wall-off vs %s" % m.groups()
+    return r[:44]
+
+
+def _ended_line(reasons, limit=6):
+    """'134x black wins: white's pawns stuck  .  107x ...', each reason in its own colour."""
+    items = []
+    for r, k in reasons.most_common(limit):
+        text = _short_reason(r)
+        code = "33" if text.startswith("draw") else "36" if "wins" in text else "32"
+        items.append(_c("1", "%d\u00d7" % k) + " " + _c(code, text))
+    rest = sum(reasons.values()) - sum(k for _, k in reasons.most_common(limit))
+    if rest:
+        items.append("+%d other" % rest)
+    return "  \u00b7  ".join(items)
 
 
 # --------------------------------------------------------------------------
@@ -114,57 +175,77 @@ def assemble(games, draw_value, shape_coef=0.0, gamma=1.0, gae_lambda=1.0):
     }
 
 
-def make_batches(counts, minibatch, max_actions, rng):
+def make_batches(counts, minibatch, max_actions, rng, drop_tail=False):
     """Shuffled batches of decision indices: at most ``minibatch`` decisions and
-    (roughly) ``max_actions`` legal actions each, which bounds memory."""
-    batch, n_actions = [], 0
+    (roughly) ``max_actions`` legal actions each, which bounds memory.
+
+    ``drop_tail`` skips the final, smaller batch of the epoch.  Its size differs every
+    iteration, and on the Intel GPU each new batch size pays a one-off setup cost.  The
+    permutation is fresh every epoch, so the dropped decisions are random ones, and they
+    are used in the next epoch.  (If that would leave no batch at all, it is kept.)"""
+    batch, n_actions, yielded = [], 0, 0
     for i in rng.permutation(len(counts)):
         batch.append(i)
         n_actions += counts[i]
         if len(batch) >= minibatch or n_actions >= max_actions:
             yield np.asarray(batch)
+            yielded += 1
             batch, n_actions = [], 0
-    if batch:
+    if batch and not (drop_tail and yielded):
         yield np.asarray(batch)
 
 
-def collate(data, adv, mb, device, pad=0):
+def collate(data, adv, mb, device, pad=0, tm=None):
     """Turn a batch of decision indices into tensors.
 
-    ``pad`` > 0 also returns ``owner_pad`` / ``comps_pad``: the action list padded (with
-    harmless zero rows) up to a multiple of ``pad``.  The number of legal actions differs
-    in every minibatch, and on the Intel GPU each *new* length makes the first call of the
-    policy head cost ~0.3 s of host-side setup (measured with xpu_shape_probe.py).  Feeding
-    the head a few fixed lengths avoids that; the caller slices the logits back to ``n``.
+    ``owner_pad`` / ``comps_pad`` are the action list padded (with harmless zero rows) up to a
+    multiple of ``pad`` (``pad`` = 0: not padded, they are the same arrays as ``owner`` /
+    ``comps``).  The number of legal actions differs in every minibatch, and on the Intel GPU
+    each *new* length makes the first call of the policy head cost ~0.3 s of host-side setup
+    (measured with xpu_shape_probe.py).  Feeding the head a few fixed lengths avoids that; the
+    caller slices the logits back to ``n``.
+
+    If ``tm`` is a dict, ``tm["collate_np"]`` (building the arrays on the host) and
+    ``tm["collate_xfer"]`` (copying them to the device) accumulate the two halves' wall time.
+    A large xfer share means the copy is waiting for the device to finish the previous step.
     """
+    t_np = time.perf_counter()
     counts = data["counts"][mb]
     comps = np.concatenate([data["comps"][s:s + n]
                             for s, n in zip(data["starts"][mb], counts)])
     owner = np.repeat(np.arange(len(mb)), counts)
     n = len(owner)
     n_pad = -(-n // pad) * pad if pad > 0 else n
-    comps_pad = np.zeros((n_pad, comps.shape[1]), dtype=comps.dtype)
-    comps_pad[:n] = comps
-    owner_pad = np.zeros(n_pad, dtype=owner.dtype)     # row 0 is a valid owner; the logits are discarded
-    owner_pad[:n] = owner
+    if n_pad == n:
+        comps_pad, owner_pad = comps, owner
+    else:
+        comps_pad = np.zeros((n_pad, comps.shape[1]), dtype=comps.dtype)
+        comps_pad[:n] = comps
+        owner_pad = np.zeros(n_pad, dtype=owner.dtype)  # row 0 is a valid owner; the logits are discarded
+        owner_pad[:n] = owner
+    t_x = time.perf_counter()
 
     def t(array, dtype):
         return torch.as_tensor(array, dtype=dtype, device=device)
 
-    return {
+    out = {
         "board": t(data["boards"][mb], torch.float32),
         "scalars": t(data["scalars"][mb], torch.float32),
-        "comps": t(comps, torch.long),
         "owner": t(owner, torch.long),
         "comps_pad": t(comps_pad, torch.long),
         "owner_pad": t(owner_pad, torch.long),
         "n": n,
+        "n_pad": n_pad,
         "counts": t(counts, torch.long),
         "chosen": t(data["chosen"][mb], torch.long),
         "old_logp": t(data["logp"][mb], torch.float32),
         "ret": t(data["ret"][mb], torch.float32),
         "adv": t(adv[mb], torch.float32),
     }
+    if tm is not None:
+        tm["collate_np"] = tm.get("collate_np", 0.0) + t_x - t_np
+        tm["collate_xfer"] = tm.get("collate_xfer", 0.0) + time.perf_counter() - t_x
+    return out
 
 
 def per_decision_logp(logits, owner, counts, amax=None):
@@ -189,12 +270,13 @@ def per_decision_logp(logits, owner, counts, amax=None):
 # --------------------------------------------------------------------------
 
 _PAD_CHECKED = []
+_SEEN_SHAPES = set()      # (decisions, padded actions) combinations this process has already run
 
 
 def _check_padding_equivalent(model, b, logits, value):
     """Once per run: padding the action list must not change the logits or the value."""
     with torch.no_grad():
-        ref_logits, ref_value = model(b["board"], b["scalars"], b["owner"], b["comps"])
+        ref_logits, ref_value = model(b["board"], b["scalars"], b["owner"], b["comps_pad"][:b["n"]])
         assert ref_logits.shape == logits.shape, (ref_logits.shape, logits.shape)
         assert torch.allclose(ref_logits, logits.detach(), atol=1e-4, rtol=1e-4), \
             "padded and unpadded action logits differ: max |diff| %.3g" % (ref_logits - logits.detach()).abs().max().item()
@@ -209,10 +291,16 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
     collate (host builds the batch), dispatch (host queues forward/backward/Adam),
     wait (host blocked until the previous step finished on the device) and steps.
     wait >> collate + dispatch means the device is the bottleneck; the reverse means
-    the host is, and the device sits idle between steps.
+    the host is, and the device sits idle between steps.  Also filled in:
+    collate_np / collate_xfer (the two halves of collate: building arrays vs copying them to
+    the device), step_dispatch (per-step dispatch seconds, in order), new_shape (per step: was
+    this (decisions, padded actions) shape new to this process), and kl_stop (the KL gate
+    ended the iteration early).
     """
     tm = timing if timing is not None else {}
-    tm.update(collate=0.0, dispatch=0.0, wait=0.0, steps=0)
+    tm.update(collate=0.0, dispatch=0.0, wait=0.0, steps=0, collate_np=0.0, collate_xfer=0.0,
+              step_dispatch=[], new_shape=[], kl_stop=False)
+    kl_hist = deque(maxlen=max(1, args.kl_window))
     adv = data["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     names = ("pg", "vf", "ent", "kl", "clipfrac")
@@ -230,17 +318,26 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
 
     stop = False
     for _ in range(args.epochs):
-        for mb in make_batches(data["counts"], args.minibatch, args.max_actions, rng):
+        for mb in make_batches(data["counts"], args.minibatch, args.max_actions, rng, args.drop_tail):
             amax = int(data["counts"][mb].max())      # host-side, so no GPU sync
             t_c = time.perf_counter()
-            b = collate(data, adv, mb, device, args.pad_actions)   # CPU work; overlaps the GPU still busy with the previous step
+            b = collate(data, adv, mb, device, args.pad_actions, tm)   # CPU work; overlaps the GPU still busy with the previous step
             tm["collate"] += time.perf_counter() - t_c
             if prev is not None:
                 kl = read(prev)
                 prev = None
-                if kl > 1.5 * args.target_kl:         # policy moved too far; stop this iteration
-                    stop = True
+                kl_hist.append(kl)
+                # Policy moved too far: stop this iteration.  One minibatch's KL is noisy (and the
+                # first ones also carry the staleness of the games), so the gate looks at the mean
+                # of the last --kl-window steps, plus a hard cap on any single step.
+                if (kl > args.kl_hard * args.target_kl
+                        or (len(kl_hist) == kl_hist.maxlen
+                            and sum(kl_hist) / len(kl_hist) > 1.5 * args.target_kl)):
+                    stop = tm["kl_stop"] = True
                     break
+            shape = (len(mb), b["n_pad"])
+            tm["new_shape"].append(shape not in _SEEN_SHAPES)
+            _SEEN_SHAPES.add(shape)
             t_d = time.perf_counter()
             try:
                 logits, value = model(b["board"], b["scalars"], b["owner_pad"], b["comps_pad"])
@@ -267,7 +364,9 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
                 raise
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
-            tm["dispatch"] += time.perf_counter() - t_d
+            dt = time.perf_counter() - t_d
+            tm["dispatch"] += dt
+            tm["step_dispatch"].append(dt)
             tm["steps"] += 1
 
             with torch.no_grad():                     # stays on the device; read next time round
@@ -357,6 +456,14 @@ def parse_args():
                         "only a few distinct shapes (a new shape costs ~0.3 s on the Intel GPU); 0 = off")
     g.add_argument("--grad-clip", type=float, default=1.0)
     g.add_argument("--target-kl", type=float, default=0.03)
+    g.add_argument("--kl-window", type=int, default=8,
+                   help="stop an iteration early when the mean KL of the last this-many minibatches exceeds "
+                        "1.5 * --target-kl (1 = judge every minibatch on its own, the old behaviour)")
+    g.add_argument("--kl-hard", type=float, default=4.0,
+                   help="also stop at once if a single minibatch's KL exceeds this multiple of --target-kl")
+    g.add_argument("--drop-tail", action=argparse.BooleanOptionalAction, default=True,
+                   help="skip each epoch's last, smaller minibatch (its size is new every iteration, and a "
+                        "new batch size costs a one-off setup on the Intel GPU); --no-drop-tail keeps it")
     g = ap.add_argument_group("evaluation / checkpoints")
     g.add_argument("--eval-every", type=int, default=10)
     g.add_argument("--eval-games", type=int, default=40)
@@ -493,8 +600,8 @@ def main():
             # without this the queue is already partly drained when learning starts.
             top_up(pending, pool, args, next_seed)
             t_collect = time.time() - t0
-            print(_c("2", "      collected %d games / %d plies in %.0fs; learning on %s ..."
-                     % (len(games), plies, t_collect, device)), flush=True)
+            print("\n" + _tag("collect", 111) + "collected %d games / %d plies in %.0fs; learning on %s ..."
+                  % (len(games), plies, t_collect, device), flush=True)
 
             # ---- learn ---------------------------------------------------
             t1 = time.time()
@@ -529,41 +636,65 @@ def main():
                 "collect_s": round(t_collect, 1), "learn_s": round(t_learn, 1),
                 "elapsed_min": round((time.time() - t_start) / 60, 1),
             }
-            print(
-                _c("1;37", "v%-4d" % version) + " "
-                + _c("1", "%3d games %5d plies" % (n, plies)) + " ("
-                + _c("94", "b %d" % winners["b"]) + " "
-                + _c("93", "w %d" % winners["w"]) + " "
-                + _c("90", "d %d" % winners["draw"])
-                + ", avg %.0f plies, %.0f legal) | " % (avg_plies, data["counts"].mean())
-                + _c("36", "%.0f plies/s" % (plies / max(t_collect, 1e-9))) + " | "
-                + _c("2", "pg") + " %+.3f " % stats["pg"]
-                + _c("2", "vf") + " %.3f " % stats["vf"]
-                + _c("2", "ent") + " " + _health("%.2f" % stats["ent"], stats["ent"], 0.3, 0.1, True) + " "
-                + _c("2", "kl") + " " + _health("%.4f" % stats["kl"], stats["kl"], 0.03, 0.045) + " "
-                + _c("2", "clip") + " " + _health("%.2f" % stats["clipfrac"], stats["clipfrac"], 0.25, 0.4) + " "
-                + _c("2", "ev") + " " + _health("%.2f" % expl_var, expl_var, 0.5, 0.2, True) + " | "
-                + _c("36", "collect %.0fs learn %.0fs" % (t_collect, t_learn))
-                + ((_c("33", "  [%d stale dropped]" % stale)) if stale else ""),
-                flush=True)
-            print(_c("2", "      ended by: %s" % dict(reasons.most_common(8))), flush=True)
-            print(_c("2", "      learner (%d steps, %.0fs): collate %.1fs | dispatch %.1fs | blocked on %s %.1fs | "
-                          "other (assemble, save, ...) %.1fs"
-                     % (timing["steps"], t_learn, timing["collate"], timing["dispatch"], device,
-                        timing["wait"],
-                        t_learn - timing["collate"] - timing["dispatch"] - timing["wait"])), flush=True)
+            draw_frac = winners["draw"] / max(sum(winners.values()), 1)
+            print(_tag("v%d" % version, 45)
+                  + _c("1", "%d games, %d plies" % (n, plies))
+                  + "  (avg %.0f plies, %.0f legal)    " % (avg_plies, data["counts"].mean())
+                  + _c(BLACK_TEAM, "black %d" % winners["b"]) + "   "
+                  + _c(WHITE_TEAM, "white %d" % winners["w"]) + "   "
+                  + _health("draw %d" % winners["draw"], draw_frac, 0.10, 0.25)
+                  + ((_c(WATCH, "    [%d stale dropped]" % stale)) if stale else ""),
+                  flush=True)
+            print(_tag("train", 114) + "    ".join([
+                "pg " + _c("1", "%+.3f" % stats["pg"]),
+                "vf " + _c("1", "%.3f" % stats["vf"]),
+                "ent " + _health("%.2f" % stats["ent"], stats["ent"], 0.3, 0.1, True),
+                "kl " + _health("%.4f" % stats["kl"], stats["kl"], 0.03, 0.045),
+                "clip " + _health("%.2f" % stats["clipfrac"], stats["clipfrac"], 0.25, 0.4),
+                "ev " + _health("%.2f" % expl_var, expl_var, 0.5, 0.2, True)]), flush=True)
+            # the longer of the two is what limits the cycle; collect ~0 s means games were already waiting
+            print(_tag("time", 111)
+                  + "collect " + _c(WATCH if t_collect > t_learn else "1", "%.0fs" % t_collect)
+                  + ("" if t_collect < 1 else " (%.0f plies/s)" % (plies / t_collect))
+                  + "    learn " + _c(WATCH if t_learn >= t_collect else "1", "%.0fs" % t_learn)
+                  + " (%d steps)" % timing["steps"]
+                  + (_c(WATCH, "  KL gate stopped it early") if timing["kl_stop"] else "")
+                  + ("   games were already waiting" if t_collect < 1 else ""), flush=True)
+            print(_tag("learner", 183)
+                  + "collate " + _share("%.1fs" % timing["collate"], timing["collate"], t_learn)
+                  + " (build %.1fs + to-device " % timing["collate_np"]
+                  + _share("%.1fs" % timing["collate_xfer"], timing["collate_xfer"], t_learn) + ")"
+                  + "    dispatch " + _share("%.1fs" % timing["dispatch"], timing["dispatch"], t_learn)
+                  + "    blocked on %s " % device + _share("%.1fs" % timing["wait"], timing["wait"], t_learn)
+                  + "    other %.1fs" % (t_learn - timing["collate"] - timing["dispatch"] - timing["wait"]),
+                  flush=True)
+            sd = timing["step_dispatch"]
+            if len(sd) >= 4:
+                # Is the dispatch cost per step, or paid once per new shape / once per iteration?
+                new = [d for d, f in zip(sd, timing["new_shape"]) if f]
+                old = [d for d, f in zip(sd, timing["new_shape"]) if not f]
+                med = float(np.median(old)) if old else float("nan")
+                print(_tag("steps", 183)
+                      + "first 3: " + " ".join(_c(WATCH if d > 3 * med else "1", "%.2f" % d) for d in sd[:3]) + " s"
+                      + "    typical " + _c("1", "%.3f s" % med)
+                      + "    new shapes: %d, cost " % len(new) + _share("%.1fs" % sum(new), sum(new), t_learn)
+                      + "    slowest %.2f s" % max(sd), flush=True)
+            print(_tag("ended", 215) + _ended_line(reasons), flush=True)
             if vs_past:
                 for g in vs_past:                     # remember how the current net does against each snapshot
-                    s = 1.0 if g["winner"] == g["net_team"] else 0.5 if g["winner"] is None else 0.0
+                    s_ = 1.0 if g["winner"] == g["net_team"] else 0.5 if g["winner"] is None else 0.0
                     sc, c = POOL_SCORE.get(g["opp"], (0.0, 0.0))
-                    POOL_SCORE[g["opp"]] = (sc * 0.97 + s, c * 0.97 + 1.0)   # recent games count more
+                    POOL_SCORE[g["opp"]] = (sc * 0.97 + s_, c * 0.97 + 1.0)   # recent games count more
                 pw = sum(g["winner"] == g["net_team"] for g in vs_past)
                 pd = sum(g["winner"] is None for g in vs_past)
                 hard = sorted(((sc + 1) / (c + 2), p) for p, (sc, c) in POOL_SCORE.items() if c >= 3)[:3]
-                print(_c("2", "      vs older snapshots (%d games): " % len(vs_past))
-                      + _c("36", "+%d =%d -%d" % (pw, pd, len(vs_past) - pw - pd))
-                      + _c("2", "   toughest: " + ", ".join("v%d %.2f" % (int(os.path.basename(p)[5:10]), s)
-                                                           for s, p in hard)), flush=True)
+                print(_tag("vs old", 80)
+                      + "against %d older snapshots: " % len(vs_past)
+                      + _c(GOOD, "won %d" % pw) + "  " + _c(WATCH, "drew %d" % pd) + "  "
+                      + _c(BAD if len(vs_past) - pw - pd else "1", "lost %d" % (len(vs_past) - pw - pd))
+                      + "    toughest: " + "  ".join(
+                          "v%d " % int(os.path.basename(p)[5:10]) + _health("%.2f" % sc_, sc_, 0.75, 0.55, True)
+                          for sc_, p in hard), flush=True)
             # ev split by how far through the game the decision was: if the value head works,
             # the last bucket (outcome nearly decided) should be much higher than the first.
             err = data["ret"] - data["value"]
@@ -574,12 +705,14 @@ def main():
                 v = float(np.var(data["ret"][m])) if m.any() else 0.0
                 e = 1 - float(np.var(err[m])) / v if v > 1e-8 else float("nan")
                 parts.append("%s %s" % (label, _health("%.2f" % e, e, 0.5, 0.2, True)))
-            print(_c("2", "      ev by game phase: ") + _c("2", " | ").join(parts), flush=True)
+            print(_tag("phase", 218) + "ev by game phase:  " + "    ".join(parts), flush=True)
 
             if args.eval_every and version % args.eval_every == 0:
                 w, d, l, score, ev = run_eval(pool, args, next_seed)
-                print(_c("1;35", "      EVAL v%d vs random: +%d =%d -%d  score %.3f"
-                         % (ev, w, d, l, score)), flush=True)
+                print(_tag("EVAL", 207) + _c("1", "v%d vs random:" % ev) + " "
+                      + _c(GOOD, "won %d" % w) + "  " + _c(WATCH, "drew %d" % d) + "  "
+                      + _c(BAD if l else "1", "lost %d" % l) + "    score "
+                      + _health("%.3f" % score, score, 0.9, 0.7, True), flush=True)
                 row.update(eval_score=round(score, 3), eval_w=w, eval_d=d, eval_l=l)
 
             if writer is None:
