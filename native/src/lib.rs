@@ -557,21 +557,27 @@ impl State {
         true
     }
 
-    /// engine.bishop_wall_check
+    /// engine.bishop_wall_check: a closed wall only strands a bishop that is on the
+    /// board, unpromoted, not home, and of that home square's colour.
     fn bishop_wall_check(&self, team: usize) -> bool {
-        let mut home_cols = [false; 8];
+        let mut stray = [false; 2];
         for k in 0..16 {
             let i = team * 16 + k;
             let p = &self.p[i];
-            if p.on && p.ptype == BISHOP && self.at_home(i) {
-                home_cols[(p.pos & 7) as usize] = true;
+            if p.on && p.ptype == BISHOP && !p.promoted && !self.at_home(i) {
+                let (pr, pc) = rc(p.pos);
+                stray[((pr + pc) % 2) as usize] = true;
             }
         }
+        if !stray[0] && !stray[1] {
+            return true;
+        }
         let r = pawn_home_row(team);
-        let walls: [(usize, [(i32, i32); 2]); 2] =
+        let br = back_row(team);
+        let walls: [(i32, [(i32, i32); 2]); 2] =
             [(2, [(r, 1), (r, 3)]), (5, [(r, 4), (r, 6)])];
         for &(col, ref squares) in walls.iter() {
-            if home_cols[col] {
+            if !stray[((br + col) % 2) as usize] {
                 continue;
             }
             let mut walled = 0;
@@ -955,12 +961,8 @@ fn losing(st: &State, team: usize) -> i32 {
                 break;
             }
         }
-        if !moving {
-            let outside =
-                (0..16).any(|k| st.p[base + k].on && st.p[base + k].ptype != KNIGHT && !st.at_home(base + k));
-            if outside {
-                return 1;
-            }
+        if !moving && st.walled_off(team) {
+            return 1;
         }
     }
     if !st.pawn_scan(team, None) {
