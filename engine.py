@@ -49,6 +49,7 @@ Pos = Tuple[int, int]
 SIZE = 8
 PROMOTION_TYPES = ("q", "n", "b", "r")  # what a gifted pawn may be promoted to
 MOVE_CACHE_LIMIT = 250_000              # entries; the cache is flushed when full
+_WITNESSES = 6                         # recent "this move proves the team can move" hints kept per team
 
 _PTYPE_INDEX = {ptype: i for i, ptype in enumerate(PTYPES)}
 
@@ -385,7 +386,8 @@ class Game:
     def __init__(self, rules: Optional[Rules] = None):
         self.rules = rules or Rules()
         self._moves_cache: dict = {}
-        self._witness: dict = {}          # team -> (piece index, dst) that last proved it could move
+        self._witness: dict = {}          # team -> [(piece index, dst), ...] recent proofs that it could move
+        self._has_move: dict = {}         # (snapshot, team) -> bool, per game (see has_legal_move)
         self.reset()
 
     # ------------------------------------------------------------------
@@ -397,6 +399,7 @@ class Game:
         self._snap: Optional[bytes] = None
         self._moves_cache.clear()
         self._witness.clear()
+        self._has_move.clear()
         self.pieces: Dict[str, List[Piece]] = {}
         self.kings: Dict[str, Piece] = {}
         uid = 0
@@ -435,6 +438,7 @@ class Game:
         """
         self.board.fill(None)
         self._moves_cache.clear()
+        self._has_move.clear()
         self.actions = {}
 
     @staticmethod
@@ -746,21 +750,38 @@ class Game:
     def has_legal_move(self, team: str) -> bool:
         """Does ``team`` have at least one raw move?  (Stops at the first.)"""
         pieces = self.pieces[team]
-        # Consecutive positions are nearly identical, so the move that proved
-        # the team could move last time almost always still works: try it first.
-        w = self._witness.get(team)
-        if w is not None:
-            p = pieces[w[0]]
-            if p.ontheboard and not p.locked and self.check_legal_move(p.pos, w[1]).legal:
-                return True
+        # Consecutive positions are nearly identical, so a move that proved the
+        # team could move recently almost always still works: try those first.
+        ws = self._witness.get(team)
+        if ws:
+            for n, (i, dst) in enumerate(ws):
+                p = pieces[i]
+                if p.ontheboard and not p.locked and self.check_legal_move(p.pos, dst).legal:
+                    if n:                                   # most recently useful first
+                        ws.insert(0, ws.pop(n))
+                    return True
+        # The answer depends only on the board fingerprint (which encodes every
+        # piece's type, promotion and lock state; "all pieces on board" follows
+        # from it), and gift checking asks about the same positions repeatedly.
+        key = (self.snapshot(), team)
+        hit = self._has_move.get(key)
+        if hit is not None:
+            return hit
+        result = False
         for i, p in enumerate(pieces):
             if p.ontheboard:
                 found = self.piece_moves(p, first_only=True)
                 if found:
                     if not found[0].demote:
-                        self._witness[team] = (i, found[0].dst)
-                    return True
-        return False
+                        ws = self._witness.setdefault(team, [])
+                        ws.insert(0, (i, found[0].dst))
+                        del ws[_WITNESSES:]
+                    result = True
+                    break
+        if len(self._has_move) >= MOVE_CACHE_LIMIT:
+            self._has_move.clear()
+        self._has_move[key] = result
+        return result
 
     # ------------------------------------------------------------------
     # Gifts
@@ -1314,12 +1335,12 @@ class Game:
     # ------------------------------------------------------------------
     def clone(self) -> "Game":
         """Independent deep copy (for tree search).  Caches are not copied."""
-        saved = self._moves_cache
-        self._moves_cache = {}
+        saved = self._moves_cache, self._has_move
+        self._moves_cache, self._has_move = {}, {}
         try:
             other = copy.deepcopy(self)
         finally:
-            self._moves_cache = saved
+            self._moves_cache, self._has_move = saved
         return other
 
     def validate(self):
