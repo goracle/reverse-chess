@@ -4,6 +4,8 @@
     python arena.py runs/run2/latest.pt runs/run2/iter_00700.pt
     python arena.py runs/run2/latest.pt runs/run2/iter_00700.pt --games 400 --workers 8
 
+Either side may also be the rule-based walk-home player from heuristic.py, written
+heur:nogift or heur:gift (e.g. ``python arena.py runs/run2/latest.pt heur:nogift``).
 Both networks sample from their policy (same as the vs-random EVAL in train.py),
 half the games with A as black and half as white.  Score is from A's point of
 view: win = 1, draw = 0.5, loss = 0.  0.5 means equal strength; the +/- is a
@@ -14,6 +16,7 @@ Everything runs on the CPU, so it is fine to run while train.py is training
 import argparse
 import multiprocessing as mp
 import os
+import random
 import time
 from collections import Counter
 from concurrent.futures import ProcessPoolExecutor
@@ -26,25 +29,47 @@ import numpy as np  # noqa: E402
 _S = {}
 
 
-def _init(path_a, path_b, max_plies):
-    import torch
-    torch.set_num_threads(1)
+def _is_heur(spec):
+    return spec.startswith("heur:")
+
+
+def _load(spec):
+    """(model, version) for a checkpoint path, or (("heur", mode), 0)."""
+    if _is_heur(spec):
+        mode = spec.split(":", 1)[1]
+        if mode not in ("nogift", "gift"):
+            raise SystemExit("unknown heuristic %r (use heur:nogift or heur:gift)" % spec)
+        return ("heur", mode), 0
     import net as netlib
+    model, ckpt = netlib.load_checkpoint(spec)
+    return model, int(ckpt["version"])
+
+
+def _init(path_a, path_b, max_plies):
+    if not (_is_heur(path_a) and _is_heur(path_b)):
+        import torch
+        torch.set_num_threads(1)
     from engine import Rules
-    model_a, ckpt_a = netlib.load_checkpoint(path_a)
-    model_b, ckpt_b = netlib.load_checkpoint(path_b)
+    model_a, va = _load(path_a)
+    model_b, vb = _load(path_b)
     _S.update(models={"a": model_a, "b": model_b}, rules=Rules(max_plies=max_plies),
-              versions=(int(ckpt_a["version"]), int(ckpt_b["version"])))
+              versions=(va, vb))
 
 
 def _play(seed, a_team):
-    import net as netlib
     from engine import Game
     rng = np.random.default_rng(seed)
+    py_rng = random.Random(seed)                 # for the heuristic player
     game = Game(_S["rules"])
     while not game.done:
         who = "a" if game.turn == a_team else "b"
-        action, _ = netlib.choose_action(_S["models"][who], game, rng)
+        model = _S["models"][who]
+        if isinstance(model, tuple):
+            import heuristic
+            action = heuristic.choose(game, py_rng, model[1])
+        else:
+            import net as netlib
+            action, _ = netlib.choose_action(model, game, rng)
         game.step(action)
     result = {"a_team": a_team, "winner": game.winner, "reason": game.end_reason,
               "plies": game.ply, "versions": _S["versions"]}
@@ -55,15 +80,15 @@ def _play(seed, a_team):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("a", help="checkpoint A (e.g. the newest)")
-    ap.add_argument("b", help="checkpoint B (e.g. an older snapshot)")
+    ap.add_argument("a", help="checkpoint A (e.g. the newest), or heur:nogift / heur:gift")
+    ap.add_argument("b", help="checkpoint B (e.g. an older snapshot), or heur:nogift / heur:gift")
     ap.add_argument("--games", type=int, default=200)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--max-plies", type=int, default=300, help="draw after this many plies (train.py default)")
     ap.add_argument("--seed", type=int, default=12345)
     args = ap.parse_args()
     for p in (args.a, args.b):
-        if not os.path.exists(p):
+        if not _is_heur(p) and not os.path.exists(p):
             raise SystemExit("no such checkpoint: %s" % p)
 
     t0 = time.time()
