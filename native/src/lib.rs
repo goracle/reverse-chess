@@ -557,6 +557,51 @@ impl State {
         true
     }
 
+    /// engine._walled_off: with every pawn home (a solid wall), is a piece on the board
+    /// stranded?  Non-knights outside the wall are; pieces on the back row can only slide
+    /// sideways and never pass each other, so their left-to-right order must match distinct
+    /// home squares of their own type (a bishop cannot move, so it must already be home).
+    fn walled_off(&self, team: usize) -> bool {
+        let back = back_row(team);
+        let mut line: Vec<(i32, usize)> = Vec::with_capacity(8); // (col, piece index)
+        for k in 0..16 {
+            let i = team * 16 + k;
+            let p = &self.p[i];
+            if !p.on || p.ptype == KNIGHT || p.ptype == PAWN {
+                continue;
+            }
+            let (r, c) = rc(p.pos);
+            if r != back {
+                return true;
+            }
+            line.push((c, i));
+        }
+        line.sort();
+        let mut last = -1;
+        for &(c, i) in line.iter() {
+            let options: &[i32] = match self.p[i].ptype {
+                KING => &[4],
+                QUEEN => &[3],
+                ROOK => &[0, 7],
+                _ => {
+                    // bishop: it cannot move, so it only counts if it is already home
+                    if self.at_home(i) {
+                        if c > last {
+                            last = c;
+                            continue;
+                        }
+                    }
+                    return true;
+                }
+            };
+            match options.iter().copied().filter(|&o| o > last).min() {
+                Some(o) => last = o,
+                None => return true,
+            }
+        }
+        false
+    }
+
     /// engine.bishop_wall_check: a closed wall only strands a bishop that is on the
     /// board, unpromoted, not home, and of that home square's colour.
     fn bishop_wall_check(&self, team: usize) -> bool {
