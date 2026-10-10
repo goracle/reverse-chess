@@ -1042,15 +1042,20 @@ class Game:
         return needed <= spare
 
     def bishop_wall_check(self, team: str) -> bool:
-        """Weak check that neither bishop is walled off from its home square.
+        """Weak check that no bishop is walled off from its home square.
 
-        A bishop that is not home yet is stuck when both pawns guarding its
-        home square's diagonals are locked at home.
+        A wall (both pawns guarding a bishop's home square locked at home) only
+        strands a bishop that is on the board, unpromoted, not home, and of that
+        home square's colour.  A bishop still off the board is not stranded: it can
+        be given back straight onto its home square, and a gift anywhere it would
+        be stranded is refused by _gift_problem (this check runs after the spawn).
         """
-        home_cols = {p.pos[1] for p in self.pieces[team]
-                     if p.ontheboard and p.ptype == "b" and p.at_home()}
+        stray = {square_color(p.pos) for p in self.pieces[team]
+                 if p.ontheboard and p.ptype == "b" and not p.promoted and not p.at_home()}
+        if not stray:
+            return True
         for col, squares in _BISHOP_WALLS[team].items():
-            if col in home_cols:
+            if square_color((back_row(team), col)) not in stray:
                 continue
             walled = 0
             for sq in squares:
@@ -1442,6 +1447,9 @@ class Game:
     def _win_reason(self, team: str) -> Optional[str]:
         """Why ``team`` has just won (it got home, or the other team is lost)."""
         if self.check_for_win(team):
+            assert self._losing_reason(team) is None, (
+                "%s has every piece home yet is scored as lost: %s"
+                % (full_name(team), self._losing_reason(team)))
             return "%s has every piece home" % full_name(team)
         why = self._losing_reason(other_team(team))
         if why:
@@ -1468,13 +1476,42 @@ class Game:
             return "no way for all of %s's bishops to get home" % name
         raise RuntimeError("native engine failed (code %d)" % code)
 
+    def _walled_off(self, team: str) -> bool:
+        """With every pawn home (a solid wall), is a piece on the board stranded?
+
+        Only called once no pawn is left to move.  Pieces already home are fine.
+        A non-knight piece outside the wall can never get past it.  Pieces on the
+        back row (behind the wall) can only slide sideways and never pass one
+        another, so they are stranded unless their left-to-right order can be
+        matched, in that order, to distinct home squares of their own type
+        (a bishop cannot move at all, so it must already be home).  Knights jump
+        and are ignored.  Pieces still off the board are not stranded.
+        """
+        back = back_row(team)
+        line = []
+        for p in self.pieces[team]:
+            if not p.ontheboard or p.ptype in ("n", "p"):
+                continue
+            if p.pos[0] != back:
+                return True
+            line.append(p)
+        line.sort(key=lambda p: p.pos[1])
+        last = -1
+        for p in line:
+            options = (p.pos[1],) if p.ptype == "b" and p.at_home() else \
+                      () if p.ptype == "b" else p.home[1]
+            nxt = min((c for c in options if c > last), default=None)
+            if nxt is None:
+                return True
+            last = nxt
+        return False
+
     def _losing_reason_py(self, team: str) -> Optional[str]:
         """Pure-Python reference for _losing_reason: why ``team`` can no longer win, or None.
 
         Three kinds of dead end are detected:
-          * all pawns are home (a solid wall) yet a non-knight piece is still
-            outside - it can never get past the wall (approximation: a piece
-            already stuck behind the wall on the back row also counts);
+          * all pawns are home (a solid wall) and some piece on the board can no
+            longer get home (see _walled_off);
           * the pawns cannot be assigned distinct home columns within the
             number of gifts that are still possible;
           * a bishop is walled off from its home square.
@@ -1491,11 +1528,8 @@ class Game:
                 elif (p.ptype == "p" or p.promoted) and not p.at_home():
                     moving = True
                     break
-            if not moving:
-                outside = any(p.ontheboard and p.ptype != "n" and not p.at_home()
-                              for p in pieces)
-                if outside:
-                    return "pawn wall-off prevents %s from winning" % name
+            if not moving and self._walled_off(team):
+                return "pawn wall-off prevents %s from winning" % name
         if not self.pawn_scan(team):
             return "no way for all of %s's pawns to get home" % name
         if not self.bishop_wall_check(team):
