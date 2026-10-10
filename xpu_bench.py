@@ -79,7 +79,22 @@ def amp_ctx(dev, fp16):
     return torch.autocast(device_type=dev, dtype=torch.float16)
 
 
-def make_stepper(model, opt, dev, fp16, loss_scale):
+def forward(model, batch, dev, fp16, scope):
+    """scope "all": the whole network under autocast.  scope "trunk": only the
+    conv trunk is fp16; the pointer head (gathers, embeddings, scorer) runs in
+    fp32, so gather/embedding backward never accumulates in half precision."""
+    board, scalars, owner, comps = batch
+    if fp16 and scope == "trunk":
+        with amp_ctx(dev, True):
+            x = model.trunk(board, scalars)
+        x = x.float()
+        g, value = model.global_features(x)
+        return model.action_logits(x, g, owner, comps), value
+    with amp_ctx(dev, fp16):
+        return model(*batch)
+
+
+def make_stepper(model, opt, dev, fp16, loss_scale, scope="trunk"):
     """Returns step(batch).  Only the forward pass is under autocast; the loss,
     backward and optimizer step are outside it (as the PyTorch AMP recipe says)."""
     scaler = None
@@ -89,8 +104,7 @@ def make_stepper(model, opt, dev, fp16, loss_scale):
     params = [p for p in model.parameters() if p.requires_grad]
 
     def step(batch):
-        with amp_ctx(dev, fp16):
-            logits, value = model(*batch)
+        logits, value = forward(model, batch, dev, fp16, scope)
         loss = value.float().pow(2).mean() + logits.float().pow(2).mean()
         opt.zero_grad(set_to_none=True)
         if scaler is not None:
@@ -108,7 +122,7 @@ def make_stepper(model, opt, dev, fp16, loss_scale):
     return step
 
 
-def bench(dev, label=None, fp16=False, loss_scale="static", steps=8, epochs=2):
+def bench(dev, label=None, fp16=False, loss_scale="static", steps=8, epochs=2, warmup=3, scope="trunk"):
     label = label or dev
     print("\n== %s ==" % label, flush=True)
     if dev == "xpu":
@@ -118,14 +132,17 @@ def bench(dev, label=None, fp16=False, loss_scale="static", steps=8, epochs=2):
     model = netlib.PolicyValueNet(64, 4, 128).to(dev).train()
     opt = torch.optim.Adam(model.parameters(), lr=3e-4, eps=1e-5)
     batch = stage("make a batch", dev, lambda: make_batch(dev))
-    step = make_stepper(model, opt, dev, fp16, loss_scale)
+    step = make_stepper(model, opt, dev, fp16, loss_scale, scope)
 
     def forward_only():
-        with torch.no_grad(), amp_ctx(dev, fp16):
-            model(*batch)
+        with torch.no_grad():
+            forward(model, batch, dev, fp16, scope)
     stage("forward only (first call)", dev, forward_only)
     stage("training step: first step", dev, lambda: step(batch))
 
+    for _ in range(warmup):      # lazily-compiled kernels and GPU clock ramp-up
+        step(batch)
+    sync(dev)
     times = []
     for _ in range(steps):
         t = time.time()
@@ -136,7 +153,8 @@ def bench(dev, label=None, fp16=False, loss_scale="static", steps=8, epochs=2):
     print("  %-38s%8.3fs   (per minibatch of %d decisions)" % ("training step: median of %d" % steps, med, BATCH))
     print("  %-38s %.3fs min, %.3fs max" % ("", min(times), max(times)))
     # one training iteration is ~8000 plies = ~31 minibatches x epochs
-    print("  => estimated learn time per iteration: ~%.0fs  (%d epochs)" % (med * 31 * epochs, epochs), flush=True)
+    print("  => estimated learn time per iteration: ~%.0fs from the median, ~%.0fs from the min  (%d epochs)" % (
+        med * 31 * epochs, min(times) * 31 * epochs, epochs), flush=True)
     return med
 
 
@@ -145,7 +163,7 @@ def flat_grads(model):
                       if p.grad is not None])
 
 
-def check_numerics(dev, loss_scale):
+def check_numerics(dev, loss_scale, scope="trunk"):
     """Same weights, same batch: fp32 vs fp16-autocast outputs and gradients.
 
     A smoke test only: random init weights and random data say nothing about how
@@ -162,8 +180,7 @@ def check_numerics(dev, loss_scale):
 
     def run(fp16):
         model.zero_grad(set_to_none=True)
-        with amp_ctx(dev, fp16):
-            logits, value = model(*batch)
+        logits, value = forward(model, batch, dev, fp16, scope)
         loss = value.float().pow(2).mean() + logits.float().pow(2).mean()
         (loss * (scale if fp16 else 1.0)).backward()
         g = flat_grads(model) / (scale if fp16 else 1.0)
@@ -189,7 +206,11 @@ if __name__ == "__main__":
                     help="also benchmark the xpu with fp16 autocast and compare to fp32")
     ap.add_argument("--loss-scale", choices=["static", "dynamic", "none"], default="static",
                     help="fp16 gradient scaling (see the module docstring)")
-    ap.add_argument("--steps", type=int, default=8, help="timed steps per variant")
+    ap.add_argument("--fp16-scope", choices=["trunk", "all"], default="trunk",
+                    help="trunk: autocast only the conv trunk, policy head stays fp32 (default); "
+                         "all: autocast the whole network")
+    ap.add_argument("--steps", type=int, default=12, help="timed steps per variant")
+    ap.add_argument("--warmup", type=int, default=3, help="untimed steps after the first one")
     ap.add_argument("--epochs", type=int, default=2, help="PPO epochs, for the learn-time estimate only")
     args = ap.parse_args()
     torch.manual_seed(0)
@@ -198,13 +219,13 @@ if __name__ == "__main__":
     on_xpu = hasattr(torch, "xpu") and torch.xpu.is_available()
     if not args.skip_xpu:
         if on_xpu:
-            results["xpu"] = bench("xpu", steps=args.steps, epochs=args.epochs)
+            results["xpu"] = bench("xpu", steps=args.steps, epochs=args.epochs, warmup=args.warmup)
             if args.fp16:
                 try:
-                    results["xpu fp16"] = bench("xpu", label="xpu fp16 (autocast, loss-scale %s)" % args.loss_scale,
-                                                fp16=True, loss_scale=args.loss_scale,
-                                                steps=args.steps, epochs=args.epochs)
-                    check_numerics("xpu", args.loss_scale)
+                    results["xpu fp16"] = bench("xpu", label="xpu fp16 (%s, loss-scale %s)" % (args.fp16_scope, args.loss_scale),
+                                                fp16=True, loss_scale=args.loss_scale, scope=args.fp16_scope,
+                                                steps=args.steps, epochs=args.epochs, warmup=args.warmup)
+                    check_numerics("xpu", args.loss_scale, args.fp16_scope)
                 except Exception as e:  # e.g. UR_RESULT_ERROR_* from an unsupported kernel
                     print("\nfp16 on the xpu FAILED: %s: %s" % (type(e).__name__, e), flush=True)
         else:
@@ -212,7 +233,7 @@ if __name__ == "__main__":
     if not args.skip_cpu:
         torch.set_num_threads(args.cpu_threads)
         print("\n(cpu with %d threads)" % args.cpu_threads)
-        results["cpu"] = bench("cpu", steps=args.steps, epochs=args.epochs)
+        results["cpu"] = bench("cpu", steps=args.steps, epochs=args.epochs, warmup=args.warmup)
     print()
     if "xpu" in results and "cpu" in results:
         print("xpu fp32 is %.1fx %s than cpu per step" % (
