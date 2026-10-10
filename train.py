@@ -128,12 +128,25 @@ def make_batches(counts, minibatch, max_actions, rng):
         yield np.asarray(batch)
 
 
-def collate(data, adv, mb, device):
-    """Turn a batch of decision indices into tensors."""
+def collate(data, adv, mb, device, pad=0):
+    """Turn a batch of decision indices into tensors.
+
+    ``pad`` > 0 also returns ``owner_pad`` / ``comps_pad``: the action list padded (with
+    harmless zero rows) up to a multiple of ``pad``.  The number of legal actions differs
+    in every minibatch, and on the Intel GPU each *new* length makes the first call of the
+    policy head cost ~0.3 s of host-side setup (measured with xpu_shape_probe.py).  Feeding
+    the head a few fixed lengths avoids that; the caller slices the logits back to ``n``.
+    """
     counts = data["counts"][mb]
     comps = np.concatenate([data["comps"][s:s + n]
                             for s, n in zip(data["starts"][mb], counts)])
     owner = np.repeat(np.arange(len(mb)), counts)
+    n = len(owner)
+    n_pad = -(-n // pad) * pad if pad > 0 else n
+    comps_pad = np.zeros((n_pad, comps.shape[1]), dtype=comps.dtype)
+    comps_pad[:n] = comps
+    owner_pad = np.zeros(n_pad, dtype=owner.dtype)     # row 0 is a valid owner; the logits are discarded
+    owner_pad[:n] = owner
 
     def t(array, dtype):
         return torch.as_tensor(array, dtype=dtype, device=device)
@@ -143,6 +156,9 @@ def collate(data, adv, mb, device):
         "scalars": t(data["scalars"][mb], torch.float32),
         "comps": t(comps, torch.long),
         "owner": t(owner, torch.long),
+        "comps_pad": t(comps_pad, torch.long),
+        "owner_pad": t(owner_pad, torch.long),
+        "n": n,
         "counts": t(counts, torch.long),
         "chosen": t(data["chosen"][mb], torch.long),
         "old_logp": t(data["logp"][mb], torch.float32),
@@ -172,8 +188,31 @@ def per_decision_logp(logits, owner, counts, amax=None):
 # PPO update
 # --------------------------------------------------------------------------
 
-def ppo_update(model, opt, data, args, device, rng):
-    """A few epochs of PPO on one iteration's data; returns averaged statistics."""
+_PAD_CHECKED = []
+
+
+def _check_padding_equivalent(model, b, logits, value):
+    """Once per run: padding the action list must not change the logits or the value."""
+    with torch.no_grad():
+        ref_logits, ref_value = model(b["board"], b["scalars"], b["owner"], b["comps"])
+        assert ref_logits.shape == logits.shape, (ref_logits.shape, logits.shape)
+        assert torch.allclose(ref_logits, logits.detach(), atol=1e-4, rtol=1e-4), \
+            "padded and unpadded action logits differ: max |diff| %.3g" % (ref_logits - logits.detach()).abs().max().item()
+        assert torch.allclose(ref_value, value.detach(), atol=1e-4, rtol=1e-4), "padded/unpadded values differ"
+    _PAD_CHECKED.append(True)
+
+
+def ppo_update(model, opt, data, args, device, rng, timing=None):
+    """A few epochs of PPO on one iteration's data; returns averaged statistics.
+
+    If ``timing`` is a dict it is filled with where the learner's wall time went:
+    collate (host builds the batch), dispatch (host queues forward/backward/Adam),
+    wait (host blocked until the previous step finished on the device) and steps.
+    wait >> collate + dispatch means the device is the bottleneck; the reverse means
+    the host is, and the device sits idle between steps.
+    """
+    tm = timing if timing is not None else {}
+    tm.update(collate=0.0, dispatch=0.0, wait=0.0, steps=0)
     adv = data["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
     names = ("pg", "vf", "ent", "kl", "clipfrac")
@@ -182,7 +221,9 @@ def ppo_update(model, opt, data, args, device, rng):
 
     def read(t):
         """Copy one step's stats to the host (waits for that step); returns its kl."""
+        t_w = time.perf_counter()
         vals = t.tolist()
+        tm["wait"] += time.perf_counter() - t_w
         for k, v in zip(names, vals):
             stats[k].append(v)
         return vals[3]
@@ -191,15 +232,21 @@ def ppo_update(model, opt, data, args, device, rng):
     for _ in range(args.epochs):
         for mb in make_batches(data["counts"], args.minibatch, args.max_actions, rng):
             amax = int(data["counts"][mb].max())      # host-side, so no GPU sync
-            b = collate(data, adv, mb, device)        # CPU work; overlaps the GPU still busy with the previous step
+            t_c = time.perf_counter()
+            b = collate(data, adv, mb, device, args.pad_actions)   # CPU work; overlaps the GPU still busy with the previous step
+            tm["collate"] += time.perf_counter() - t_c
             if prev is not None:
                 kl = read(prev)
                 prev = None
                 if kl > 1.5 * args.target_kl:         # policy moved too far; stop this iteration
                     stop = True
                     break
+            t_d = time.perf_counter()
             try:
-                logits, value = model(b["board"], b["scalars"], b["owner"], b["comps"])
+                logits, value = model(b["board"], b["scalars"], b["owner_pad"], b["comps_pad"])
+                logits = logits[:b["n"]]                  # drop the padding rows (their gradient is zero)
+                if args.pad_actions > 0 and not _PAD_CHECKED:
+                    _check_padding_equivalent(model, b, logits, value)
                 logp_all, mask = per_decision_logp(logits, b["owner"], b["counts"], amax)
                 rows = torch.arange(len(mb), device=device)
                 logp = logp_all[rows, b["chosen"]]
@@ -220,6 +267,8 @@ def ppo_update(model, opt, data, args, device, rng):
                 raise
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             opt.step()
+            tm["dispatch"] += time.perf_counter() - t_d
+            tm["steps"] += 1
 
             with torch.no_grad():                     # stays on the device; read next time round
                 prev = torch.stack([
@@ -303,6 +352,9 @@ def parse_args():
     g.add_argument("--clip", type=float, default=0.2)
     g.add_argument("--vf-coef", type=float, default=0.5)
     g.add_argument("--ent-coef", type=float, default=0.01)
+    g.add_argument("--pad-actions", type=int, default=4096,
+                   help="pad each minibatch's action list up to a multiple of this, so the policy head sees "
+                        "only a few distinct shapes (a new shape costs ~0.3 s on the Intel GPU); 0 = off")
     g.add_argument("--grad-clip", type=float, default=1.0)
     g.add_argument("--target-kl", type=float, default=0.03)
     g = ap.add_argument_group("evaluation / checkpoints")
@@ -448,7 +500,8 @@ def main():
             t1 = time.time()
             data = assemble(games, args.draw_value, args.shape_coef, args.gamma, args.gae_lambda)
             model.train()
-            stats = ppo_update(model, opt, data, args, device, rng)
+            timing = {}
+            stats = ppo_update(model, opt, data, args, device, rng, timing)
             version += 1
             netlib.save_checkpoint(latest, model, version, opt.state_dict())
             if version % args.save_every == 0:
@@ -494,6 +547,11 @@ def main():
                 + ((_c("33", "  [%d stale dropped]" % stale)) if stale else ""),
                 flush=True)
             print(_c("2", "      ended by: %s" % dict(reasons.most_common(8))), flush=True)
+            print(_c("2", "      learner (%d steps, %.0fs): collate %.1fs | dispatch %.1fs | blocked on %s %.1fs | "
+                          "other (assemble, save, ...) %.1fs"
+                     % (timing["steps"], t_learn, timing["collate"], timing["dispatch"], device,
+                        timing["wait"],
+                        t_learn - timing["collate"] - timing["dispatch"] - timing["wait"])), flush=True)
             if vs_past:
                 for g in vs_past:                     # remember how the current net does against each snapshot
                     s = 1.0 if g["winner"] == g["net_team"] else 0.5 if g["winner"] is None else 0.0
