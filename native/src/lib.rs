@@ -6,6 +6,9 @@
 //!
 //! No dependencies, plain C ABI, loaded from Python with ctypes.
 //!
+//! `step.rs` adds `rc_step` (one whole ply: apply the action, win/draw checks, the next
+//! side's actions) and `rc_observe` (network input planes) for fastgame.py.
+//!
 //! State wire format (128 bytes): 32 pieces x 4 bytes, in engine.py's piece
 //! order (black 0..16 then white 16..32; each side: 8 pawns, king, 2 rooks,
 //! 2 bishops, queen, 2 knights).  Per piece: [flags, pos, ptype, 0] with
@@ -17,6 +20,9 @@
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
+
+mod nnet;
+mod step;
 
 const PAWN: u8 = 0;
 const KING: u8 = 1;

@@ -33,6 +33,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import rustnet
 from engine import SIZE, Game
 from env import (NUM_BOARD_PLANES, NUM_SCALARS, _NUM_GIFT, _NUM_PROMO,
                  action_components, encode_observation)
@@ -147,6 +148,20 @@ def action_components_array(game: Game) -> np.ndarray:
     return comps
 
 
+def forward_np(model, boards: np.ndarray, scalars: np.ndarray, counts: np.ndarray, comps: np.ndarray):
+    """Run ``model`` (a PyTorch ``PolicyValueNet`` or a ``rustnet.RustNet``) on a batch of
+    positions: boards (B,18,8,8) f32, scalars (B,17) f32, counts (B,) legal actions per position,
+    comps (sum counts, 6) uint8 with the positions' actions back to back.
+    Returns numpy ``(logits (sum counts,), value (B,))``."""
+    if isinstance(model, rustnet.RustNet):
+        return model.forward(boards, scalars, counts, comps)
+    with torch.inference_mode():
+        logits, value = model(torch.from_numpy(boards), torch.from_numpy(scalars),
+                              torch.from_numpy(np.repeat(np.arange(len(counts), dtype=np.int64), counts)),
+                              torch.from_numpy(comps.astype(np.int64)))
+    return logits.numpy(), value.numpy()
+
+
 def choose_action(model: PolicyValueNet, game: Game, rng: np.random.Generator,
                   greedy: bool = False):
     """Pick an action for the side to move.
@@ -160,14 +175,11 @@ def choose_action(model: PolicyValueNet, game: Game, rng: np.random.Generator,
     actions = game.legal_actions()
     n = len(actions)
     comps = action_components_array(game)
-    with torch.inference_mode():
-        logits, value = model(
-            torch.from_numpy(obs["board"])[None],
-            torch.from_numpy(obs["scalars"])[None],
-            torch.zeros(n, dtype=torch.long),
-            torch.from_numpy(comps.astype(np.int64)),
-        )
-        logp = torch.log_softmax(logits, dim=0).numpy()
+    logits, value = forward_np(model, obs["board"][None], obs["scalars"][None],
+                               np.array([n], dtype=np.int64), comps)
+    z = logits.astype(np.float32)
+    z -= z.max()
+    logp = z - np.log(np.exp(z).sum(dtype=np.float32))
     if greedy:
         idx = int(np.argmax(logp))
     else:
@@ -199,13 +211,9 @@ class SearchEvaluator:
         obs = encode_observation(game)
         actions = game.legal_actions()
         comps = action_components_array(game)
-        with torch.inference_mode():
-            logits, value = self.model(
-                torch.from_numpy(obs["board"])[None],
-                torch.from_numpy(obs["scalars"])[None],
-                torch.zeros(len(actions), dtype=torch.long),
-                torch.from_numpy(comps.astype(np.int64)))
-        z = logits.numpy().astype(np.float64)
+        logits, value = forward_np(self.model, obs["board"][None], obs["scalars"][None],
+                                   np.array([len(actions)], dtype=np.int64), comps)
+        z = logits.astype(np.float64)
         p = np.exp(z - z.max())
         return Analysis(float(value[0]), actions, p / p.sum()), obs, comps
 
@@ -222,14 +230,9 @@ class SearchEvaluator:
         actions = [g.legal_actions() for g in games]
         comps = [action_components_array(g) for g in games]
         counts = np.fromiter((len(a) for a in actions), dtype=np.int64, count=len(games))
-        with torch.inference_mode():
-            logits, value = self.model(
-                torch.from_numpy(np.stack([o["board"] for o in obs])),
-                torch.from_numpy(np.stack([o["scalars"] for o in obs])),
-                torch.from_numpy(np.repeat(np.arange(len(games), dtype=np.int64), counts)),
-                torch.from_numpy(np.concatenate(comps).astype(np.int64)))
-        z = logits.numpy().astype(np.float64)
-        value = value.numpy()
+        logits, value = forward_np(self.model, np.stack([o["board"] for o in obs]),
+                                   np.stack([o["scalars"] for o in obs]), counts, np.concatenate(comps))
+        z = logits.astype(np.float64)
         out, start = [], 0
         for k, n in enumerate(counts):
             zk = z[start:start + n]

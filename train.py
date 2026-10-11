@@ -68,6 +68,7 @@ import torch
 import net as netlib
 import returns
 import rollout
+import rustnet
 
 # ---- terminal colours --------------------------------------------------------
 # Off when piped or when NO_COLOR is set; FORCE_COLOR=1 turns them on regardless.
@@ -272,6 +273,169 @@ def collate(data, adv, mb, device, pad=0, tm=None):
     return out
 
 
+_BUFFERS = {}     # (name, device) -> persistent device buffer, grown (never shrunk) when needed
+
+
+def _to_device(name, array, dtype, device, persist):
+    """``array`` as a ``dtype`` tensor on ``device``.
+
+    With ``persist`` the data is copied into a buffer that lives across iterations (allocated with
+    25% slack and only regrown if an iteration needs more) and a view of it is returned.  Without
+    it every iteration allocates fresh device tensors of a slightly different size and frees them
+    again, which on the Intel GPU (device memory is system memory) pays allocation / first-touch
+    costs again and again.  Rows past the view's end are never read."""
+    if not persist:
+        return torch.as_tensor(array, dtype=dtype, device=device)
+    host = torch.as_tensor(array, dtype=dtype)
+    n = host.shape[0]
+    key = (name, str(device))
+    buf = _BUFFERS.get(key)
+    if buf is None or buf.shape[0] < n or buf.dtype != dtype or buf.shape[1:] != host.shape[1:]:
+        _BUFFERS.pop(key, None)                                   # free the old one first
+        buf = torch.empty((int(n * 1.25) + 16,) + tuple(host.shape[1:]), dtype=dtype, device=device)
+        _BUFFERS[key] = buf
+    view = buf[:n]
+    view.copy_(host)
+    return view
+
+
+def _dev_call(device, name, *a):
+    """``torch.<xpu|cuda>.<name>(*a)``, or None when this backend has no such function (the log
+    then says n/a; nothing is guessed)."""
+    mod = getattr(torch, torch.device(device).type, None)
+    fn = getattr(mod, name, None) if mod is not None else None
+    return None if fn is None else fn(*a)
+
+
+def _device_total_bytes(device):
+    props = _dev_call(device, "get_device_properties", 0)
+    return getattr(props, "total_memory", None)
+
+
+class DeviceData:
+    """One iteration's training set, resident on the device.
+
+    ``collate`` copied ~13 small tensors to the device for EVERY minibatch (boards, scalars,
+    actions, advantages, ...), each copy queued behind the step still running there.  Here the
+    whole set goes over once (a few hundred MB at most), and a minibatch is gathered on the
+    device with ``tensor[indices]``.  The indices of a whole epoch's minibatches (decision
+    ids, action ids, owner ids, search-target ids) are built on the host and sent as ONE
+    int64 array, so a step needs no host-to-device copy at all.
+
+    Produces exactly what ``collate`` does (checked on the first minibatch of a run by
+    ``_check_resident_equivalent``), except that padding rows of the action list repeat action
+    row 0 instead of being zeros; they are scored and then sliced away like before.
+    """
+
+    def __init__(self, data, adv, device, tm, persist=False):
+        t0 = time.perf_counter()
+        self.device = device
+        self.h_counts, self.h_starts = data["counts"], data["starts"]
+        self.h_searched = data["searched"]
+
+        def t(name, array, dtype):
+            return _to_device(name, array, dtype, device, persist)
+
+        self.boards = t("boards", data["boards"], torch.float32)
+        self.scalars = t("scalars", data["scalars"], torch.float32)
+        self.comps = t("comps", data["comps"], torch.long)
+        self.counts = t("counts", data["counts"], torch.long)
+        self.chosen = t("chosen", data["chosen"], torch.long)
+        self.old_logp = t("old_logp", data["logp"], torch.float32)
+        self.ret = t("ret", data["ret"], torch.float32)
+        self.adv = t("adv", adv, torch.float32)
+        self.searched = t("searched", data["searched"], torch.float32)
+        self.pad_slot = 0
+        self.pi = None
+        if data["pi"] is not None:            # one extra zero entry that "no target" slots point at
+            self.pad_slot = len(data["pi"])
+            self.pi = t("pi", np.concatenate([data["pi"], np.zeros(1, np.float32)]), torch.float32)
+        tm["collate_xfer"] = tm.get("collate_xfer", 0.0) + time.perf_counter() - t0
+
+    def nbytes(self):
+        """Bytes of each resident tensor (what this iteration's data occupies on the device)."""
+        names = ("boards", "scalars", "comps", "counts", "chosen", "old_logp", "ret", "adv", "searched", "pi")
+        return {k: getattr(self, k).numel() * getattr(self, k).element_size()
+                for k in names if getattr(self, k) is not None}
+
+    def plan(self, batches, pad, tm):
+        """Index arrays for a list of minibatches (decision-id arrays), uploaded in one copy."""
+        t_np = time.perf_counter()
+        pieces, meta, off = [], [], 0
+        for mb in batches:
+            counts, starts = self.h_counts[mb], self.h_starts[mb]
+            B, n = len(mb), int(counts.sum())
+            owner = np.repeat(np.arange(B), counts)
+            act_idx = starts[owner] + (np.arange(n) - (np.cumsum(counts) - counts)[owner])
+            n_pad = -(-n // pad) * pad if pad > 0 else n
+            if n_pad > n:                     # harmless filler rows: valid row 0, owner 0
+                act_idx = np.concatenate([act_idx, np.zeros(n_pad - n, dtype=act_idx.dtype)])
+                owner = np.concatenate([owner, np.zeros(n_pad - n, dtype=owner.dtype)])
+            amax = int(counts.max())
+            parts = [np.asarray(mb, dtype=np.int64), act_idx.astype(np.int64), owner.astype(np.int64)]
+            has_pi = self.pi is not None and self.h_searched[mb].any()
+            if has_pi:                        # (B, amax) gather ids; non-searched rows -> zero slot
+                cols = np.arange(amax)[None, :]
+                valid = (cols < counts[:, None]) & (self.h_searched[mb][:, None] != 0)
+                parts.append(np.where(valid, starts[:, None] + cols, self.pad_slot).reshape(-1).astype(np.int64))
+            o_act, o_own = off + B, off + B + n_pad
+            o_pi = o_own + n_pad if has_pi else None
+            meta.append((off, B, n, n_pad, amax, o_act, o_own, o_pi))
+            off += sum(len(x) for x in parts)
+            pieces.extend(parts)
+        packed = np.concatenate(pieces)
+        t_x = time.perf_counter()
+        packed_d = torch.as_tensor(packed, dtype=torch.long, device=self.device)
+        tm["collate_np"] = tm.get("collate_np", 0.0) + t_x - t_np
+        tm["collate_xfer"] = tm.get("collate_xfer", 0.0) + time.perf_counter() - t_x
+        return packed_d, meta
+
+    def batch(self, plan, k):
+        """Minibatch ``k`` of a plan, as the dict ``collate`` returns (all views / gathers)."""
+        P, meta = plan
+        o_mb, B, n, n_pad, amax, o_act, o_own, o_pi = meta[k]
+        mb = P[o_mb:o_mb + B]
+        owner_pad = P[o_own:o_own + n_pad]
+        pi = None if o_pi is None else self.pi[P[o_pi:o_pi + B * amax]].view(B, amax)
+        return {
+            "searched": self.searched[mb],
+            "pi": pi,
+            "board": self.boards[mb],
+            "scalars": self.scalars[mb],
+            "owner": owner_pad[:n],
+            "comps_pad": self.comps[P[o_act:o_act + n_pad]],
+            "owner_pad": owner_pad,
+            "n": n,
+            "n_pad": n_pad,
+            "counts": self.counts[mb],
+            "chosen": self.chosen[mb],
+            "old_logp": self.old_logp[mb],
+            "ret": self.ret[mb],
+            "adv": self.adv[mb],
+        }
+
+
+_RES_CHECKED = []
+
+
+def _check_resident_equivalent(b, data, adv, mb, device, pad):
+    """Once per run: the device-resident minibatch must equal the one ``collate`` builds."""
+    ref = collate(data, adv, mb, device, pad)
+    for key in ("searched", "board", "scalars", "owner", "owner_pad", "counts", "chosen",
+                "old_logp", "ret", "adv"):
+        if key == "owner_pad":
+            ok = torch.equal(ref[key][:ref["n"]].cpu(), b[key][:b["n"]].cpu())
+        else:
+            ok = torch.equal(ref[key].cpu(), b[key].cpu())
+        assert ok, "device-resident batch differs from collate() in %r (rerun with --host-batches)" % key
+    assert torch.equal(ref["comps_pad"][:ref["n"]].cpu(), b["comps_pad"][:b["n"]].cpu()), "comps differ"
+    assert (ref["n"], ref["n_pad"]) == (b["n"], b["n_pad"]), "action counts differ"
+    assert (ref["pi"] is None) == (b["pi"] is None), "pi presence differs"
+    if ref["pi"] is not None:
+        assert torch.equal(ref["pi"].cpu(), b["pi"].cpu()), "search targets differ"
+    _RES_CHECKED.append(True)
+
+
 def per_decision_logp(logits, owner, counts, amax=None):
     """Log-softmax of the flat legal-action logits within each decision.
 
@@ -341,11 +505,22 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
         return vals[3]
 
     stop = False
+    _dev_call(device, "reset_peak_memory_stats")
+    resident = None if args.host_batches else DeviceData(data, adv, device, tm, args.persist_data)
+    tm["gpu_resident"] = _dev_call(device, "memory_allocated")     # data + model + optimizer state
+    tm["gpu_parts"] = {} if resident is None else resident.nbytes()
     for _ in range(args.epochs):
-        for mb in make_batches(data["counts"], args.minibatch, args.max_actions, rng, args.drop_tail):
+        batches = list(make_batches(data["counts"], args.minibatch, args.max_actions, rng, args.drop_tail))
+        plan = resident.plan(batches, args.pad_actions, tm) if resident is not None else None
+        for k, mb in enumerate(batches):
             amax = int(data["counts"][mb].max())      # host-side, so no GPU sync
             t_c = time.perf_counter()
-            b = collate(data, adv, mb, device, args.pad_actions, tm)   # CPU work; overlaps the GPU still busy with the previous step
+            if resident is not None:                  # gathered on the device: no host copies
+                b = resident.batch(plan, k)
+                if not _RES_CHECKED:
+                    _check_resident_equivalent(b, data, adv, mb, device, args.pad_actions)
+            else:
+                b = collate(data, adv, mb, device, args.pad_actions, tm)   # CPU work; overlaps the GPU still busy with the previous step
             tm["collate"] += time.perf_counter() - t_c
             if prev is not None:
                 kl = read(prev)
@@ -418,6 +593,8 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
             break
     if prev is not None:
         read(prev)
+    tm["gpu_peak"] = _dev_call(device, "max_memory_allocated")
+    tm["gpu_total"] = _device_total_bytes(device)
     return {k: float(np.mean(v)) for k, v in stats.items()}
 
 
@@ -451,6 +628,15 @@ def parse_args():
     g.add_argument("--device", default="auto", help="auto | cpu | cuda | xpu (learner only; workers always use the CPU)")
     g.add_argument("--move-cache", type=int, default=50_000,
                    help="engine move-cache entries per worker (memory knob)")
+    g.add_argument("--net-backend", choices=("native", "torch"), default="native",
+                   help="how the self-play workers evaluate the network: native = the Rust forward pass "
+                        "(rustnet.py; needs ./build_native.sh, raises if the library is missing or stale), "
+                        "torch = PyTorch on the CPU (the old behaviour).  The learner always uses torch.")
+    g.add_argument("--persist-data", action=argparse.BooleanOptionalAction, default=True,
+                   help="keep the iteration's training data in device buffers that live across iterations "
+                        "(25%% slack, regrown when needed) instead of allocating and freeing fresh device "
+                        "tensors every iteration.  Uses a few hundred MB more device memory; "
+                        "--no-persist-data is the old behaviour.")
     g = ap.add_argument_group("self-play")
     g.add_argument("--plies-per-iter", type=int, default=8000)
     g.add_argument("--max-plies", type=int, default=300, help="draw after this many plies")
@@ -512,8 +698,16 @@ def parse_args():
                    help="leaves evaluated per network call (virtual loss).  1 = the plain "
                         "one-at-a-time search (default).  Above 1 the 16 simulations are spread "
                         "over many root moves, which flattens the visit distribution the policy "
-                        "is trained on (policy entropy climbs, ce explodes): leave at 1 unless "
-                        "you also raise --search-sims a lot")
+                        "is trained on (policy entropy climbs, ce explodes): see --search-vl, "
+                        "and check_vl.py to measure it on your network")
+    g.add_argument("--search-vl", type=float, default=0.25,
+                   help="virtual-loss strength for --search-batch > 1, 0..1.  1 = every descent in "
+                        "flight counts as a sure loss (the old behaviour: spreads the simulations "
+                        "over many root moves, flattening the visit distribution); 0 = it only "
+                        "counts as a visit (descents spread the way PUCT would spread them; batches "
+                        "shrink when descents collide).  0.25 keeps most of the batching with about "
+                        "half the distortion (check_vl.py measures it on your network).  No effect at "
+                        "--search-batch 1")
     g.add_argument("--search-smooth", type=float, default=0.0,
                    help="blend this fraction of the network's own policy into the search's target "
                         "(the move is still drawn from the unsmoothed search).  Few simulations "
@@ -538,6 +732,9 @@ def parse_args():
                         "1.5 * --target-kl (1 = judge every minibatch on its own, the old behaviour)")
     g.add_argument("--kl-hard", type=float, default=4.0,
                    help="also stop at once if a single minibatch's KL exceeds this multiple of --target-kl")
+    g.add_argument("--host-batches", action="store_true",
+                   help="build and copy every minibatch from the host (the old behaviour) instead of "
+                        "keeping the iteration's data on the device and gathering minibatches there")
     g.add_argument("--drop-tail", action=argparse.BooleanOptionalAction, default=True,
                    help="skip each epoch's last, smaller minibatch (its size is new every iteration, and a "
                         "new batch size costs a one-off setup on the Intel GPU); --no-drop-tail keeps it")
@@ -610,6 +807,39 @@ def run_eval(pool, args, next_seed):
     return wins, draws, losses, score, results[0]["version"]
 
 
+def _mb(b):
+    return "n/a" if b is None else "%.0f MB" % (b / 2 ** 20)
+
+
+def _gpu_line(tm, args, data, it):
+    """What the learner kept on the device this iteration, and how much room is left."""
+    res, peak, total = tm.get("gpu_resident"), tm.get("gpu_peak"), tm.get("gpu_total")
+    parts = tm.get("gpu_parts") or {}
+    groups = {"boards": parts.get("boards", 0), "actions": parts.get("comps", 0),
+              "search targets": parts.get("pi", 0)}
+    groups["other"] = sum(parts.values()) - sum(groups.values())
+    line = ("data " + _c("1", _mb(sum(parts.values()) if parts else None))
+            + (" (" + " \u00b7 ".join("%s %s" % (k, _mb(v)) for k, v in groups.items() if v) + ")" if parts else "")
+            + "    allocated after upload " + _c("1", _mb(res))
+            + "    peak " + _c("1", _mb(peak)))
+    if peak is not None and total:
+        line += " = %.1f%% of %s" % (100.0 * peak / total, _mb(total))
+        # Per-step memory (activations) grows about linearly with --minibatch; the data does not.
+        # Say how far the batch could grow while the peak stays under 60% of the device.
+        step_mem = max(peak - (res or 0), 1)
+        grow = (0.6 * total - (res or 0)) / step_mem
+        if grow > 1.5 and (it % 50 == 0 or not _gpu_line.hinted):
+            _gpu_line.hinted = True
+            mb = int(grow * args.minibatch) // 64 * 64
+            acts = -(-int(mb * float(data["counts"].mean()) * 2) // 4096) * 4096
+            line += ("    room for ~%.0fx the batch: --minibatch %d --max-actions %d "
+                     "(more decisions per step, fewer steps; mind --lr)" % (grow, mb, max(acts, args.max_actions)))
+    print(_tag("gpu", 183) + line, flush=True)
+
+
+_gpu_line.hinted = False
+
+
 def main():
     args = parse_args()
     if hasattr(signal, "SIGUSR1"):          # kill -USR1 <pid> prints where every thread is, then carries on
@@ -642,8 +872,14 @@ def main():
     netlib.save_checkpoint(latest, model, version, opt.state_dict())
 
     n_params = sum(p.numel() for p in model.parameters())
-    print("device=%s  workers=%d  learner threads=%d  params=%.2fM  start version=%d"
-          % (device, args.workers, args.learner_threads, n_params / 1e6, version), flush=True)
+    if args.net_backend == "native":
+        rustnet.require()                   # fail here, not inside a worker
+        rustnet.RustNet.from_torch(model)   # and make sure this network's shapes are supported
+    print("device=%s  workers=%d  learner threads=%d  params=%.2fM  start version=%d  net=%s"
+          % (device, args.workers, args.learner_threads, n_params / 1e6, version,
+             args.net_backend + (" (avx2)" if args.net_backend == "native" and rustnet.simd_active()
+                                 else " (portable kernels)" if args.net_backend == "native" else "")),
+          flush=True)
 
     seed_counter = [args.seed * 1_000_003 + version * 7919]
 
@@ -658,7 +894,8 @@ def main():
                   {"frac": args.search_frac, "sims": args.search_sims, "noise": args.search_noise,
                    "temp": args.search_temp, "sweep": args.search_sweep,
                    "c_puct": args.search_cpuct, "smooth": args.search_smooth,
-                   "batch": args.search_batch}))
+                   "batch": args.search_batch, "vl": args.search_vl},
+                  args.net_backend))
     pending = []          # futures in submission order (oldest first)
     t_start = time.time()
     log_file = open(log_path, "a", newline="")
@@ -781,6 +1018,7 @@ def main():
                   + "    blocked on %s " % device + _share("%.1fs" % timing["wait"], timing["wait"], t_learn)
                   + "    other %.1fs" % (t_learn - timing["collate"] - timing["dispatch"] - timing["wait"]),
                   flush=True)
+            _gpu_line(timing, args, data, it)
             sd = timing["step_dispatch"]
             if len(sd) >= 4:
                 # Is the dispatch cost per step, or paid once per new shape / once per iteration?

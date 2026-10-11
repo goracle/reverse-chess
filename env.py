@@ -102,7 +102,13 @@ def encode_observation(game: Game, max_plies: Optional[int] = None) -> Dict[str,
     Returns ``{"board": float32 (18, 8, 8), "scalars": float32 (17,)}``.
     ``max_plies`` normalises the game-length feature (defaults to the rules'
     cap, or 400 when the game is uncapped).
+
+    A ``fastgame.FastGame`` (the light position tree search uses) encodes itself, natively;
+    check_fastgame.py verifies it matches this function exactly.
     """
+    fast = getattr(game, "observation", None)
+    if fast is not None:
+        return fast(max_plies)
     me = game.turn
     board = np.zeros((NUM_BOARD_PLANES, SIZE, SIZE), dtype=np.float32)
     for team in TEAMS:

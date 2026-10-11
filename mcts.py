@@ -33,22 +33,32 @@ when the search ends (``_release``).  After a search the tree keeps only its num
 
 Training (see ``net.search_action`` and rollout.py) uses the same search with root noise and
 no root sweep: ``Searcher.search(game, sims=N, root_analysis=..., noise=0.25, sweep_k=0)``.
+
+Light mode: when the native library has ``rc_step`` (see fastgame.py) the tree holds
+``FastGame`` positions instead of ``Game`` copies.  A simulation then steps with one native
+call (``FastGame.child(i)``) instead of ``fast_clone`` + ``Game.step``, which is most of the
+non-network time of a simulation.  The search itself is unchanged and picks the same moves
+(check_fastgame.py runs both and compares the trees); ``Searcher(light=False)`` or the
+environment variable ``RC_FASTGAME=0`` switches it off.
 """
 from __future__ import annotations
 
 import copy
 import math
+import os
 import threading
 import time
 from typing import List, Optional, Tuple
 
 import numpy as np
 
+import fastgame
 from engine import Action, Game
 
 C_PUCT = 1.5          # exploration constant
 FPU_REDUCTION = 0.25  # an unvisited move is assumed this much worse than its parent
 SWEEP_SHARE = 0.35    # at most this fraction of the time budget goes on the root sweep
+VL_DEFAULT = 1.0      # virtual-loss strength for batched search (see Searcher): 1 = a full loss
 
 
 def fast_clone(game: Game) -> Game:
@@ -72,6 +82,13 @@ def fast_clone(game: Game) -> Game:
         return copy.deepcopy(game, memo)
     finally:
         game._moves_cache, game._has_move = saved
+
+
+def light_default() -> bool:
+    """Light mode is on when the native library supports it, unless RC_FASTGAME=0."""
+    if os.environ.get("RC_FASTGAME", "1").strip().lower() in ("0", "off", "no", "false"):
+        return False
+    return fastgame.AVAILABLE
 
 
 def terminal_value(game: Game) -> float:
@@ -214,9 +231,22 @@ class Searcher:
     """Runs searches for play.py.  One search at a time: starting a new one stops the old."""
 
     def __init__(self, advisor, sims: int = 600, think_ms: int = 2500, c_puct: float = C_PUCT,
-                 batch: int = 1):
+                 batch: int = 1, light: Optional[bool] = None, vl: float = VL_DEFAULT):
+        if light and not fastgame.AVAILABLE:
+            raise RuntimeError("light search needs the native engine with rc_step "
+                               "(run ./build_native.sh)")
+        if not 0.0 <= vl <= 1.0:
+            raise ValueError("vl (virtual-loss strength) must be in [0, 1], got %r" % (vl,))
+        self.light = light_default() if light is None else bool(light)
         self.advisor = advisor
         self.batch = max(1, int(batch))       # leaves evaluated per network call (virtual loss)
+        # What a descent that is still in flight counts as: one extra visit of an edge whose result
+        # is  (1 - vl) * (the edge's current value) - vl.  vl = 1: a sure loss (the classic virtual
+        # loss: the next descent of the batch is pushed to another move hard, which spreads a small
+        # simulation budget over many root moves); vl = 0: a visit that changes nothing but the
+        # exploration term (descents spread the way PUCT itself would spread them).  Irrelevant
+        # when batch = 1.
+        self.vl = float(vl)
         self.sims = sims
         self.think_ms = think_ms
         self.c_puct = c_puct
@@ -231,7 +261,7 @@ class Searcher:
               sims: Optional[int] = None) -> Job:
         if self.job is not None:
             self.job.stop()
-        job = Job(key, fast_clone(game), sims or self.sims, ms or self.think_ms)
+        job = Job(key, self._copy(game), sims or self.sims, ms or self.think_ms)
         self.job = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
@@ -248,12 +278,24 @@ class Searcher:
         ``root_analysis`` (an ``Analysis`` of ``game``) saves re-evaluating the root;
         ``noise`` mixes Dirichlet noise into the root priors for exploration; ``sweep_k``
         limits the exact root sweep to the k likeliest moves (0 = none, None = all)."""
-        job = Job(None, fast_clone(game), sims or self.sims, ms or self.think_ms,
+        job = Job(None, self._copy(game), sims or self.sims, ms or self.think_ms,
                   root_analysis, noise, rng, sweep_k)
         self._run(job)
         return job
 
     # -- internals -------------------------------------------------------
+    def _copy(self, game: Game):
+        """Private copy of the caller's game for a search to own."""
+        return fastgame.FastGame.from_game(game) if self.light else fast_clone(game)
+
+    def _child_game(self, node: Node, i: int):
+        """The position after ``node``'s i-th legal action."""
+        if self.light:
+            return node.game.child(i)
+        g = fast_clone(node.game)
+        g.step(node.actions[i])
+        return g
+
     def _make_node(self, game: Game) -> Node:
         if game.done:
             node = Node(None, game.turn, True, terminal_value(game))
@@ -268,11 +310,15 @@ class Searcher:
         # the FPU baseline uses real visits only, so a virtual loss never makes unvisited moves
         # look worse than moves already in flight
         parent_q = float(node.W.sum()) / node.total if node.total else node.value
+        fpu = parent_q - FPU_REDUCTION
         if node.nvl == 0:                      # no batched descents in flight (always, if batch=1)
-            n_eff, w_eff, total = node.N, node.W, node.total
-        else:                                  # a virtual loss counts as one lost visit
-            n_eff, w_eff, total = node.N + node.vl, node.W - node.vl, node.total + node.nvl
-        q = np.where(n_eff > 0, w_eff / np.maximum(n_eff, 1), parent_q - FPU_REDUCTION)
+            n_eff, total = node.N, node.total
+            q = np.where(n_eff > 0, node.W / np.maximum(n_eff, 1), fpu)
+        else:                                  # each one counts as a visit worth v_virt (see vl)
+            n_eff, total = node.N + node.vl, node.total + node.nvl
+            q_now = np.where(node.N > 0, node.W / np.maximum(node.N, 1), fpu)
+            v_virt = q_now * (1.0 - self.vl) - self.vl
+            q = np.where(n_eff > 0, (node.W + node.vl * v_virt) / np.maximum(n_eff, 1), fpu)
         u = self.c_puct * node.priors * math.sqrt(total + 1.0) / (1.0 + n_eff)
         return int(np.argmax(q + u))
 
@@ -328,8 +374,7 @@ class Searcher:
                 child = node.children[i]
                 if child is None:
                     t0 = time.perf_counter()
-                    g = fast_clone(node.game)
-                    g.step(node.actions[i])
+                    g = self._child_game(node, i)
                     self.t_clone += time.perf_counter() - t0
                     if g.done:
                         child = Node(None, g.turn, True, terminal_value(g))
@@ -374,8 +419,7 @@ class Searcher:
             if job._stop.is_set() or time.monotonic() > until or root.win_idx is not None:
                 break
             t0 = time.perf_counter()
-            g = fast_clone(root.game)
-            g.step(root.actions[int(i)])
+            g = self._child_game(root, int(i))
             self.t_clone += time.perf_counter() - t0
             job.sweep_done = n + 1
             if not g.done:

@@ -23,26 +23,42 @@ import torch
 
 import engine
 import net as netlib
+import rustnet
 from engine import Game, Rules
 from env import potential
 
 _STATE = {"path": None, "rules": None, "key": None, "model": None, "version": -1,
-          "search": None}
+          "search": None, "backend": "torch"}
 
 
-def init_worker(ckpt_path: str, rules_kwargs: dict, move_cache: int, search_cfg: dict = None):
+def init_worker(ckpt_path: str, rules_kwargs: dict, move_cache: int, search_cfg: dict = None,
+                net_backend: str = "torch"):
     """Runs once in each worker process.
 
     ``search_cfg`` (None = no search, the original behaviour) switches on the lightweight
     tree search for a fraction of the network's own decisions: keys ``frac`` (chance a
     decision is searched), ``sims``, ``noise`` (root Dirichlet noise), ``temp`` (move
     sampling temperature on the visit counts), ``sweep`` (root moves checked exactly),
-    ``c_puct``, ``batch`` (leaves per network call).  See ``net.search_action`` and mcts.py."""
+    ``c_puct``, ``batch`` (leaves per network call), ``vl`` (virtual-loss strength).  See
+    ``net.search_action`` and mcts.py.
+
+    ``net_backend``: "torch" evaluates the network with PyTorch on the CPU; "native" with the Rust
+    forward pass (rustnet.py), which needs the rebuilt native library and raises without it."""
+    if net_backend not in ("torch", "native"):
+        raise ValueError("net_backend must be 'torch' or 'native', got %r" % (net_backend,))
+    if net_backend == "native":
+        rustnet.require()
+    _STATE["backend"] = net_backend
     torch.set_num_threads(1)
     engine.MOVE_CACHE_LIMIT = move_cache
     _STATE["path"] = ckpt_path
     _STATE["rules"] = Rules(**rules_kwargs)
     _STATE["search"] = search_cfg if search_cfg and search_cfg.get("frac", 0) > 0 else None
+
+
+def _backend_model(model, version=None):
+    """The loaded PyTorch model as the worker's configured backend evaluates it."""
+    return rustnet.RustNet.from_torch(model, version) if _STATE["backend"] == "native" else model
 
 
 def _current_model():
@@ -51,7 +67,8 @@ def _current_model():
     key = (st.st_mtime_ns, st.st_ino)       # os.replace() gives a new inode
     if key != _STATE["key"]:
         model, ckpt = netlib.load_checkpoint(_STATE["path"])
-        _STATE.update(key=key, model=model, version=int(ckpt["version"]))
+        _STATE.update(key=key, model=_backend_model(model, int(ckpt["version"])),
+                      version=int(ckpt["version"]))
     return _STATE["model"], _STATE["version"]
 
 
@@ -61,7 +78,8 @@ _OPP = {}      # snapshot path -> model; small LRU so a worker never holds many 
 def _opponent_model(path):
     model = _OPP.pop(path, None)
     if model is None:
-        model, _ = netlib.load_checkpoint(path)
+        model, ckpt = netlib.load_checkpoint(path)
+        model = _backend_model(model, int(ckpt["version"]))
     _OPP[path] = model                       # most recently used goes last
     while len(_OPP) > 6:
         _OPP.pop(next(iter(_OPP)))
@@ -156,7 +174,7 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
         import mcts
         evaluator = netlib.SearchEvaluator(model)
         searcher = mcts.Searcher(evaluator, sims=cfg["sims"], c_puct=cfg.get("c_puct", mcts.C_PUCT),
-                                 batch=cfg.get("batch", 1))
+                                 batch=cfg.get("batch", 1), vl=cfg.get("vl", mcts.VL_DEFAULT))
     start = time.time()
     while not game.done:
         team = game.turn
