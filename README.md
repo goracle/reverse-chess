@@ -73,6 +73,11 @@ python play.py --ai-color b     # you are white
 python play.py --no-ai          # hot-seat; the AI can be switched on in the window
 ```
 
+The AI looks ahead with a Monte-Carlo tree search (`mcts.py`) by default: every legal move is checked
+exactly for an immediate win/loss, then the network's policy and value guide a PUCT search that runs
+in the background while the window stays responsive.  `--sims N` / `--think-ms MS` set how hard it
+thinks per move, `--no-search` (or the **MCTS** button / `S`) switches back to the plain network.
+
 In the window: **AI on/off** and which colour it plays, an **eval bar** (the network's opinion of who
 is ahead, white at the bottom), a **Hint** button (its three favourite moves), and a **record** of your
 games against it.  The move menu has a **Back** button and an **X**.  Keys: `H` hint, `E` eval bar,

@@ -26,15 +26,23 @@ import net as netlib
 from engine import Game, Rules
 from env import potential
 
-_STATE = {"path": None, "rules": None, "key": None, "model": None, "version": -1}
+_STATE = {"path": None, "rules": None, "key": None, "model": None, "version": -1,
+          "search": None}
 
 
-def init_worker(ckpt_path: str, rules_kwargs: dict, move_cache: int):
-    """Runs once in each worker process."""
+def init_worker(ckpt_path: str, rules_kwargs: dict, move_cache: int, search_cfg: dict = None):
+    """Runs once in each worker process.
+
+    ``search_cfg`` (None = no search, the original behaviour) switches on the lightweight
+    tree search for a fraction of the network's own decisions: keys ``frac`` (chance a
+    decision is searched), ``sims``, ``noise`` (root Dirichlet noise), ``temp`` (move
+    sampling temperature on the visit counts), ``sweep`` (root moves checked exactly),
+    ``c_puct``.  See ``net.search_action`` and mcts.py."""
     torch.set_num_threads(1)
     engine.MOVE_CACHE_LIMIT = move_cache
     _STATE["path"] = ckpt_path
     _STATE["rules"] = Rules(**rules_kwargs)
+    _STATE["search"] = search_cfg if search_cfg and search_cfg.get("frac", 0) > 0 else None
 
 
 def _current_model():
@@ -73,10 +81,14 @@ class _Recorder:
         self.boards, self.scalars, self.comps = [], [], []
         self.counts, self.chosen, self.logp, self.value, self.player = [], [], [], [], []
         self.phi = []             # progress potential of each decision's mover (reward shaping)
+        self.pi = []              # search's move distribution for searched decisions, else None
+        self.search_sims = 0
+        self.search_seconds = 0.0
 
-    def add(self, team: str, sample, phi: float = 0.0):
+    def add(self, team: str, sample, phi: float = 0.0, pi=None):
         board, scalars, comps, idx, logp, value = sample
         self.phi.append(phi)
+        self.pi.append(pi)
         self.boards.append(board)
         self.scalars.append(scalars)
         self.comps.append(comps)
@@ -87,7 +99,18 @@ class _Recorder:
         self.player.append(0 if team == "b" else 1)
 
     def finish(self, game: Game, version: int, seconds: float) -> dict:
+        searched = np.asarray([p is not None for p in self.pi], dtype=np.uint8)
+        extra = {}
+        if searched.any():          # games played without search carry no search keys at all
+            extra = {
+                "searched": searched,                                        # (T,) 1 = chosen by search
+                "pi": np.concatenate([p if p is not None else np.zeros(c, np.float32)
+                                      for p, c in zip(self.pi, self.counts)]),   # (sum n,)
+                "search_sims": self.search_sims,
+                "search_seconds": self.search_seconds,
+            }
         return {
+            **extra,
             "boards": np.stack(self.boards),                         # (T,18,8,8) uint8
             "scalars": np.stack(self.scalars).astype(np.float32),    # (T,17)
             "comps": np.concatenate(self.comps),                     # (sum n, 6) uint8
@@ -124,6 +147,11 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
     rng = np.random.default_rng(seed)
     game = Game(_STATE["rules"])
     rec = _Recorder()
+    cfg = _STATE["search"]
+    if cfg is not None:
+        import mcts
+        evaluator = netlib.SearchEvaluator(model)
+        searcher = mcts.Searcher(evaluator, sims=cfg["sims"], c_puct=cfg.get("c_puct", mcts.C_PUCT))
     start = time.time()
     while not game.done:
         team = game.turn
@@ -133,8 +161,20 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
             action, _ = netlib.choose_action(opp, game, rng)          # not recorded
         else:
             phi = potential(game, team)
-            action, sample = netlib.choose_action(model, game, rng)
-            rec.add(team, sample, phi)
+            pi = None
+            # Search only some decisions (and only where there is a choice): it costs roughly
+            # one network call + one game copy per simulation.  The decisions it does not
+            # touch stay ordinary on-policy samples for PPO.
+            if cfg is not None and len(game.actions) > 1 and rng.random() < cfg["frac"]:
+                t_s = time.time()
+                action, sample, pi, sims = netlib.search_action(
+                    evaluator, searcher, game, rng, cfg["sims"], cfg.get("noise", 0.25),
+                    cfg.get("temp", 1.0), cfg.get("sweep", 0))
+                rec.search_sims += sims
+                rec.search_seconds += time.time() - t_s
+            else:
+                action, sample = netlib.choose_action(model, game, rng)
+            rec.add(team, sample, phi, pi)
         game.step(action)
     result = rec.finish(game, version, time.time() - start)
     result["opp"] = opp_path                                  # None = plain self-play

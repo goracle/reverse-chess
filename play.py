@@ -33,9 +33,16 @@ The computer opponent is the network trained by train.py.  Put its file next to 
 ``python export_weights.py latest.pt`` turns it into an ``ai.npz`` that needs only NumPy.
 With no file the computer moves at random and the eval bar and hints are unavailable.
 
-* Eval bar (E): the network's opinion of the position, white at the bottom.  It is the
-  network's value estimate, not a calculation, so treat it as a hint of who is ahead.
-* Hint (H): the network's three favourite moves, as arrows and in the panel.
+* Look-ahead search (S, the MCTS button; see mcts.py): the computer does not just play the
+  network's first instinct.  It runs a Monte-Carlo tree search in a background thread (up to
+  --sims simulations / --think-ms milliseconds per move), first checking every legal move
+  exactly for an immediate win or loss, then averaging the network's value over many lines.
+  ``--no-search`` starts with it off (the old policy-sampling opponent).
+* Eval bar (E): who is ahead, white at the bottom.  While it is your turn the search keeps
+  thinking and the bar becomes the search's value ("search N" in the panel; "forced win"
+  when a winning move was found); before that it is the network's raw estimate ("net").
+* Hint (H): the three favourite moves, as arrows and in the panel (the network's policy at
+  first, then the search's most-visited moves as it deepens).
 * AI on/off (A) and which colour(s) the AI plays: buttons in the panel.
 * Your record against the AI (won / lost / drawn, by colour) is kept in a small file in your
   user data folder (see stats.py); a game counts only if the opponent was the AI from the first
@@ -63,6 +70,7 @@ from collections import Counter, defaultdict
 import numpy as np
 import pygame
 
+import mcts
 import numpy_net
 from chessassets import TEAMS, PTYPES, image_path
 from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team
@@ -114,13 +122,14 @@ def make_layout():
     x0 = PANEL_X + 14
     w = PANEL_W - 28
     half = (w - 8) // 2
-    third = (w - 16) // 3
+    third = (w - 16) // 3   # also used by the AI / Eval / Search row
     R = pygame.Rect
     return {
         'x0': x0, 'w': w,
         'ai_label_y': 344,
-        'ai': R(x0, 382, half, 30),
-        'eval': R(x0 + half + 8, 382, half, 30),
+        'ai': R(x0, 382, third, 30),
+        'eval': R(x0 + third + 8, 382, third, 30),
+        'search': R(x0 + 2 * (third + 8), 382, third, 30),
         'side_label_y': 418,
         'side_b': R(x0, 434, third, 28),
         'side_w': R(x0 + third + 8, 434, third, 28),
@@ -255,7 +264,7 @@ def app_dir():
 
 class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
-                 stats, show_eval):
+                 stats, show_eval, searcher=None):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -276,6 +285,9 @@ class App:
         self.ai_sides = set(ai_sides)
         self.stats = stats
         self.show_eval = show_eval and advisor is not None
+        self.searcher = searcher if advisor is not None else None   # mcts.Searcher or None
+        self.use_search = self.searcher is not None
+        self.search_job = None
         np_rng = np.random.default_rng(rng.randrange(2 ** 32))
         if advisor is not None:
             self.default_ai = lambda game: advisor.choose(game, np_rng)
@@ -319,6 +331,7 @@ class App:
         self.recorded = False
         self.stats_ok = self.stats_eligible()
         self.bar_pos = None
+        self.stop_search()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
         self.reindex()
 
@@ -417,6 +430,7 @@ class App:
         self.refresh_agents()
         self.cancel()
         self.hint = None
+        self.stop_search()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
 
     def toggle_ai(self):
@@ -441,9 +455,62 @@ class App:
     def pos_key(self):
         return (id(self.game), self.game.ply)
 
+    # -- search (mcts.py) --------------------------------------------------
+    def stop_search(self):
+        if self.searcher is not None:
+            self.searcher.stop()
+        self.search_job = None
+
+    def toggle_search(self):
+        if self.searcher is None:
+            self.message = "Search needs the AI file (ai.npz or latest.pt next to play.py)."
+            return
+        self.use_search = not self.use_search
+        self.stop_search()
+        self.hint = None
+        self.bar_pos = None
+        self.message = ""
+        self.ai_due = pygame.time.get_ticks() + self.delay_ms
+
+    def search_for_here(self):
+        """The search job for the current position, if there is one."""
+        job = self.search_job
+        if job is not None and job.key == self.pos_key() and job.error is None:
+            return job
+        return None
+
+    def ensure_search(self, ms=None):
+        """Make sure a background search of the current position is running or finished."""
+        if not self.use_search or self.searcher is None or self.game.done:
+            return None
+        job = self.search_for_here()
+        if job is None:
+            self.search_job = job = self.searcher.start(self.game, self.pos_key(), ms=ms)
+        return job
+
+    def searching(self):
+        job = self.search_for_here()
+        return job is not None and not job.finished
+
+    def white_value_now(self):
+        """(value from white's side, simulations behind it): the search once it has enough
+        simulations to mean something, the bare network before that."""
+        job = self.search_for_here() if self.use_search else None
+        if job is not None and (job.solved or job.sims >= 30):
+            v = job.white_value()
+            if v is not None:
+                return v, job.sims
+        return self.advisor.white_value(self.game), 0
+
     def current_hint(self):
         if self.hint is not None and self.hint["key"] != self.pos_key():
             self.hint = None                      # the position moved on
+        if self.hint is not None and self.use_search:
+            job = self.search_for_here()
+            if job is not None and (job.solved or job.sims >= 50):
+                top = job.top(3)
+                if top:                           # swap the policy's guess for the search's
+                    self.hint["top"] = [(a, share) for a, share, _ in top]
         return self.hint
 
     def toggle_hint(self):
@@ -459,6 +526,7 @@ class App:
         else:
             self.hint = {"key": self.pos_key(), "top": self.advisor.analyse(self.game).top(3)}
             self.hint_used = True
+            self.ensure_search(1800)              # the hint sharpens as the search deepens
             self.message = ""
 
     def click_reset(self):
@@ -478,6 +546,8 @@ class App:
             self.toggle_ai()
         elif L['eval'].collidepoint(pos):
             self.toggle_eval()
+        elif L['search'].collidepoint(pos):
+            self.toggle_search()
         elif L['side_b'].collidepoint(pos):
             self.set_sides({'b'})
         elif L['side_w'].collidepoint(pos):
@@ -559,11 +629,29 @@ class App:
 
     def update_ai(self):
         game = self.game
-        if game.done or self.agents[game.turn] is None:
+        if game.done:
             return
-        if pygame.time.get_ticks() < self.ai_due:
+        agent = self.agents[game.turn]
+        if agent is None:                         # a human's turn: think ahead for the eval bar / hint
+            if self.use_search and (self.show_eval or self.current_hint() is not None):
+                self.ensure_search(1800)
             return
-        action = self.agents[game.turn](game)
+        if self.use_search and agent is self.default_ai:
+            job = self.ensure_search()            # the network, with look-ahead
+            if job is None or not job.finished or pygame.time.get_ticks() < self.ai_due:
+                return
+            if job.error is not None:
+                self.message = "search failed (%s); using the network alone" % job.error
+                self.search_job = None
+                self.use_search = False
+                return
+            action = job.best()
+            if action is None or action not in game.actions:
+                action = agent(game)
+        else:
+            if pygame.time.get_ticks() < self.ai_due:
+                return
+            action = agent(game)
         if action not in game.actions:
             self.message = "agent returned an illegal action; playing a random one"
             action = self.rng.choice(game.legal_actions())
@@ -642,7 +730,7 @@ class App:
         game = self.game
         if game.done:
             return 0.5 if game.winner is None else 1.0 if game.winner == 'w' else 0.0
-        return (max(-1.0, min(1.0, self.advisor.white_value(game))) + 1.0) / 2.0
+        return (max(-1.0, min(1.0, self.white_value_now()[0])) + 1.0) / 2.0
 
     def draw_eval_bar(self):
         pygame.draw.rect(self.screen, PANEL_BG, (BOARD_PX, 0, BAR_W, BOARD_PX))
@@ -702,7 +790,7 @@ class App:
         self.draw_controls()
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
-                  "H hint  E eval  A AI  R new  Esc back"]
+                  "H hint  E eval  A AI  S MCTS  R new  Esc back"]
         for i, line in enumerate(legend):
             self.text(line, (x0, WIN_H - 8 - (len(legend) - i) * 21), self.font_small, MUTED)
 
@@ -715,9 +803,11 @@ class App:
             label = self.ai_note or "No AI file found: the computer moves at random."
         for i, line in enumerate(wrap(label, self.font_small, w)[:2]):
             self.text(line, (x0, L['ai_label_y'] + i * 17), self.font_small, MUTED)
-        self.draw_button(L['ai'], "AI: ON" if self.ai_on else "AI: OFF", on=self.ai_on)
-        self.draw_button(L['eval'], "Eval bar: ON" if self.show_eval else "Eval bar: OFF",
+        self.draw_button(L['ai'], "AI ON" if self.ai_on else "AI OFF", on=self.ai_on)
+        self.draw_button(L['eval'], "Eval ON" if self.show_eval else "Eval OFF",
                          on=self.show_eval, enabled=self.advisor is not None)
+        self.draw_button(L['search'], "MCTS ON" if self.use_search else "MCTS OFF",
+                         on=self.use_search, enabled=self.searcher is not None)
         self.text("AI plays:", (x0, L['side_label_y']), self.font_small, MUTED)
         for name, text, sides in (('side_b', "Black", {'b'}), ('side_w', "White", {'w'}),
                                   ('side_both', "Both", {'b', 'w'})):
@@ -730,9 +820,15 @@ class App:
             if self.game.done:
                 vw = 0.0 if self.game.winner is None else 1.0 if self.game.winner == 'w' else -1.0
             else:
-                vw = self.advisor.white_value(self.game)
+                vw, sims = self.white_value_now()
             who = "white ahead" if vw > 0.05 else "black ahead" if vw < -0.05 else "about even"
-            self.text("Eval %+.2f  (%s)" % (vw, who), (x0, L['eval_text_y']), self.font_small, TEXT)
+            how = "search %d" % sims if sims else "net"
+            if self.game.done:
+                how = "final"
+            elif sims and self.search_for_here() is not None and self.search_for_here().solved:
+                how = "forced win"
+            self.text("Eval %+.2f  (%s, %s)" % (vw, who, how), (x0, L['eval_text_y']),
+                      self.font_small, TEXT)
         if hint is not None:
             y = L['hint_y']
             for rank, (action, p) in enumerate(hint["top"]):
@@ -787,6 +883,8 @@ class App:
             last = game.last_move
             extra = (" - extra turn (reverse en passant)"
                      if last is not None and last.extra_turn and last.team == game.turn else "")
+            if kind == "computer" and self.searching():
+                extra += " - thinking (%d sims)" % self.search_for_here().sims
             line = "%s to move (%s)%s" % (name, kind, extra)
         lines = wrap(line, self.font_status, PANEL_X - 28)
         if len(lines) > 3:
@@ -879,6 +977,13 @@ def main():
     ap.add_argument("--ai-max-plies", type=int, default=300,
                     help="the move cap the AI was trained with (train.py --max-plies); only scales "
                          "one of its inputs, it does not end games")
+    ap.add_argument("--no-search", action="store_true",
+                    help="start with the look-ahead search (MCTS) off; the AI plays straight "
+                         "from the network's policy")
+    ap.add_argument("--sims", type=int, default=600,
+                    help="most simulations the search runs per move (default 600)")
+    ap.add_argument("--think-ms", type=int, default=2500,
+                    help="most milliseconds the search thinks per move (default 2500)")
     ap.add_argument("--strict-win", action="store_true",
                     help="experimental: every piece of both teams must be on the board")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
@@ -916,7 +1021,11 @@ def main():
     stats = None if args.no_stats else Stats(args.stats)
     rules = Rules(win_requires_all_pieces_on_board=args.strict_win,
                   max_plies=args.max_plies)
-    app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval)
+    searcher = mcts.Searcher(advisor, sims=args.sims, think_ms=args.think_ms) if advisor else None
+    app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
+              searcher)
+    if args.no_search:
+        app.use_search = False
 
     clock = pygame.time.Clock()
     running = True
@@ -936,6 +1045,8 @@ def main():
                         app.toggle_eval()
                     elif event.key == pygame.K_a:
                         app.toggle_ai()
+                    elif event.key == pygame.K_s:
+                        app.toggle_search()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 app.handle_click(event.pos)
         app.update_ai()
