@@ -212,16 +212,46 @@ class SearchEvaluator:
     def analyse_fresh(self, game: Game):
         return self.evaluate(game)[0]
 
+    def analyse_many(self, games):
+        """``analyse_fresh`` for several positions with ONE network call (the model is
+        batch-size independent: GroupNorm, per-position softmax).  Used by batched search."""
+        from numpy_net import Analysis
+        if len(games) == 1:
+            return [self.analyse_fresh(games[0])]
+        obs = [encode_observation(g) for g in games]
+        actions = [g.legal_actions() for g in games]
+        comps = [action_components_array(g) for g in games]
+        counts = np.fromiter((len(a) for a in actions), dtype=np.int64, count=len(games))
+        with torch.inference_mode():
+            logits, value = self.model(
+                torch.from_numpy(np.stack([o["board"] for o in obs])),
+                torch.from_numpy(np.stack([o["scalars"] for o in obs])),
+                torch.from_numpy(np.repeat(np.arange(len(games), dtype=np.int64), counts)),
+                torch.from_numpy(np.concatenate(comps).astype(np.int64)))
+        z = logits.numpy().astype(np.float64)
+        value = value.numpy()
+        out, start = [], 0
+        for k, n in enumerate(counts):
+            zk = z[start:start + n]
+            start += n
+            p = np.exp(zk - zk.max())
+            out.append(Analysis(float(value[k]), actions[k], p / p.sum()))
+        return out
+
 
 def search_action(evaluator: SearchEvaluator, searcher, game: Game, rng: np.random.Generator,
-                  sims: int, noise: float = 0.25, temp: float = 1.0, sweep_k: int = 0):
+                  sims: int, noise: float = 0.25, temp: float = 1.0, sweep_k: int = 0,
+                  smooth: float = 0.0):
     """Pick an action by a short tree search instead of straight from the policy.
 
     Returns ``(action, sample, pi, sims_run)``.  ``sample`` has the same layout as
     ``choose_action``'s (with the *network's own* log-prob and value for the position, which is
     what PPO's bookkeeping expects); ``pi`` is the float32 distribution over the legal actions
     the move was drawn from (visit counts ** 1/temp; one-hot on a move the search proved wins)
-    -- the learner trains the policy head towards it.
+    -- the learner trains the policy head towards it.  With ``smooth`` > 0 the returned target is
+    ``(1 - smooth) * pi + smooth * (the network's own policy)`` (the move is still drawn from the
+    unsmoothed pi): a few simulations leave most moves with zero visits, and a target that
+    says "probability 0" for them sharpens the policy quickly; smoothing slows that down.
     """
     analysis, obs, comps = evaluator.evaluate(game)
     job = searcher.search(game, sims=sims, ms=10 ** 9, root_analysis=analysis,
@@ -241,6 +271,8 @@ def search_action(evaluator: SearchEvaluator, searcher, game: Game, rng: np.rand
         pi /= pi.sum()
     cdf = np.cumsum(pi)
     idx = min(int(cdf.searchsorted(rng.random() * cdf[-1], side="right")), n - 1)
+    if smooth > 0 and root.win_idx is None:                    # a proven win stays sharp
+        pi = (1.0 - smooth) * pi + smooth * analysis.probs
     sample = (obs["board"].astype(np.uint8), obs["scalars"], comps, idx,
               float(np.log(max(analysis.probs[idx], 1e-30))), float(analysis.value))
     return analysis.actions[idx], sample, pi.astype(np.float32), int(root.total)

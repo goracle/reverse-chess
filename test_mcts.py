@@ -31,7 +31,114 @@ def check(job, game):
     assert all(0.0 <= share <= 1.0 for _, share, _ in job.top(3))
 
 
+def check_fast_clone():
+    """mcts.fast_clone must behave exactly like Game.clone (and be independent of the original)."""
+    rng = np.random.default_rng(1)
+    game = Game(Rules(max_plies=300))
+    for _ in range(25):
+        if game.done:
+            break
+        acts = game.legal_actions()
+        game.step(acts[int(rng.integers(len(acts)))])
+    a, b = game.clone(), mcts.fast_clone(game)
+    assert a.legal_actions() == b.legal_actions() == game.legal_actions()
+    assert a.position_key() == b.position_key() == game.position_key()
+    assert a.move_log == b.move_log == game.move_log and a.seen == b.seen == game.seen
+    # play the same random continuation on all three: identical results, original untouched
+    before = (game.ply, game.position_key())
+    for _ in range(15):
+        if a.done:
+            break
+        acts = a.legal_actions()
+        pick = acts[int(rng.integers(len(acts)))]
+        a.step(pick)
+        b.step(pick)
+        assert a.position_key() == b.position_key() and a.legal_actions() == b.legal_actions()
+        assert a.done == b.done and a.winner == b.winner
+    assert (game.ply, game.position_key()) == before, "fast_clone shares state with the original"
+    assert b.move_log is not game.move_log and b.seen is not game.seen
+    print("fast_clone ok")
+
+
+class UniformMany(Uniform):
+    """Same stand-in, with the batch entry point; counts the calls."""
+    def __init__(self):
+        self.calls = []
+
+    def analyse_many(self, games):
+        self.calls.append(len(games))
+        return [self.analyse_fresh(g) for g in games]
+
+
+def check_batched():
+    """Batched search (virtual loss): the bookkeeping must come out exactly as in the plain one --
+    every simulation counted once, no virtual loss left behind, one network call per round."""
+    game = Game(Rules(max_plies=300))
+    for _ in range(6):                                   # a mid-game position, not the opening
+        game.step(game.legal_actions()[0])
+    for batch in (1, 2, 4, 7):
+        adv = UniformMany()
+        searcher = mcts.Searcher(adv, sims=40, batch=batch)
+        job = searcher.search(game, sims=40)
+        check(job, game)
+        root = job.root
+        assert root.total == 40 and root.nvl == 0 and not root.vl.any(), (batch, root.total, root.nvl)
+        stack = [root]
+        while stack:                                     # no pending node or virtual loss anywhere
+            node = stack.pop()
+            assert not node.pending and node.nvl == 0 and not node.vl.any()
+            assert node.total == int(node.N.sum())
+            stack.extend(c for c in node.children if c is not None)
+        assert sum(adv.calls) <= 40 and (batch == 1 or max(adv.calls) <= batch), adv.calls
+        if batch > 1:
+            assert len(adv.calls) < 39, "batching made no difference: %s" % adv.calls
+        print("batch %d: %d sims, %d network calls (sizes %s)" % (batch, root.total, len(adv.calls),
+                                                                   sorted(set(adv.calls))))
+    # an advisor without analyse_many still works with batch > 1
+    job = mcts.Searcher(Uniform(), sims=20, batch=4).search(game, sims=20)
+    check(job, game)
+    # batch=1 must not depend on how the advisor evaluates
+    a = mcts.Searcher(Uniform(), sims=30, batch=1).search(game, sims=30)
+    b = mcts.Searcher(UniformMany(), sims=30, batch=1).search(game, sims=30)
+    assert (a.root.N == b.root.N).all()
+    print("batched search ok")
+
+
+def check_evaluate_many():
+    """SearchEvaluator.analyse_many == analyse_fresh position by position (needs PyTorch)."""
+    try:
+        import torch
+        import net as netlib
+    except ImportError:
+        print("torch not installed: skipping the analyse_many check")
+        return
+    torch.manual_seed(0)
+    rng = np.random.default_rng(3)
+    model = netlib.PolicyValueNet(16, 1, 32).eval()
+    for p in model.parameters():                         # make the heads non-trivial
+        p.data += 0.05 * torch.randn_like(p)
+    ev = netlib.SearchEvaluator(model)
+    games = []
+    for k in range(5):
+        g = Game(Rules(max_plies=300))
+        for _ in range(3 + 4 * k):
+            if g.done:
+                break
+            acts = g.legal_actions()
+            g.step(acts[int(rng.integers(len(acts)))])
+        games.append(g)
+    many = ev.analyse_many(games)
+    for g, m in zip(games, many):
+        one = ev.analyse_fresh(g)
+        assert m.actions == one.actions
+        assert abs(m.value - one.value) < 1e-4, (m.value, one.value)
+        assert np.abs(m.probs - one.probs).max() < 1e-4 and abs(m.probs.sum() - 1) < 1e-9
+    print("analyse_many matches analyse_fresh on %d positions" % len(games))
+
+
 def main():
+    check_fast_clone()
+    check_batched()
     advisor = Advisor(sys.argv[1]) if len(sys.argv) > 1 else Uniform()
     searcher = mcts.Searcher(advisor, sims=150, think_ms=20000)
 
@@ -69,7 +176,7 @@ def check_training_search():
     rng = np.random.default_rng(0)
     model = netlib.PolicyValueNet(16, 1, 32).eval()
     evaluator = netlib.SearchEvaluator(model)
-    searcher = mcts.Searcher(evaluator, sims=8)
+    searcher = mcts.Searcher(evaluator, sims=8, batch=4)
     game = Game(Rules(max_plies=300))
     sims_seen = []
     for _ in range(6):                                  # a few plies, all chosen by search
@@ -89,4 +196,5 @@ def check_training_search():
 
 if __name__ == "__main__":
     main()
+    check_evaluate_many()
     check_training_search()

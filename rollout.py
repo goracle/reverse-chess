@@ -37,7 +37,7 @@ def init_worker(ckpt_path: str, rules_kwargs: dict, move_cache: int, search_cfg:
     tree search for a fraction of the network's own decisions: keys ``frac`` (chance a
     decision is searched), ``sims``, ``noise`` (root Dirichlet noise), ``temp`` (move
     sampling temperature on the visit counts), ``sweep`` (root moves checked exactly),
-    ``c_puct``.  See ``net.search_action`` and mcts.py."""
+    ``c_puct``, ``batch`` (leaves per network call).  See ``net.search_action`` and mcts.py."""
     torch.set_num_threads(1)
     engine.MOVE_CACHE_LIMIT = move_cache
     _STATE["path"] = ckpt_path
@@ -84,6 +84,8 @@ class _Recorder:
         self.pi = []              # search's move distribution for searched decisions, else None
         self.search_sims = 0
         self.search_seconds = 0.0
+        self.search_clone = 0.0       # of which: copying / stepping games
+        self.search_net = 0.0         # of which: network evaluation of new nodes
 
     def add(self, team: str, sample, phi: float = 0.0, pi=None):
         board, scalars, comps, idx, logp, value = sample
@@ -108,6 +110,8 @@ class _Recorder:
                                       for p, c in zip(self.pi, self.counts)]),   # (sum n,)
                 "search_sims": self.search_sims,
                 "search_seconds": self.search_seconds,
+                "search_clone": self.search_clone,
+                "search_net": self.search_net,
             }
         return {
             **extra,
@@ -151,7 +155,8 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
     if cfg is not None:
         import mcts
         evaluator = netlib.SearchEvaluator(model)
-        searcher = mcts.Searcher(evaluator, sims=cfg["sims"], c_puct=cfg.get("c_puct", mcts.C_PUCT))
+        searcher = mcts.Searcher(evaluator, sims=cfg["sims"], c_puct=cfg.get("c_puct", mcts.C_PUCT),
+                                 batch=cfg.get("batch", 1))
     start = time.time()
     while not game.done:
         team = game.turn
@@ -169,13 +174,15 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
                 t_s = time.time()
                 action, sample, pi, sims = netlib.search_action(
                     evaluator, searcher, game, rng, cfg["sims"], cfg.get("noise", 0.25),
-                    cfg.get("temp", 1.0), cfg.get("sweep", 0))
+                    cfg.get("temp", 1.0), cfg.get("sweep", 0), cfg.get("smooth", 0.0))
                 rec.search_sims += sims
                 rec.search_seconds += time.time() - t_s
             else:
                 action, sample = netlib.choose_action(model, game, rng)
             rec.add(team, sample, phi, pi)
         game.step(action)
+    if cfg is not None:
+        rec.search_clone, rec.search_net = searcher.t_clone, searcher.t_eval
     result = rec.finish(game, version, time.time() - start)
     result["opp"] = opp_path                                  # None = plain self-play
     result["net_team"] = net_team if opp_path else None
