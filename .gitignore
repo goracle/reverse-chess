@@ -1,12 +1,52 @@
-venv/*
-venv/.*venv/
-venv/
+# --- Python ---
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.egg-info/
 .pytest_cache/
+.ipynb_checkpoints/
+
+# --- virtual environments ---
+venv/
+venv-*/
+.venv/
+
+# --- editor / OS junk ---
 *.swp
 *.swo
 *~
+.*.~undo-tree~
+.#*
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# --- patch leftovers ---
+*.orig
+*.rej
+
+# --- profiler output ---
+*.lprof
+*.prof
+*.pstats
+
+# --- training runs: checkpoints, snapshots, logs (large, regenerated) ---
 runs/
+*.pt
+*.ckpt
+
+# --- trained networks: attach to a GitHub release instead of committing ---
+# (play.py looks for ai.npz next to itself; download it from the release page)
+ai.npz
+ai.pt
+
+# --- built native engine: build with ./build_native.sh ---
+native/target/
+*.so
+*.dylib
+*.dll
+
+# --- packaging output ---
+build/
+dist/
+*.zip

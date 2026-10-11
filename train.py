@@ -508,12 +508,12 @@ def parse_args():
                         "win/loss before searching; 0 = off.  Finds one-move wins the policy "
                         "misses, at one game copy per move checked")
     g.add_argument("--search-cpuct", type=float, default=1.5)
-    g.add_argument("--search-batch", type=int, default=4,
-                   help="leaves evaluated per network call (virtual loss).  Workers run the net "
-                        "with batch size 1, which is dominated by per-call overhead, so 4 leaves "
-                        "cost little more than 1.  1 = the plain one-at-a-time search; with only "
-                        "16 simulations keep it small (2-4), a bigger batch makes the lines "
-                        "explored less informed")
+    g.add_argument("--search-batch", type=int, default=1,
+                   help="leaves evaluated per network call (virtual loss).  1 = the plain "
+                        "one-at-a-time search (default).  Above 1 the 16 simulations are spread "
+                        "over many root moves, which flattens the visit distribution the policy "
+                        "is trained on (policy entropy climbs, ce explodes): leave at 1 unless "
+                        "you also raise --search-sims a lot")
     g.add_argument("--search-smooth", type=float, default=0.0,
                    help="blend this fraction of the network's own policy into the search's target "
                         "(the move is still drawn from the unsmoothed search).  Few simulations "
