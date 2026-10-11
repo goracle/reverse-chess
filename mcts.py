@@ -36,6 +36,7 @@ no root sweep: ``Searcher.search(game, sims=N, root_analysis=..., noise=0.25, sw
 """
 from __future__ import annotations
 
+import copy
 import math
 import threading
 import time
@@ -50,6 +51,29 @@ FPU_REDUCTION = 0.25  # an unvisited move is assumed this much worse than its pa
 SWEEP_SHARE = 0.35    # at most this fraction of the time budget goes on the root sweep
 
 
+def fast_clone(game: Game) -> Game:
+    """``Game.clone()`` without rebuilding immutable objects.
+
+    ``Game.clone`` deep-copies everything, including every legal ``Action`` (the dict of legal
+    actions holds dozens to thousands) and the whole ``move_log``, one slow reconstruction each.
+    ``Action`` is a frozen dataclass, so copies can share them; the log and the repetition
+    table are copied shallowly.  Everything mutable (pieces, board, moves) is still deep-copied.
+    Keep in step with ``Game.clone`` (it also leaves the move caches out)."""
+    memo = {}
+    for a in game.actions:
+        memo[id(a)] = a
+    for a in game.move_log:
+        memo[id(a)] = a
+    memo[id(game.move_log)] = list(game.move_log)
+    memo[id(game.seen)] = dict(game.seen)
+    saved = game._moves_cache, game._has_move
+    game._moves_cache, game._has_move = {}, {}
+    try:
+        return copy.deepcopy(game, memo)
+    finally:
+        game._moves_cache, game._has_move = saved
+
+
 def terminal_value(game: Game) -> float:
     """Exact result of a finished game for the side to move (``game.turn``)."""
     if game.winner is None:
@@ -62,7 +86,7 @@ class Node:
     point of view of this node's side to move."""
 
     __slots__ = ("game", "turn", "terminal", "value", "actions", "priors",
-                 "N", "W", "children", "total", "win_idx")
+                 "N", "W", "children", "total", "win_idx", "vl", "nvl", "pending")
 
     def __init__(self, game: Optional[Game], turn: str, terminal: bool, value: float,
                  actions: Optional[List[Action]] = None, priors: Optional[np.ndarray] = None):
@@ -78,6 +102,21 @@ class Node:
         self.children: List[Optional["Node"]] = [None] * n
         self.total = 0                        # visits through this node
         self.win_idx: Optional[int] = None    # index of a move known to win on the spot
+        self.vl = np.zeros(n, dtype=np.int64)  # virtual losses: batched descents in flight per edge
+        self.nvl = 0                          # their sum
+        self.pending = False                  # created, network evaluation not done yet
+
+    def fill(self, a) -> None:
+        """Give a pending node its network result (an ``Analysis``)."""
+        self.value = a.value
+        self.actions = a.actions
+        self.priors = a.probs
+        n = len(self.actions)
+        self.N = np.zeros(n, dtype=np.int64)
+        self.W = np.zeros(n, dtype=np.float64)
+        self.vl = np.zeros(n, dtype=np.int64)
+        self.children = [None] * n
+        self.pending = False
 
 
 def _edge_value(parent: Node, child: Node, v: float) -> float:
@@ -174,19 +213,25 @@ class Job:
 class Searcher:
     """Runs searches for play.py.  One search at a time: starting a new one stops the old."""
 
-    def __init__(self, advisor, sims: int = 600, think_ms: int = 2500, c_puct: float = C_PUCT):
+    def __init__(self, advisor, sims: int = 600, think_ms: int = 2500, c_puct: float = C_PUCT,
+                 batch: int = 1):
         self.advisor = advisor
+        self.batch = max(1, int(batch))       # leaves evaluated per network call (virtual loss)
         self.sims = sims
         self.think_ms = think_ms
         self.c_puct = c_puct
         self.job: Optional[Job] = None
+        # where the time goes (seconds, summed over this searcher's life): copying + stepping
+        # games, network evaluation of new nodes.  Read by rollout.py for the training log.
+        self.t_clone = 0.0
+        self.t_eval = 0.0
 
     # -- public ----------------------------------------------------------
     def start(self, game: Game, key, ms: Optional[int] = None,
               sims: Optional[int] = None) -> Job:
         if self.job is not None:
             self.job.stop()
-        job = Job(key, game.clone(), sims or self.sims, ms or self.think_ms)
+        job = Job(key, fast_clone(game), sims or self.sims, ms or self.think_ms)
         self.job = job
         threading.Thread(target=self._run, args=(job,), daemon=True).start()
         return job
@@ -203,7 +248,7 @@ class Searcher:
         ``root_analysis`` (an ``Analysis`` of ``game``) saves re-evaluating the root;
         ``noise`` mixes Dirichlet noise into the root priors for exploration; ``sweep_k``
         limits the exact root sweep to the k likeliest moves (0 = none, None = all)."""
-        job = Job(None, game.clone(), sims or self.sims, ms or self.think_ms,
+        job = Job(None, fast_clone(game), sims or self.sims, ms or self.think_ms,
                   root_analysis, noise, rng, sweep_k)
         self._run(job)
         return job
@@ -220,41 +265,104 @@ class Searcher:
     def _select(self, node: Node) -> int:
         if node.win_idx is not None:
             return node.win_idx
-        if node.total:
-            parent_q = float(node.W.sum()) / node.total
-        else:
-            parent_q = node.value
-        q = np.where(node.N > 0, node.W / np.maximum(node.N, 1), parent_q - FPU_REDUCTION)
-        u = self.c_puct * node.priors * math.sqrt(node.total + 1.0) / (1.0 + node.N)
+        # the FPU baseline uses real visits only, so a virtual loss never makes unvisited moves
+        # look worse than moves already in flight
+        parent_q = float(node.W.sum()) / node.total if node.total else node.value
+        if node.nvl == 0:                      # no batched descents in flight (always, if batch=1)
+            n_eff, w_eff, total = node.N, node.W, node.total
+        else:                                  # a virtual loss counts as one lost visit
+            n_eff, w_eff, total = node.N + node.vl, node.W - node.vl, node.total + node.nvl
+        q = np.where(n_eff > 0, w_eff / np.maximum(n_eff, 1), parent_q - FPU_REDUCTION)
+        u = self.c_puct * node.priors * math.sqrt(total + 1.0) / (1.0 + n_eff)
         return int(np.argmax(q + u))
 
-    def _simulate(self, root: Node):
-        path: List[Tuple[Node, int]] = []
-        node = root
-        while True:
-            if node.terminal:
-                v = node.value
-                break
-            i = self._select(node)
-            path.append((node, i))
-            child = node.children[i]
-            if child is None:
-                g = node.game.clone()
-                g.step(node.actions[i])
-                child = self._make_node(g)
-                node.children[i] = child
-                if child.terminal and _edge_value(node, child, child.value) >= 1.0:
-                    node.win_idx = i
-                v = child.value
-                node = child
-                break
-            node = child
+    @staticmethod
+    def _backup(path: List[Tuple[Node, int]], v: float):
+        """Add result ``v`` (from the mover's view at the end of ``path``) to every edge on the
+        path and take back the virtual loss each descent put there."""
         for parent, i in reversed(path):
             child = parent.children[i]
             v = _edge_value(parent, child, v)
             parent.W[i] += v
             parent.N[i] += 1
             parent.total += 1
+            parent.vl[i] -= 1
+            parent.nvl -= 1
+
+    @staticmethod
+    def _undo(path: List[Tuple[Node, int]]):
+        for parent, i in path:
+            parent.vl[i] -= 1
+            parent.nvl -= 1
+
+    def _evaluate(self, games: List[Game]):
+        """Network results for several positions at once, in one call when the advisor can."""
+        many = getattr(self.advisor, "analyse_many", None)
+        if many is not None:
+            return many(games)
+        return [self.advisor.analyse_fresh(g) for g in games]
+
+    def _round(self, root: Node, want: int):
+        """Run up to ``want`` simulations as one batch: descend ``want`` times (each descent
+        leaves a virtual loss on its path so the next one prefers another line), evaluate all the
+        new leaves with a single network call, then back everything up.  With ``want`` = 1 this
+        is the plain one-at-a-time PUCT simulation."""
+        leaves: List[Tuple[List[Tuple[Node, int]], Node]] = []
+        known: List[Tuple[List[Tuple[Node, int]], float]] = []   # descents that ended on a result
+        issued = 0
+        while issued < want and root.win_idx is None:
+            path: List[Tuple[Node, int]] = []
+            node = root
+            leaf = None
+            while True:
+                if node.terminal:
+                    v = node.value
+                    break
+                if node.pending:               # another descent of this batch got here first
+                    v = None
+                    break
+                i = self._select(node)
+                path.append((node, i))
+                node.vl[i] += 1
+                node.nvl += 1
+                child = node.children[i]
+                if child is None:
+                    t0 = time.perf_counter()
+                    g = fast_clone(node.game)
+                    g.step(node.actions[i])
+                    self.t_clone += time.perf_counter() - t0
+                    if g.done:
+                        child = Node(None, g.turn, True, terminal_value(g))
+                        g.close()
+                        node.children[i] = child
+                        if _edge_value(node, child, child.value) >= 1.0:
+                            node.win_idx = i
+                        v = child.value
+                    else:
+                        child = Node(g, g.turn, False, 0.0)
+                        child.pending = True
+                        node.children[i] = child
+                        leaf = child
+                        v = 0.0
+                    break
+                node = child
+            if v is None:                      # collision: stop collecting, flush what we have
+                self._undo(path)
+                break
+            issued += 1
+            if leaf is not None:
+                leaves.append((path, leaf))
+            else:                              # result known: back it up with the rest, so its
+                known.append((path, v))        # virtual loss steers the other descents away too
+        if leaves:
+            t0 = time.perf_counter()
+            results = self._evaluate([leaf.game for _, leaf in leaves])
+            self.t_eval += time.perf_counter() - t0
+            for (path, leaf), a in zip(leaves, results):
+                leaf.fill(a)
+                self._backup(path, a.value)
+        for path, v in known:
+            self._backup(path, v)
 
     def _sweep(self, job: Job, root: Node, until: float):
         """Play every root move on a copy, best prior first, looking only for a result."""
@@ -265,8 +373,10 @@ class Searcher:
         for n, i in enumerate(order):
             if job._stop.is_set() or time.monotonic() > until or root.win_idx is not None:
                 break
-            g = root.game.clone()
+            t0 = time.perf_counter()
+            g = fast_clone(root.game)
             g.step(root.actions[int(i)])
+            self.t_clone += time.perf_counter() - t0
             job.sweep_done = n + 1
             if not g.done:
                 g.close()
@@ -306,7 +416,7 @@ class Searcher:
             while (not job._stop.is_set() and root.win_idx is None
                    and root.total < job.max_sims and time.monotonic() < end):
                 with job._lock:
-                    self._simulate(root)
+                    self._round(root, min(self.batch, job.max_sims - root.total))
         except Exception as err:               # never kill the UI over a search bug
             job.error = "%s: %s" % (type(err).__name__, err)
         finally:

@@ -508,6 +508,17 @@ def parse_args():
                         "win/loss before searching; 0 = off.  Finds one-move wins the policy "
                         "misses, at one game copy per move checked")
     g.add_argument("--search-cpuct", type=float, default=1.5)
+    g.add_argument("--search-batch", type=int, default=4,
+                   help="leaves evaluated per network call (virtual loss).  Workers run the net "
+                        "with batch size 1, which is dominated by per-call overhead, so 4 leaves "
+                        "cost little more than 1.  1 = the plain one-at-a-time search; with only "
+                        "16 simulations keep it small (2-4), a bigger batch makes the lines "
+                        "explored less informed")
+    g.add_argument("--search-smooth", type=float, default=0.0,
+                   help="blend this fraction of the network's own policy into the search's target "
+                        "(the move is still drawn from the unsmoothed search).  Few simulations "
+                        "give sparse targets that sharpen the policy fast; try 0.1 if entropy "
+                        "falls quickly or repetition draws climb")
     g = ap.add_argument_group("PPO")
     g.add_argument("--lr", type=float, default=3e-4)
     g.add_argument("--epochs", type=int, default=2)
@@ -646,7 +657,8 @@ def main():
         initargs=(latest, {"max_plies": args.max_plies}, args.move_cache,
                   {"frac": args.search_frac, "sims": args.search_sims, "noise": args.search_noise,
                    "temp": args.search_temp, "sweep": args.search_sweep,
-                   "c_puct": args.search_cpuct}))
+                   "c_puct": args.search_cpuct, "smooth": args.search_smooth,
+                   "batch": args.search_batch}))
     pending = []          # futures in submission order (oldest first)
     t_start = time.time()
     log_file = open(log_path, "a", newline="")
@@ -742,6 +754,16 @@ def main():
                       + "    %.0f sims, %.0f ms per searched move    " % (s_sims / n_s, 1000 * s_sec / n_s)
                       + "search = " + _share("%.0f%%" % (100 * s_sec / max(w_sec, 1e-9)), s_sec, w_sec)
                       + " of worker game time", flush=True)
+                # where the search's own time goes: copying games, network calls, everything else
+                # (root evaluation, selection / backup, freeing the tree)
+                s_cl = sum(g.get("search_clone", 0.0) for g in games)
+                s_nt = sum(g.get("search_net", 0.0) for g in games)
+                s_ot = max(s_sec - s_cl - s_nt, 0.0)
+                print(_tag("search", 183) + "search time:  game copies "
+                      + _c("1", "%.0f%%" % (100 * s_cl / max(s_sec, 1e-9)))
+                      + "    network (new nodes) " + _c("1", "%.0f%%" % (100 * s_nt / max(s_sec, 1e-9)))
+                      + "    other " + _c("1", "%.0f%%" % (100 * s_ot / max(s_sec, 1e-9)))
+                      + "    (%.1f ms per simulation)" % (1000 * s_sec / max(s_sims, 1)), flush=True)
             # the longer of the two is what limits the cycle; collect ~0 s means games were already waiting
             print(_tag("time", 111)
                   + "collect " + _c(WATCH if t_collect > t_learn else "1", "%.0fs" % t_collect)
