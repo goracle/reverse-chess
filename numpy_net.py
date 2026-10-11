@@ -193,6 +193,13 @@ class Advisor:
         key = (id(game), game.ply, game.turn)
         if self._cache[0] == key:
             return self._cache[1]
+        result = self.analyse_fresh(game)
+        self._cache = (key, result)
+        return result
+
+    def analyse_fresh(self, game: Game) -> Analysis:
+        """``analyse`` without the one-entry cache: safe for tree search, where games are
+        short-lived copies (ids get reused) and several threads may ask at once."""
         obs = encode_observation(game, self.max_plies)
         actions = game.legal_actions()
         comps = game.action_array().copy()           # canonical frame: flip rows for black
@@ -202,9 +209,7 @@ class Advisor:
                                          np.zeros(len(actions), dtype=np.int64), comps)
         z = logits.astype(np.float64)
         p = np.exp(z - z.max())
-        result = Analysis(float(value[0]), actions, p / p.sum())
-        self._cache = (key, result)
-        return result
+        return Analysis(float(value[0]), actions, p / p.sum())
 
     def white_value(self, game: Game, analysis: Optional[Analysis] = None) -> float:
         """The evaluation from white's side: +1 white is winning, -1 black is."""

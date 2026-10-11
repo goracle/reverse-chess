@@ -182,6 +182,71 @@ def choose_action(model: PolicyValueNet, game: Game, rng: np.random.Generator,
 
 
 # --------------------------------------------------------------------------
+# Search in self-play (lightweight MCTS, see mcts.py)
+# --------------------------------------------------------------------------
+
+class SearchEvaluator:
+    """Gives mcts.Searcher what it asks of an advisor: ``analyse_fresh(game)`` -> an
+    ``numpy_net.Analysis`` (value for the side to move, legal actions, policy probabilities),
+    here computed with the PyTorch model."""
+
+    def __init__(self, model: PolicyValueNet):
+        self.model = model
+
+    def evaluate(self, game: Game):
+        """``(Analysis, obs, comps)``; obs / comps are what the learner stores for a decision."""
+        from numpy_net import Analysis
+        obs = encode_observation(game)
+        actions = game.legal_actions()
+        comps = action_components_array(game)
+        with torch.inference_mode():
+            logits, value = self.model(
+                torch.from_numpy(obs["board"])[None],
+                torch.from_numpy(obs["scalars"])[None],
+                torch.zeros(len(actions), dtype=torch.long),
+                torch.from_numpy(comps.astype(np.int64)))
+        z = logits.numpy().astype(np.float64)
+        p = np.exp(z - z.max())
+        return Analysis(float(value[0]), actions, p / p.sum()), obs, comps
+
+    def analyse_fresh(self, game: Game):
+        return self.evaluate(game)[0]
+
+
+def search_action(evaluator: SearchEvaluator, searcher, game: Game, rng: np.random.Generator,
+                  sims: int, noise: float = 0.25, temp: float = 1.0, sweep_k: int = 0):
+    """Pick an action by a short tree search instead of straight from the policy.
+
+    Returns ``(action, sample, pi, sims_run)``.  ``sample`` has the same layout as
+    ``choose_action``'s (with the *network's own* log-prob and value for the position, which is
+    what PPO's bookkeeping expects); ``pi`` is the float32 distribution over the legal actions
+    the move was drawn from (visit counts ** 1/temp; one-hot on a move the search proved wins)
+    -- the learner trains the policy head towards it.
+    """
+    analysis, obs, comps = evaluator.evaluate(game)
+    job = searcher.search(game, sims=sims, ms=10 ** 9, root_analysis=analysis,
+                          noise=noise, rng=rng, sweep_k=sweep_k)
+    root, n = job.root, len(analysis.actions)
+    if root.win_idx is not None:
+        pi = np.zeros(n)
+        pi[root.win_idx] = 1.0
+    else:
+        visits = root.N.astype(np.float64)
+        if visits.sum() <= 0:                                  # no simulations ran: trust the policy
+            pi = analysis.probs.copy()
+        elif temp <= 1e-3:
+            pi = (visits == visits.max()).astype(np.float64)
+        else:
+            pi = visits ** (1.0 / temp)
+        pi /= pi.sum()
+    cdf = np.cumsum(pi)
+    idx = min(int(cdf.searchsorted(rng.random() * cdf[-1], side="right")), n - 1)
+    sample = (obs["board"].astype(np.uint8), obs["scalars"], comps, idx,
+              float(np.log(max(analysis.probs[idx], 1e-30))), float(analysis.value))
+    return analysis.actions[idx], sample, pi.astype(np.float32), int(root.total)
+
+
+# --------------------------------------------------------------------------
 # Checkpoints
 # --------------------------------------------------------------------------
 

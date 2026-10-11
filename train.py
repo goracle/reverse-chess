@@ -26,6 +26,14 @@ How it works
   burden minus ours; env.potential).  Potential-based shaping provably leaves
   the optimal policy unchanged, so it cannot be farmed; it just credits
   progress toward getting home earlier than the final +-1.
+* Optional look-ahead in self-play (on by default, ``--search-frac 0`` turns it off): a
+  fraction of the network's decisions are made by a short MCTS (``--search-sims`` simulations,
+  see mcts.py / net.search_action) instead of straight from the policy.  The searched
+  position is stored with the search's move distribution, and the learner adds a
+  cross-entropy term pulling the policy towards it (``--search-coef``); PPO's policy-gradient
+  term is skipped for those decisions, since their move was not drawn from the policy.  The
+  value head keeps learning from the game result, so everything else is unchanged and an
+  existing checkpoint can simply be resumed.
 * Every ``--eval-every`` updates the current network plays ``--eval-games``
   games against a uniformly random player (half as each colour).  A network
   that has learned anything should score well above 0.5 there.
@@ -158,7 +166,14 @@ def assemble(games, draw_value, shape_coef=0.0, gamma=1.0, gae_lambda=1.0):
         advs.append(a)
         rets.append(r)
     counts = np.concatenate([g["counts"] for g in games]).astype(np.int64)
+    # search targets (rollout.py): games played without search simply have none
+    searched = np.concatenate([g["searched"] if "searched" in g
+                               else np.zeros(len(g["player"]), np.uint8) for g in games])
+    pi = (np.concatenate([g["pi"] if "pi" in g else np.zeros(len(g["comps"]), np.float32)
+                          for g in games]) if searched.any() else None)
     return {
+        "searched": searched,                        # (decisions,) 1 = the move came from the search
+        "pi": pi,                                    # (actions,) search move distribution, or None
         "boards": np.concatenate([g["boards"] for g in games]),
         "scalars": np.concatenate([g["scalars"] for g in games]),
         "comps": np.concatenate([g["comps"] for g in games]),
@@ -228,7 +243,16 @@ def collate(data, adv, mb, device, pad=0, tm=None):
     def t(array, dtype):
         return torch.as_tensor(array, dtype=dtype, device=device)
 
+    searched = data["searched"][mb]
+    pi_mat = None
+    if searched.any():                # (B, Amax) search distributions, zero rows for the rest
+        pi_mat = np.zeros((len(mb), int(counts.max())), dtype=np.float32)
+        for r in np.flatnonzero(searched):
+            s0, n_r = data["starts"][mb[r]], counts[r]
+            pi_mat[r, :n_r] = data["pi"][s0:s0 + n_r]
     out = {
+        "searched": t(searched, torch.float32),
+        "pi": None if pi_mat is None else t(pi_mat, torch.float32),
         "board": t(data["boards"][mb], torch.float32),
         "scalars": t(data["scalars"][mb], torch.float32),
         "owner": t(owner, torch.long),
@@ -303,7 +327,7 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
     kl_hist = deque(maxlen=max(1, args.kl_window))
     adv = data["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-    names = ("pg", "vf", "ent", "kl", "clipfrac")
+    names = ("pg", "vf", "ent", "kl", "clipfrac", "ce")
     stats = {k: [] for k in names}
     prev = None          # previous step's stats, still on the device
 
@@ -350,11 +374,21 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
 
                 ratio = torch.exp(logp - b["old_logp"])
                 clipped = torch.clamp(ratio, 1 - args.clip, 1 + args.clip)
-                pg_loss = -torch.min(ratio * b["adv"], clipped * b["adv"]).mean()
+                # PPO only learns from decisions drawn from the policy itself; a searched one
+                # was drawn from the search's distribution (w = 0), and teaches through ce below.
+                w = 1.0 - b["searched"]
+                wsum = w.sum().clamp(min=1.0)
+                pg_loss = -(torch.min(ratio * b["adv"], clipped * b["adv"]) * w).sum() / wsum
                 vf_loss = torch.mean((value - b["ret"]) ** 2)
                 probs = logp_all.exp()                       # exactly 0 in padded slots
                 entropy = -(probs * logp_all.masked_fill(~mask, 0.0)).sum(1).mean()
-                loss = pg_loss + args.vf_coef * vf_loss - args.ent_coef * entropy
+                if b["pi"] is not None:
+                    ce_rows = -(b["pi"] * logp_all.masked_fill(~mask, 0.0)).sum(1)
+                    ce_loss = (ce_rows * b["searched"]).sum() / b["searched"].sum().clamp(min=1.0)
+                else:
+                    ce_loss = torch.zeros((), device=device)
+                loss = (pg_loss + args.vf_coef * vf_loss - args.ent_coef * entropy
+                        + args.search_coef * ce_loss)
 
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
@@ -373,10 +407,13 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
             with torch.no_grad():                     # stays on the device; read next time round
                 prev = torch.stack([
                     pg_loss.detach(), vf_loss.detach(), entropy.detach(),
-                    (b["old_logp"] - logp).mean(),
+                    # kl / clipfrac over the policy-sampled decisions only (searched ones were
+                    # not drawn from the old policy, so they would bias both)
+                    ((b["old_logp"] - logp) * w).sum() / wsum,
                     # == ((ratio - 1).abs() > clip).float().mean(), but pure float arithmetic:
                     # the bool -> float cast raises UR_RESULT_ERROR_INVALID_ARGUMENT on Iris Xe.
-                    ((ratio - 1).abs() - args.clip).sign().clamp(min=0).mean()])
+                    (((ratio - 1).abs() - args.clip).sign().clamp(min=0) * w).sum() / wsum,
+                    ce_loss.detach()])
         if stop:
             break
     if prev is not None:
@@ -453,6 +490,24 @@ def parse_args():
     g.add_argument("--channels", type=int, default=64)
     g.add_argument("--blocks", type=int, default=4)
     g.add_argument("--hidden", type=int, default=128)
+    g = ap.add_argument_group("search in self-play (mcts.py)")
+    g.add_argument("--search-frac", type=float, default=0.15,
+                   help="fraction of the network's decisions made by a short tree search (0 = "
+                        "no search, the old behaviour).  Cost is roughly frac * sims extra "
+                        "network calls + game copies per decision; watch the 'search' log line")
+    g.add_argument("--search-sims", type=int, default=16, help="simulations per searched decision")
+    g.add_argument("--search-coef", type=float, default=1.0,
+                   help="weight of the cross-entropy pulling the policy towards the search's move "
+                        "distribution")
+    g.add_argument("--search-noise", type=float, default=0.25,
+                   help="Dirichlet noise mixed into the root priors (exploration)")
+    g.add_argument("--search-temp", type=float, default=1.0,
+                   help="searched moves are drawn from visit counts ** (1/temp); 0 = most visited")
+    g.add_argument("--search-sweep", type=int, default=0,
+                   help="root moves (likeliest first) played out and checked for an immediate "
+                        "win/loss before searching; 0 = off.  Finds one-move wins the policy "
+                        "misses, at one game copy per move checked")
+    g.add_argument("--search-cpuct", type=float, default=1.5)
     g = ap.add_argument_group("PPO")
     g.add_argument("--lr", type=float, default=3e-4)
     g.add_argument("--epochs", type=int, default=2)
@@ -489,6 +544,7 @@ def parse_args():
         args.iters = 3
         args.eval_every, args.eval_games, args.save_every = 2, 8, 1
         args.minibatch = 64
+        args.search_sims = min(args.search_sims, 8)
     return args
 
 
@@ -587,7 +643,10 @@ def main():
     pool = ProcessPoolExecutor(
         max_workers=args.workers, mp_context=mp.get_context("spawn"),
         initializer=rollout.init_worker,
-        initargs=(latest, {"max_plies": args.max_plies}, args.move_cache))
+        initargs=(latest, {"max_plies": args.max_plies}, args.move_cache,
+                  {"frac": args.search_frac, "sims": args.search_sims, "noise": args.search_noise,
+                   "temp": args.search_temp, "sweep": args.search_sweep,
+                   "c_puct": args.search_cpuct}))
     pending = []          # futures in submission order (oldest first)
     t_start = time.time()
     log_file = open(log_path, "a", newline="")
@@ -651,7 +710,7 @@ def main():
                 "avg_plies": round(avg_plies, 1),
                 "avg_legal": round(float(data["counts"].mean()), 1),
                 "plies_per_s": round(plies / max(t_collect, 1e-9), 1),
-                **{k: round(v, 5) for k, v in stats.items()},
+                **{k: round(v, 5) for k, v in stats.items() if k != "ce"},
                 "expl_var": round(expl_var, 3),
                 "collect_s": round(t_collect, 1), "learn_s": round(t_learn, 1),
                 "elapsed_min": round((time.time() - t_start) / 60, 1),
@@ -672,6 +731,17 @@ def main():
                 "kl " + _health("%.4f" % stats["kl"], stats["kl"], 0.03, 0.045),
                 "clip " + _health("%.2f" % stats["clipfrac"], stats["clipfrac"], 0.25, 0.4),
                 "ev " + _health("%.2f" % expl_var, expl_var, 0.5, 0.2, True)]), flush=True)
+            if data["searched"].any():
+                n_s = int(data["searched"].sum())
+                s_sims = sum(g.get("search_sims", 0) for g in games)
+                s_sec = sum(g.get("search_seconds", 0.0) for g in games)
+                w_sec = sum(g["seconds"] for g in games)
+                print(_tag("search", 183)
+                      + "searched " + _c("1", "%.0f%%" % (100.0 * n_s / len(data["counts"])))
+                      + " of decisions (%d)    ce " % n_s + _c("1", "%.3f" % stats["ce"])
+                      + "    %.0f sims, %.0f ms per searched move    " % (s_sims / n_s, 1000 * s_sec / n_s)
+                      + "search = " + _share("%.0f%%" % (100 * s_sec / max(w_sec, 1e-9)), s_sec, w_sec)
+                      + " of worker game time", flush=True)
             # the longer of the two is what limits the cycle; collect ~0 s means games were already waiting
             print(_tag("time", 111)
                   + "collect " + _c(WATCH if t_collect > t_learn else "1", "%.0fs" % t_collect)
