@@ -817,6 +817,7 @@ class App:
         self.draw_button(L['hint'], "Hide hint" if hint else "Hint",
                          on=hint is not None, enabled=self.advisor is not None)
         if self.show_eval and self.advisor is not None:
+            sims = 0
             if self.game.done:
                 vw = 0.0 if self.game.winner is None else 1.0 if self.game.winner == 'w' else -1.0
             else:
