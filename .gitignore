@@ -50,3 +50,4 @@ native/target/
 build/
 dist/
 *.zip
+*.npz
