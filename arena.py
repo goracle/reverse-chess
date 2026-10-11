@@ -56,7 +56,7 @@ def _init(path_a, path_b, max_plies):
               versions=(va, vb))
 
 
-def _play(seed, a_team):
+def _play(seed, a_team, greedy=False):
     from engine import Game
     rng = np.random.default_rng(seed)
     py_rng = random.Random(seed)                 # for the heuristic player
@@ -69,7 +69,7 @@ def _play(seed, a_team):
             action = heuristic.choose(game, py_rng, model[1])
         else:
             import net as netlib
-            action, _ = netlib.choose_action(model, game, rng)
+            action, _ = netlib.choose_action(model, game, rng, greedy)
         game.step(action)
     result = {"a_team": a_team, "winner": game.winner, "reason": game.end_reason,
               "plies": game.ply, "versions": _S["versions"]}
@@ -86,6 +86,9 @@ def main():
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--max-plies", type=int, default=300, help="draw after this many plies (train.py default)")
     ap.add_argument("--seed", type=int, default=12345)
+    ap.add_argument("--greedy", action="store_true",
+                    help="networks play their single most likely move instead of sampling (training "
+                         "samples; a sampling net with entropy ~2 nats is much noisier than its best play)")
     args = ap.parse_args()
     for p in (args.a, args.b):
         if not _is_heur(p) and not os.path.exists(p):
@@ -95,7 +98,7 @@ def main():
     ctx = mp.get_context("spawn")
     with ProcessPoolExecutor(args.workers, mp_context=ctx, initializer=_init,
                              initargs=(args.a, args.b, args.max_plies)) as pool:
-        futures = [pool.submit(_play, args.seed + i, "b" if i % 2 == 0 else "w")
+        futures = [pool.submit(_play, args.seed + i, "b" if i % 2 == 0 else "w", args.greedy)
                    for i in range(args.games)]
         results = [f.result() for f in futures]            # re-raises worker errors
 
