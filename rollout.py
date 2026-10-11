@@ -15,6 +15,7 @@ import os
 for _var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
 
+import random
 import time
 
 import numpy as np
@@ -57,6 +58,12 @@ def _opponent_model(path):
     while len(_OPP) > 6:
         _OPP.pop(next(iter(_OPP)))
     return model
+
+
+def _bot_mode(spec):
+    """'heur:gift' / 'heur:nogift' -> 'gift' / 'nogift' (the rule-based bot in heuristic.py);
+    anything else (a snapshot path, None) -> None."""
+    return spec.split(":", 1)[1] if spec and spec.startswith("heur:") else None
 
 
 class _Recorder:
@@ -104,17 +111,25 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
     With ``opp_path=None`` the current network plays itself and every decision is
     recorded.  With a snapshot path, the current network plays ``net_team`` against
     that older network; only the current network's decisions are recorded (the
-    learner must not train on moves it did not make).
+    learner must not train on moves it did not make).  ``opp_path`` may also be
+    ``"heur:nogift"`` or ``"heur:gift"``: the rule-based walk-home bots from heuristic.py,
+    handled the same way.
     """
     model, version = _current_model()
-    opp = _opponent_model(opp_path) if opp_path else None
+    bot = _bot_mode(opp_path)
+    opp = _opponent_model(opp_path) if opp_path and bot is None else None
+    if bot is not None:
+        import heuristic
+        py_rng = random.Random(seed)
     rng = np.random.default_rng(seed)
     game = Game(_STATE["rules"])
     rec = _Recorder()
     start = time.time()
     while not game.done:
         team = game.turn
-        if opp is not None and team != net_team:
+        if bot is not None and team != net_team:
+            action = heuristic.choose(game, py_rng, bot)              # not recorded
+        elif opp is not None and team != net_team:
             action, _ = netlib.choose_action(opp, game, rng)          # not recorded
         else:
             phi = potential(game, team)

@@ -1,12 +1,13 @@
 #!/usr/bin/env python
 """Pygame front-end for Reverse Chess, built on the headless engine.
 
-    python play.py                          # you (black) vs a random computer (white)
-    python play.py --white human            # hot-seat, two humans
-    python play.py --black random           # you play white against a random black
+    python play.py                          # you (black) vs the AI (white)
+    python play.py --ai-color b             # you play white
+    python play.py --no-ai                  # hot-seat, two humans (the AI can be switched on in the window)
+    python play.py --ai path/to/ai.npz      # use a particular network file
     python play.py --black random --white random --delay 100   # watch a game
     python play.py --white mymodule:policy  # plug in your own agent (see below)
-    python play.py --white ckpt:runs/run1/latest.pt   # play a network from train.py
+    python play.py --white ckpt:runs/run1/latest.pt   # play a network from train.py (needs PyTorch)
 
 How to play
 -----------
@@ -15,19 +16,37 @@ How to play
 * Click any other square to be told why that move is illegal.
 * Click a destination.  If the move needs a decision (un-promote? which piece
   to give back? reverse en passant? promote the gifted pawn to what?) a menu
-  appears in the window.  Esc cancels back to the board.
+  appears in the window.  *Back* returns to the previous question, the X (or
+  Esc) closes the menu and keeps your piece selected; nothing is played until
+  the last question is answered.
 * The panel on the right shows which pieces are still off the board for each
   team (those are the pieces the *other* side can give back) and how many of
   a team's on-board pieces are home.
 * Padlocks: grey = locked for good (home pawns, castled king/rook); orange =
   blocked in right now (e.g. a bishop behind its own pawns).
-* Keys: R = new game, Esc = cancel selection/menu.
+
+The AI
+------
+The computer opponent is the network trained by train.py.  Put its file next to play.py
+(``ai.npz``, or a checkpoint such as ``latest.pt``; the newest of ``ai.npz`` / ``ai.pt`` /
+``latest.pt`` is used), or point to one with ``--ai``.  A ``.pt`` checkpoint needs PyTorch;
+``python export_weights.py latest.pt`` turns it into an ``ai.npz`` that needs only NumPy.
+With no file the computer moves at random and the eval bar and hints are unavailable.
+
+* Eval bar (E): the network's opinion of the position, white at the bottom.  It is the
+  network's value estimate, not a calculation, so treat it as a hint of who is ahead.
+* Hint (H): the network's three favourite moves, as arrows and in the panel.
+* AI on/off (A) and which colour(s) the AI plays: buttons in the panel.
+* Your record against the AI (won / lost / drawn, by colour) is kept in a small file in your
+  user data folder (see stats.py); a game counts only if the opponent was the AI from the first
+  move to the last.  Games where you used hints are counted too, and noted.
+* Keys: R = new game, Esc = back out of the menu / deselect, H, E, A as above.
 
 Custom agents
 -------------
-``--black`` / ``--white`` accept ``human``, ``random``, ``ckpt:PATH`` (a trained
-network that samples from its policy), ``ckpt-greedy:PATH`` (same, but always the
-most likely move) or ``module:function``.
+``--black`` / ``--white`` accept ``human``, ``ai`` (the network above), ``random``,
+``ckpt:PATH`` (a trained network that samples from its policy), ``ckpt-greedy:PATH`` (same,
+but always the most likely move) or ``module:function``.
 The function is called as ``function(game)`` and must return one of
 ``game.legal_actions()``.  A trained network fits here directly.
 
@@ -36,22 +55,29 @@ Only pygame and numpy are needed; there is no tkinter and no pop-up window.
 import argparse
 import importlib
 import math
+import os
 import random
+import sys
 from collections import Counter, defaultdict
 
+import numpy as np
 import pygame
 
+import numpy_net
 from chessassets import TEAMS, PTYPES, image_path
 from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team
+from stats import Stats
 
 # --------------------------------------------------------------------------
 # Layout and colours
 # --------------------------------------------------------------------------
 SQ = 100                         # pixels per square
 BOARD_PX = SQ * SIZE
-PANEL_W = 240
+BAR_W = 34                       # the eval bar, between the board and the panel
+PANEL_X = BOARD_PX + BAR_W
+PANEL_W = 280
 STATUS_H = 92
-WIN_W = BOARD_PX + PANEL_W
+WIN_W = PANEL_X + PANEL_W
 WIN_H = BOARD_PX + STATUS_H
 
 LIGHT = (238, 238, 210)
@@ -68,12 +94,43 @@ TEXT = (235, 235, 235)
 MUTED = (150, 150, 155)
 BAD = (255, 190, 110)
 GOOD = (130, 220, 130)
+BUTTON = (62, 62, 70)
+BUTTON_HOVER = (84, 84, 96)
+BUTTON_ON = (52, 110, 170)
+BUTTON_OFF = (46, 46, 52)
+HINT_COLOURS = ((60, 200, 90, 215), (240, 200, 60, 190), (235, 135, 60, 170))
+HINT_TEXT = ((130, 220, 130), (240, 205, 90), (240, 160, 100))
+HINT_WIDTHS = (15, 11, 8)
 
 NAMES = {'p': 'pawn', 'k': 'king', 'r': 'rook', 'b': 'bishop', 'q': 'queen', 'n': 'knight'}
 
 # A move may need these decisions, asked in this order.  Each is a field of
 # engine.Action; a decision is only asked when the legal actions disagree on it.
 DIMENSIONS = ('demote', 'gift', 'en_passant', 'promote')
+
+
+def make_layout():
+    """Rectangles of the panel's controls (fixed; only their labels change)."""
+    x0 = PANEL_X + 14
+    w = PANEL_W - 28
+    half = (w - 8) // 2
+    third = (w - 16) // 3
+    R = pygame.Rect
+    return {
+        'x0': x0, 'w': w,
+        'ai_label_y': 344,
+        'ai': R(x0, 382, half, 30),
+        'eval': R(x0 + half + 8, 382, half, 30),
+        'side_label_y': 418,
+        'side_b': R(x0, 434, third, 28),
+        'side_w': R(x0 + third + 8, 434, third, 28),
+        'side_both': R(x0 + 2 * (third + 8), 434, third, 28),
+        'hint': R(x0, 470, w, 30),
+        'eval_text_y': 506,
+        'hint_y': 524,
+        'stats_y': 642,
+        'reset': R(x0, 734, w, 24),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -107,8 +164,30 @@ def next_choice(candidates):
 
 
 # --------------------------------------------------------------------------
-# Small drawing helpers
+# Small helpers
 # --------------------------------------------------------------------------
+
+def sq_name(sq):
+    """(row, col) -> 'a1'..'h8' (white at the bottom, as drawn)."""
+    return "%s%d" % ("abcdefgh"[sq[1]], SIZE - sq[0])
+
+
+def describe(game, action):
+    """One line for an action: 'rook a3-a1, give back a knight'."""
+    piece = game.board[action.src]
+    text = "%s %s-%s" % (NAMES[piece.ptype] if piece is not None else "piece",
+                         sq_name(action.src), sq_name(action.dst))
+    notes = []
+    if action.demote:
+        notes.append("un-promote")
+    if action.gift:
+        notes.append("give back a %s" % NAMES[action.gift])
+    if action.en_passant:
+        notes.append("reverse en passant")
+    if action.promote:
+        notes.append("promote it to a %s" % NAMES[action.promote])
+    return text + (", " + ", ".join(notes) if notes else "")
+
 
 def wrap(text, font, width):
     """Split ``text`` into lines no wider than ``width`` pixels."""
@@ -131,6 +210,19 @@ def draw_padlock(surface, x, y, colour):
     pygame.draw.circle(surface, (20, 20, 20), (x + 8, y + 13), 2)
 
 
+def draw_arrow(surface, start, end, colour, width):
+    """A thick arrow from start to end (pixel coordinates)."""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length
+    head = min(width * 2 + 8, length * 0.6)
+    base = (end[0] - ux * head, end[1] - uy * head)
+    pygame.draw.line(surface, colour, start, base, width)
+    px, py = -uy, ux
+    pygame.draw.polygon(surface, colour, [end, (base[0] + px * head * 0.55, base[1] + py * head * 0.55),
+                                          (base[0] - px * head * 0.55, base[1] - py * head * 0.55)])
+
+
 # --------------------------------------------------------------------------
 # Agents
 # --------------------------------------------------------------------------
@@ -143,14 +235,18 @@ def load_agent(spec, rng):
         return lambda game: rng.choice(game.legal_actions())
     if spec.startswith(('ckpt:', 'ckpt-greedy:')):    # a network trained by train.py
         kind, _, path = spec.partition(':')
-        import numpy as np
         from net import make_agent                    # imports torch only when asked for
         return make_agent(path, greedy=(kind == 'ckpt-greedy'),
                           rng=np.random.default_rng(rng.randrange(2 ** 32)))
     module, _, name = spec.partition(':')
     if not name:
-        raise SystemExit("agent must be 'human', 'random' or 'module:function', got %r" % spec)
+        raise SystemExit("agent must be 'human', 'ai', 'random' or 'module:function', got %r" % spec)
     return getattr(importlib.import_module(module), name)
+
+
+def app_dir():
+    """Folder holding the program (and ai.npz): works from source and from a PyInstaller bundle."""
+    return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 
 
 # --------------------------------------------------------------------------
@@ -158,7 +254,8 @@ def load_agent(spec, rng):
 # --------------------------------------------------------------------------
 
 class App:
-    def __init__(self, agents, rules, delay_ms, rng):
+    def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
+                 stats, show_eval):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -166,12 +263,48 @@ class App:
         self.font_big = pygame.font.SysFont(None, 38)
         self.font_small = pygame.font.SysFont(None, 20)
         self.font_status = pygame.font.SysFont(None, 25)
+        self.font_btn = pygame.font.SysFont(None, 23)
         self._sprites = {}
-        self.agents = agents          # {'b': fn|None, 'w': fn|None}
+        self.layout = make_layout()
         self.rules = rules
         self.delay_ms = delay_ms
         self.rng = rng
+        self.advisor = advisor        # numpy_net.Advisor or None (no AI file)
+        self.ai_note = ai_note        # why there is no advisor, shown in the panel
+        self.custom = custom          # {'b': fn|None, 'w': fn|None}: agents given on the command line
+        self.ai_on = ai_on
+        self.ai_sides = set(ai_sides)
+        self.stats = stats
+        self.show_eval = show_eval and advisor is not None
+        np_rng = np.random.default_rng(rng.randrange(2 ** 32))
+        if advisor is not None:
+            self.default_ai = lambda game: advisor.choose(game, np_rng)
+        else:
+            self.default_ai = lambda game: rng.choice(game.legal_actions())
+        self.stats_summary = stats.summary() if stats is not None else None
+        self.confirm_reset_until = 0
+        self.refresh_agents()
         self.new_game()
+        if stats is not None and stats.error:
+            self.message = stats.error
+
+    # -- who plays what --------------------------------------------------
+    def agent_for(self, team):
+        if not (self.ai_on and team in self.ai_sides):
+            return None
+        return self.custom.get(team) or self.default_ai
+
+    def refresh_agents(self):
+        self.agents = {team: self.agent_for(team) for team in TEAMS}
+
+    def stats_eligible(self):
+        """True when this setup is 'a human against the network', the only thing the record counts."""
+        if self.stats is None or self.advisor is None or not self.ai_on or len(self.ai_sides) != 1:
+            return False
+        return self.custom.get(next(iter(self.ai_sides))) is None
+
+    def human_colour(self):
+        return other_team(next(iter(self.ai_sides)))
 
     # -- state -----------------------------------------------------------
     def new_game(self):
@@ -179,9 +312,23 @@ class App:
         self.selected = None          # square of the piece being moved
         self.candidates = []          # actions for the chosen src -> dst
         self.pending = None           # (dimension, values) while a menu is open
+        self.history = []             # candidate lists before each answered question (for Back)
         self.message = ""
+        self.hint = None
+        self.hint_used = False
+        self.recorded = False
+        self.stats_ok = self.stats_eligible()
+        self.bar_pos = None
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
         self.reindex()
+
+    def restart(self):
+        """Start a new game; one abandoned part-way is noted in the record."""
+        if self.stats_ok and not self.recorded and not self.game.done and self.game.ply > 0:
+            self.stats.add(self.human_colour(), "abandoned", self.game.ply, self.hint_used,
+                           self.advisor.version)
+            self.stats_summary = self.stats.summary()
+        self.new_game()
 
     def reindex(self):
         """Group the side to move's legal actions by source square."""
@@ -206,10 +353,30 @@ class App:
                         self.blocked.add(piece.pos)
 
     def cancel(self):
+        """Back to the board with nothing selected."""
         self.selected = None
         self.candidates = []
         self.pending = None
+        self.history = []
         self.message = ""
+
+    def close_menu(self):
+        """Close the move menu without playing; the piece stays selected."""
+        self.candidates = []
+        self.pending = None
+        self.history = []
+        self.message = ""
+
+    def menu_back(self):
+        """Undo the last answer in the menu (only offered when there is one)."""
+        self.candidates = self.history.pop()
+        self.pending = next_choice(self.candidates)
+
+    def escape(self):
+        if self.pending is not None:
+            self.close_menu()
+        else:
+            self.cancel()
 
     def play(self, action):
         try:
@@ -221,21 +388,119 @@ class App:
         self.cancel_keep_message()
         self.reindex()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        if self.game.done:
+            self.record_finished()
 
     def cancel_keep_message(self):
         message = self.message
         self.cancel()
         self.message = message
 
+    def record_finished(self):
+        if not self.stats_ok or self.recorded:
+            return
+        game, human = self.game, self.human_colour()
+        result = "drawn" if game.winner is None else "won" if game.winner == human else "lost"
+        self.stats.add(human, result, game.ply, self.hint_used, self.advisor.version)
+        self.stats_summary = self.stats.summary()
+        self.recorded = True
+        if self.stats.error:
+            self.message = self.stats.error
+
+    # -- panel controls --------------------------------------------------
+    def ai_changed(self):
+        """The AI setup changed: a game already under way no longer counts as 'vs the AI'."""
+        if self.game.ply > 0 and not self.game.done:
+            self.stats_ok = False
+        elif self.game.ply == 0:
+            self.stats_ok = self.stats_eligible()
+        self.refresh_agents()
+        self.cancel()
+        self.hint = None
+        self.ai_due = pygame.time.get_ticks() + self.delay_ms
+
+    def toggle_ai(self):
+        self.ai_on = not self.ai_on
+        if self.ai_on and not self.ai_sides:
+            self.ai_sides = {'w'}
+        self.ai_changed()
+
+    def set_sides(self, sides):
+        if self.ai_on and set(sides) != self.ai_sides:
+            self.ai_sides = set(sides)
+            self.ai_changed()
+
+    def toggle_eval(self):
+        if self.advisor is None:
+            self.message = "The eval bar needs the AI file (ai.npz or latest.pt next to play.py)."
+        else:
+            self.show_eval = not self.show_eval
+            self.bar_pos = None
+            self.message = ""
+
+    def pos_key(self):
+        return (id(self.game), self.game.ply)
+
+    def current_hint(self):
+        if self.hint is not None and self.hint["key"] != self.pos_key():
+            self.hint = None                      # the position moved on
+        return self.hint
+
+    def toggle_hint(self):
+        if self.current_hint() is not None:
+            self.hint = None
+            return
+        if self.advisor is None:
+            self.message = "Hints need the AI file (ai.npz or latest.pt next to play.py)."
+        elif self.game.done:
+            self.message = ""
+        elif not self.human_to_move():
+            self.message = "Hints are for your own moves; it is the computer's turn."
+        else:
+            self.hint = {"key": self.pos_key(), "top": self.advisor.analyse(self.game).top(3)}
+            self.hint_used = True
+            self.message = ""
+
+    def click_reset(self):
+        if self.stats is None:
+            return
+        now = pygame.time.get_ticks()
+        if now < self.confirm_reset_until:
+            self.stats.reset()
+            self.stats_summary = self.stats.summary()
+            self.confirm_reset_until = 0
+        else:
+            self.confirm_reset_until = now + 3000
+
+    def click_panel(self, pos):
+        L = self.layout
+        if L['ai'].collidepoint(pos):
+            self.toggle_ai()
+        elif L['eval'].collidepoint(pos):
+            self.toggle_eval()
+        elif L['side_b'].collidepoint(pos):
+            self.set_sides({'b'})
+        elif L['side_w'].collidepoint(pos):
+            self.set_sides({'w'})
+        elif L['side_both'].collidepoint(pos):
+            self.set_sides({'b', 'w'})
+        elif L['hint'].collidepoint(pos):
+            self.toggle_hint()
+        elif L['reset'].collidepoint(pos):
+            self.click_reset()
+
     # -- input -----------------------------------------------------------
     def human_to_move(self):
         return not self.game.done and self.agents[self.game.turn] is None
 
     def handle_click(self, pos):
-        if not self.human_to_move():
-            return
-        if self.pending is not None:
+        if self.pending is not None:              # the menu is modal
             self.click_menu(pos)
+            return
+        if pos[0] >= BOARD_PX:
+            self.click_panel(pos)
+            return
+        if not self.human_to_move():
             return
         x, y = pos
         if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX):
@@ -260,6 +525,7 @@ class App:
             return
         if sq in {a.dst for a in self.by_src.get(self.selected, [])}:
             self.candidates = [a for a in self.by_src[self.selected] if a.dst == sq]
+            self.history = []
             self.resolve()
         else:
             self.message = (game.explain_illegal(self.selected, sq)
@@ -275,14 +541,21 @@ class App:
 
     def click_menu(self, pos):
         dim, values = self.pending
-        _, rects = menu_rects(len(values))
-        for value, rect in zip(values, rects):
-            if rect.collidepoint(pos):
-                self.candidates = [a for a in self.candidates if getattr(a, dim) == value]
-                self.pending = None
-                self.resolve()
-                return
-        self.cancel()                 # clicked outside every option
+        panel, rects, x_rect, back_rect = menu_rects(len(values), bool(self.history))
+        if x_rect.collidepoint(pos):
+            self.close_menu()
+        elif back_rect is not None and back_rect.collidepoint(pos):
+            self.menu_back()
+        else:
+            for value, rect in zip(values, rects):
+                if rect.collidepoint(pos):
+                    self.history.append(self.candidates)
+                    self.candidates = [a for a in self.candidates if getattr(a, dim) == value]
+                    self.pending = None
+                    self.resolve()
+                    return
+            if not panel.collidepoint(pos):   # a click away from the menu closes it
+                self.close_menu()
 
     def update_ai(self):
         game = self.game
@@ -310,6 +583,8 @@ class App:
     def draw(self):
         self.screen.fill(STATUS_BG)
         self.draw_board()
+        self.draw_hint_arrows()
+        self.draw_eval_bar()
         self.draw_panel()
         self.draw_status()
         if self.pending is not None:
@@ -347,10 +622,62 @@ class App:
                 if (r, c) in dests:
                     pygame.draw.circle(self.screen, DOT, rect.center, 11)
 
+    def draw_hint_arrows(self):
+        hint = self.current_hint()
+        if hint is None:
+            return
+        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        seen = set()
+        for rank, (action, _) in enumerate(hint["top"]):
+            if (action.src, action.dst) in seen:
+                continue
+            seen.add((action.src, action.dst))
+            centre = lambda sq: (sq[1] * SQ + SQ // 2, sq[0] * SQ + SQ // 2)
+            draw_arrow(overlay, centre(action.src), centre(action.dst),
+                       HINT_COLOURS[rank], HINT_WIDTHS[rank])
+        self.screen.blit(overlay, (0, 0))
+
+    def eval_target(self):
+        """Where the bar should sit: 1 = all white, 0 = all black."""
+        game = self.game
+        if game.done:
+            return 0.5 if game.winner is None else 1.0 if game.winner == 'w' else 0.0
+        return (max(-1.0, min(1.0, self.advisor.white_value(game))) + 1.0) / 2.0
+
+    def draw_eval_bar(self):
+        pygame.draw.rect(self.screen, PANEL_BG, (BOARD_PX, 0, BAR_W, BOARD_PX))
+        if not self.show_eval or self.advisor is None:
+            return
+        target = self.eval_target()
+        self.bar_pos = target if self.bar_pos is None else self.bar_pos + (target - self.bar_pos) * 0.25
+        bar = pygame.Rect(BOARD_PX + 7, 8, BAR_W - 14, BOARD_PX - 16)
+        split = bar.bottom - int(round(bar.height * self.bar_pos))   # white fills up from the bottom
+        pygame.draw.rect(self.screen, (14, 14, 17), (bar.x, bar.y, bar.w, split - bar.y))
+        pygame.draw.rect(self.screen, (240, 240, 240), (bar.x, split, bar.w, bar.bottom - split))
+        for frac in (0.25, 0.5, 0.75):
+            y = bar.y + int(bar.height * frac)
+            pygame.draw.line(self.screen, (150, 150, 155) if frac != 0.5 else (230, 110, 40),
+                             (bar.x, y), (bar.right - 1, y), 1)
+        pygame.draw.rect(self.screen, (120, 120, 125), bar, 1)
+
+    def draw_button(self, rect, label, on=False, enabled=True):
+        if not enabled:
+            bg, fg = BUTTON_OFF, MUTED
+        elif on:
+            bg, fg = BUTTON_ON, TEXT
+        elif rect.collidepoint(pygame.mouse.get_pos()):
+            bg, fg = BUTTON_HOVER, TEXT
+        else:
+            bg, fg = BUTTON, TEXT
+        pygame.draw.rect(self.screen, bg, rect, border_radius=6)
+        surf = self.font_btn.render(label, True, fg)
+        self.screen.blit(surf, surf.get_rect(center=rect.center))
+
     def draw_panel(self):
         game = self.game
-        x0 = BOARD_PX + 14
-        pygame.draw.rect(self.screen, PANEL_BG, (BOARD_PX, 0, PANEL_W, WIN_H))
+        L = self.layout
+        x0 = L['x0']
+        pygame.draw.rect(self.screen, PANEL_BG, (PANEL_X, 0, PANEL_W, WIN_H))
         y = 12
         self.text("Reverse Chess", (x0, y), self.font_big)
         y += 34
@@ -372,11 +699,78 @@ class App:
                 self.text("x%d" % count, (cx + 34, cy + 8), self.font,
                           TEXT if count else MUTED)
             y += 2 * 38 + 16
+        self.draw_controls()
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
-                  "R: new game   Esc: cancel"]
+                  "H hint  E eval  A AI  R new  Esc back"]
         for i, line in enumerate(legend):
             self.text(line, (x0, WIN_H - 8 - (len(legend) - i) * 21), self.font_small, MUTED)
+
+    def draw_controls(self):
+        L = self.layout
+        x0, w = L['x0'], L['w']
+        if self.advisor is not None:
+            label = "AI: " + self.advisor.name
+        else:
+            label = self.ai_note or "No AI file found: the computer moves at random."
+        for i, line in enumerate(wrap(label, self.font_small, w)[:2]):
+            self.text(line, (x0, L['ai_label_y'] + i * 17), self.font_small, MUTED)
+        self.draw_button(L['ai'], "AI: ON" if self.ai_on else "AI: OFF", on=self.ai_on)
+        self.draw_button(L['eval'], "Eval bar: ON" if self.show_eval else "Eval bar: OFF",
+                         on=self.show_eval, enabled=self.advisor is not None)
+        self.text("AI plays:", (x0, L['side_label_y']), self.font_small, MUTED)
+        for name, text, sides in (('side_b', "Black", {'b'}), ('side_w', "White", {'w'}),
+                                  ('side_both', "Both", {'b', 'w'})):
+            self.draw_button(L[name], text, on=self.ai_on and self.ai_sides == sides,
+                             enabled=self.ai_on)
+        hint = self.current_hint()
+        self.draw_button(L['hint'], "Hide hint" if hint else "Hint",
+                         on=hint is not None, enabled=self.advisor is not None)
+        if self.show_eval and self.advisor is not None:
+            if self.game.done:
+                vw = 0.0 if self.game.winner is None else 1.0 if self.game.winner == 'w' else -1.0
+            else:
+                vw = self.advisor.white_value(self.game)
+            who = "white ahead" if vw > 0.05 else "black ahead" if vw < -0.05 else "about even"
+            self.text("Eval %+.2f  (%s)" % (vw, who), (x0, L['eval_text_y']), self.font_small, TEXT)
+        if hint is not None:
+            y = L['hint_y']
+            for rank, (action, p) in enumerate(hint["top"]):
+                line = "%d. %d%%  %s" % (rank + 1, round(100 * p), describe(self.game, action))
+                for text in wrap(line, self.font_small, w)[:2]:
+                    self.text(text, (x0, y), self.font_small, HINT_TEXT[rank])
+                    y += 17
+                y += 3
+        self.draw_stats()
+
+    def draw_stats(self):
+        L = self.layout
+        x0, w = L['x0'], L['w']
+        y = L['stats_y']
+        self.text("You vs the AI", (x0, y), self.font_status)
+        if self.stats is None:
+            self.text("record switched off", (x0, y + 24), self.font_small, MUTED)
+            return
+        s = self.stats_summary
+        a = s["all"]
+        self.text("%d won   %d lost   %d drawn" % (a["won"], a["lost"], a["drawn"]),
+                  (x0, y + 24), self.font)
+        b, wh = s['b'], s['w']
+        self.text("as black %d-%d-%d    as white %d-%d-%d" % (
+            b["won"], b["lost"], b["drawn"], wh["won"], wh["lost"], wh["drawn"]),
+            (x0, y + 50), self.font_small, MUTED)
+        notes = []
+        if s["hinted"]:
+            notes.append("%d with hints" % s["hinted"])
+        if s["abandoned"]:
+            notes.append("%d abandoned" % s["abandoned"])
+        if not self.stats_ok and not self.game.done:
+            notes.append("this game is not counted")
+        if notes:
+            self.text(", ".join(notes), (x0, y + 70), self.font_small, MUTED)
+        confirming = pygame.time.get_ticks() < self.confirm_reset_until
+        self.draw_button(L['reset'], "Click again to erase" if confirming else "Reset record",
+                         on=confirming, enabled=bool(self.stats.games))
 
     def draw_status(self):
         game = self.game
@@ -394,7 +788,7 @@ class App:
             extra = (" - extra turn (reverse en passant)"
                      if last is not None and last.extra_turn and last.team == game.turn else "")
             line = "%s to move (%s)%s" % (name, kind, extra)
-        lines = wrap(line, self.font_status, WIN_W - 28)
+        lines = wrap(line, self.font_status, PANEL_X - 28)
         if len(lines) > 3:
             lines = lines[:3]
             lines[-1] = lines[-1].rstrip(" .,;:") + " ..."
@@ -409,7 +803,7 @@ class App:
         veil = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
         veil.fill((0, 0, 0, 140))
         self.screen.blit(veil, (0, 0))
-        panel, rects = menu_rects(len(values))
+        panel, rects, x_rect, back_rect = menu_rects(len(values), bool(self.history))
         pygame.draw.rect(self.screen, PANEL_BG, panel, border_radius=12)
         titles = {
             'demote': "Un-promote this piece?",
@@ -419,6 +813,9 @@ class App:
             'promote': "Promote the gifted pawn?",
         }
         self.text(titles[dim], (panel.x + 20, panel.y + 18), self.font_big)
+        self.draw_button(x_rect, "X")
+        if back_rect is not None:
+            self.draw_button(back_rect, "< Back")
         mouse = pygame.mouse.get_pos()
         for value, rect in zip(values, rects):
             pygame.draw.rect(self.screen, (84, 84, 96) if rect.collidepoint(mouse)
@@ -445,16 +842,19 @@ class App:
             self.text(label, (rect.x + 76, rect.y + 24), self.font)
 
 
-def menu_rects(n):
-    """(background rect, one rect per option) for a centred menu of n options."""
-    width, height, gap, head = 600, 70, 10, 60
-    total = head + n * height + (n - 1) * gap
+def menu_rects(n, with_back=False):
+    """(background, one rect per option, X button, Back button or None) for a centred menu of n options."""
+    width, height, gap, head, foot = 600, 70, 10, 60, 56
+    total = head + n * height + (n - 1) * gap + (foot if with_back else 0)
     left = (BOARD_PX - width) // 2
     top = (BOARD_PX - total) // 2
     panel = pygame.Rect(left - 20, top - 10, width + 40, total + 30)
     rects = [pygame.Rect(left, top + head + i * (height + gap), width, height)
              for i in range(n)]
-    return panel, rects
+    x_rect = pygame.Rect(panel.right - 46, panel.y + 12, 34, 34)
+    back_rect = (pygame.Rect(left, top + head + n * height + (n - 1) * gap + 12, 130, 38)
+                 if with_back else None)
+    return panel, rects, x_rect, back_rect
 
 
 # --------------------------------------------------------------------------
@@ -464,20 +864,59 @@ def menu_rects(n):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--black", default="human", help="human | random | module:function")
-    ap.add_argument("--white", default="random", help="human | random | module:function")
+    ap.add_argument("--ai", default=None, metavar="FILE",
+                    help="network file: ai.npz, or a train.py checkpoint such as latest.pt "
+                         "(default: the newest of ai.npz / ai.pt / latest.pt next to play.py)")
+    ap.add_argument("--ai-color", choices=("b", "w", "both"), default="w",
+                    help="which side the AI plays (default w: you are black)")
+    ap.add_argument("--no-ai", action="store_true", help="start with the AI switched off")
+    ap.add_argument("--eval", action="store_true", help="start with the eval bar on")
+    ap.add_argument("--black", default=None, help="human | ai | random | module:function")
+    ap.add_argument("--white", default=None, help="human | ai | random | module:function")
     ap.add_argument("--delay", type=int, default=400, help="ms before a computer moves")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--max-plies", type=int, default=None, help="draw after this many plies")
+    ap.add_argument("--ai-max-plies", type=int, default=300,
+                    help="the move cap the AI was trained with (train.py --max-plies); only scales "
+                         "one of its inputs, it does not end games")
     ap.add_argument("--strict-win", action="store_true",
                     help="experimental: every piece of both teams must be on the board")
+    ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
+    ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
-    agents = {"b": load_agent(args.black, rng), "w": load_agent(args.white, rng)}
+
+    advisor, ai_note = None, ""
+    path = args.ai or None
+    if path is None:
+        path = numpy_net.find_ai_file(app_dir(), os.getcwd())
+    if path:
+        try:
+            advisor = numpy_net.Advisor(path, args.ai_max_plies)
+        except Exception as err:             # missing PyTorch for a .pt, a damaged file, ...
+            if args.ai:
+                raise SystemExit("cannot load the AI file %s: %s" % (path, err))
+            ai_note = "Could not load %s (%s); the computer moves at random." % (os.path.basename(path), err)
+
+    custom = {"b": None, "w": None}
+    sides = set()
+    if args.black is not None or args.white is not None:
+        for team, spec in (("b", args.black), ("w", args.white)):
+            if spec in (None, "human"):
+                continue
+            sides.add(team)
+            if spec != "ai":
+                custom[team] = load_agent(spec, rng)
+        ai_on = bool(sides)
+    else:
+        sides = {"b", "w"} if args.ai_color == "both" else {args.ai_color}
+        ai_on = not args.no_ai
+
+    stats = None if args.no_stats else Stats(args.stats)
     rules = Rules(win_requires_all_pieces_on_board=args.strict_win,
                   max_plies=args.max_plies)
-    app = App(agents, rules, args.delay, rng)
+    app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval)
 
     clock = pygame.time.Clock()
     running = True
@@ -487,9 +926,16 @@ def main():
                 running = False
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
-                    app.cancel()
+                    app.escape()
                 elif event.key == pygame.K_r:
-                    app.new_game()
+                    app.restart()
+                elif app.pending is None:
+                    if event.key == pygame.K_h:
+                        app.toggle_hint()
+                    elif event.key == pygame.K_e:
+                        app.toggle_eval()
+                    elif event.key == pygame.K_a:
+                        app.toggle_ai()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 app.handle_click(event.pos)
         app.update_ai()

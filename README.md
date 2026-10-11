@@ -62,6 +62,31 @@ The rules are simple...ish.
 
 * Strategy - You are trying to force your opponent to make a mistake and trap themselves (leading to a loss) or to clutter the board.
 
+## Playing against the AI
+
+`play.py` is the pygame front end.  The computer opponent is the network trained by `train.py`:
+copy its checkpoint (e.g. `runs/run4/latest.pt`) next to `play.py`, then
+
+```bash
+python play.py                  # you are black, the AI is white
+python play.py --ai-color b     # you are white
+python play.py --no-ai          # hot-seat; the AI can be switched on in the window
+```
+
+In the window: **AI on/off** and which colour it plays, an **eval bar** (the network's opinion of who
+is ahead, white at the bottom), a **Hint** button (its three favourite moves), and a **record** of your
+games against it.  The move menu has a **Back** button and an **X**.  Keys: `H` hint, `E` eval bar,
+`A` AI on/off, `R` new game, `Esc` back out.
+
+A `.pt` checkpoint needs PyTorch.  To play (or package the game) without it, convert once:
+
+```bash
+python export_weights.py runs/run4/latest.pt        # writes ai.npz (NumPy only, ~2 MB)
+python check_numpy_net.py runs/run4/latest.pt       # optional: NumPy output == PyTorch output
+```
+
+The record is kept in your user data folder (see `stats.py`), not in the game folder.
+
 ## Contributing
 
 Contributions, issues, and ideas for new (and worse) features are welcome!

@@ -299,7 +299,7 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
     """
     tm = timing if timing is not None else {}
     tm.update(collate=0.0, dispatch=0.0, wait=0.0, steps=0, collate_np=0.0, collate_xfer=0.0,
-              step_dispatch=[], new_shape=[], kl_stop=False)
+              step_dispatch=[], new_shape=[], kl_stop=False, decisions=0)
     kl_hist = deque(maxlen=max(1, args.kl_window))
     adv = data["adv"]
     adv = (adv - adv.mean()) / (adv.std() + 1e-8)
@@ -368,6 +368,7 @@ def ppo_update(model, opt, data, args, device, rng, timing=None):
             tm["dispatch"] += dt
             tm["step_dispatch"].append(dt)
             tm["steps"] += 1
+            tm["decisions"] += len(mb)
 
             with torch.no_grad():                     # stays on the device; read next time round
                 prev = torch.stack([
@@ -422,6 +423,16 @@ def parse_args():
     g.add_argument("--pool-power", type=float, default=2.0,
                    help="how strongly to favour the older snapshots that beat the current net "
                         "(0 = pick uniformly, 2 = default, higher = focus harder on the toughest)")
+    g.add_argument("--heur-frac", type=float, default=0.25,
+                   help="fraction of games played against the rule-based walk-home bots from heuristic.py "
+                        "(heur:nogift and heur:gift; the one the net scores worse against is picked more "
+                        "often, see --pool-power) -- but only while games are being queued in every "
+                        "--heur-every-th iteration.  0 = never.  Only the net's own moves are trained on, "
+                        "and the 'vs bots' line reports only those training games (no separate eval games).")
+    g.add_argument("--heur-every", type=int, default=20,
+                   help="queue the bot games only in every this-many-th iteration (they are slower to play "
+                        "than self-play games; the queue is ~1 iteration deep, so they show up in the "
+                        "batch a little later).  A sanity check, not a real-time measure.  1 = every iteration.")
     g.add_argument("--pool-frac", type=float, default=0.25,
                    help="fraction of games played against a random older iter_*.pt snapshot "
                         "instead of the current net (stops self-play from cycling; "
@@ -505,7 +516,13 @@ def top_up(pending, pool, args, next_seed):
     while len(pending) < args.queue_factor * args.workers:
         seed = next_seed()
         pick = np.random.default_rng(seed + 1)               # picks opponent and colour
-        if snaps and pick.random() < args.pool_frac:
+        u = pick.random()
+        if getattr(args, "bots_now", False) and u < args.heur_frac:     # a rule-based bot
+            bots = ["heur:nogift", "heur:gift"]
+            pending.append(pool.submit(rollout.selfplay_task, seed,
+                                       bots[int(pick.choice(2, p=_pool_weights(bots, args.pool_power)))],
+                                       "b" if pick.random() < 0.5 else "w"))
+        elif snaps and pick.random() < args.pool_frac:       # an older snapshot of the net
             pending.append(pool.submit(rollout.selfplay_task, seed,
                                        snaps[int(pick.choice(len(snaps), p=weights))],
                                        "b" if pick.random() < 0.5 else "w"))
@@ -579,6 +596,7 @@ def main():
         for it in range(args.iters):
             # ---- collect self-play games --------------------------------
             t0 = time.time()
+            args.bots_now = args.heur_frac > 0 and it % max(1, args.heur_every) == 0
             games, plies, stale = [], 0, 0
             while plies < args.plies_per_iter:
                 top_up(pending, pool, args, next_seed)
@@ -619,7 +637,9 @@ def main():
             # ---- report ---------------------------------------------------
             n = len(games)
             winners = Counter(g["winner"] or "draw" for g in games if not g["opp"])
-            vs_past = [g for g in games if g["opp"]]
+            vs_all = [g for g in games if g["opp"]]
+            vs_past = [g for g in vs_all if not g["opp"].startswith("heur:")]     # older snapshots
+            vs_bots = [g for g in vs_all if g["opp"].startswith("heur:")]         # rule-based bots
             avg_plies = sum(g["plies"] for g in games) / n
             reasons = Counter(g["reason"][:64] for g in games)
             ret_var = float(np.var(data["ret"]))
@@ -657,7 +677,8 @@ def main():
                   + "collect " + _c(WATCH if t_collect > t_learn else "1", "%.0fs" % t_collect)
                   + ("" if t_collect < 1 else " (%.0f plies/s)" % (plies / t_collect))
                   + "    learn " + _c(WATCH if t_learn >= t_collect else "1", "%.0fs" % t_learn)
-                  + " (%d steps)" % timing["steps"]
+                  + " (%d steps, %.2f of %d passes over the batch)"
+                  % (timing["steps"], timing["decisions"] / max(len(data["counts"]), 1), args.epochs)
                   + (_c(WATCH, "  KL gate stopped it early") if timing["kl_stop"] else "")
                   + ("   games were already waiting" if t_collect < 1 else ""), flush=True)
             print(_tag("learner", 183)
@@ -680,14 +701,29 @@ def main():
                       + "    new shapes: %d, cost " % len(new) + _share("%.1fs" % sum(new), sum(new), t_learn)
                       + "    slowest %.2f s" % max(sd), flush=True)
             print(_tag("ended", 215) + _ended_line(reasons), flush=True)
+            for g in vs_all:                          # remember how the current net does against each opponent
+                s_ = 1.0 if g["winner"] == g["net_team"] else 0.5 if g["winner"] is None else 0.0
+                sc, c = POOL_SCORE.get(g["opp"], (0.0, 0.0))
+                POOL_SCORE[g["opp"]] = (sc * 0.97 + s_, c * 0.97 + 1.0)       # recent games count more
+            if vs_bots:
+                parts = []
+                for mode in ("heur:nogift", "heur:gift"):
+                    gs = [g for g in vs_bots if g["opp"] == mode]
+                    if not gs:
+                        continue
+                    bw = sum(g["winner"] == g["net_team"] for g in gs)
+                    bd = sum(g["winner"] is None for g in gs)
+                    sc, c = POOL_SCORE[mode]
+                    parts.append("%s: " % mode[5:] + _c(GOOD, "won %d" % bw) + " " + _c(WATCH, "drew %d" % bd)
+                                 + " " + _c(BAD if len(gs) - bw - bd else "1", "lost %d" % (len(gs) - bw - bd))
+                                 + " (running score " + _health("%.2f" % (sc / max(c, 1e-9)), sc / max(c, 1e-9),
+                                                                0.9, 0.75, True) + ")")
+                print(_tag("vs bots", 150) + "    ".join(parts), flush=True)
             if vs_past:
-                for g in vs_past:                     # remember how the current net does against each snapshot
-                    s_ = 1.0 if g["winner"] == g["net_team"] else 0.5 if g["winner"] is None else 0.0
-                    sc, c = POOL_SCORE.get(g["opp"], (0.0, 0.0))
-                    POOL_SCORE[g["opp"]] = (sc * 0.97 + s_, c * 0.97 + 1.0)   # recent games count more
                 pw = sum(g["winner"] == g["net_team"] for g in vs_past)
                 pd = sum(g["winner"] is None for g in vs_past)
-                hard = sorted(((sc + 1) / (c + 2), p) for p, (sc, c) in POOL_SCORE.items() if c >= 3)[:3]
+                hard = sorted(((sc + 1) / (c + 2), p) for p, (sc, c) in POOL_SCORE.items()
+                              if c >= 3 and not p.startswith("heur:"))[:3]
                 print(_tag("vs old", 80)
                       + "against %d older snapshots: " % len(vs_past)
                       + _c(GOOD, "won %d" % pw) + "  " + _c(WATCH, "drew %d" % pd) + "  "
