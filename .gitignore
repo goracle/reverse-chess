@@ -35,8 +35,8 @@ runs/
 *.pt
 *.ckpt
 
-# --- trained networks: attach to a GitHub release instead of committing ---
-# (play.py looks for ai.npz next to itself; download it from the release page)
+# --- trained networks ---
+# ai.npz (~1.5 MB) is committed so CI can package it into releases; checkpoints are not.
 ai.pt
 
 # --- built native engine: build with ./build_native.sh ---
@@ -48,4 +48,5 @@ native/target/
 # --- packaging output ---
 build/
 dist/
+out/
 *.zip

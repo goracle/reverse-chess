@@ -1,0 +1,120 @@
+name: build-release
+
+# Push a tag like v0.1.0 to build all platforms and publish a GitHub release.
+# "Run workflow" (workflow_dispatch) builds everything and keeps the zips as run artifacts only.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-22.04,    name: linux-x64 }
+          - { os: windows-latest,  name: windows-x64 }
+          - { os: macos-14,        name: macos-arm64 }       # Apple Silicon
+          - { os: macos-15-intel,  name: macos-intel }       # Intel Macs
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      SDL_VIDEODRIVER: dummy
+      SDL_AUDIODRIVER: dummy
+      RC_SELFTEST_LOG: ${{ github.workspace }}/selftest.txt
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python packages
+        run: python -m pip install pygame numpy pyinstaller
+
+      - name: Build the native engine
+        run: sh build_native.sh
+
+      - name: Native engine must match the Python reference on this OS
+        run: |
+          RC_ENGINE=native python check_engine.py
+          RC_ENGINE=native python check_native.py --games 30 --no-time
+          python check_rustnet.py
+
+      - name: Package with PyInstaller
+        run: pyinstaller --noconfirm reverse_chess.spec
+
+      - name: Smoke-test the packaged app (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = Start-Process dist\ReverseChess\ReverseChess.exe -ArgumentList '--selftest','--no-stats' -Wait -PassThru
+          Get-Content $env:RC_SELFTEST_LOG
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+
+      - name: Smoke-test the packaged app (mac)
+        if: runner.os == 'macOS'
+        run: |
+          dist/ReverseChess.app/Contents/MacOS/ReverseChess --selftest --no-stats
+          cat "$RC_SELFTEST_LOG"
+
+      - name: Smoke-test the packaged app (linux)
+        if: runner.os == 'Linux'
+        run: |
+          dist/ReverseChess/ReverseChess --selftest --no-stats
+          cat "$RC_SELFTEST_LOG"
+
+      - name: Require the native engine in the packaged app
+        run: |
+          grep -q "engine: native" "$RC_SELFTEST_LOG"
+
+      - name: Zip it
+        run: |
+          mkdir -p out
+          case "${{ runner.os }}" in
+            Windows) powershell -Command "Compress-Archive -Path dist/ReverseChess -DestinationPath out/ReverseChess-${{ matrix.name }}.zip" ;;
+            macOS)   ditto -c -k --keepParent dist/ReverseChess.app out/ReverseChess-${{ matrix.name }}.zip ;;
+            Linux)   tar -C dist -czf out/ReverseChess-${{ matrix.name }}.tar.gz ReverseChess ;;
+          esac
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ReverseChess-${{ matrix.name }}
+          path: out/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" out/* \
+            --repo "${{ github.repository }}" \
+            --title "Reverse Chess ${{ github.ref_name }}" \
+            --notes-file - <<'NOTES'
+          Download the file for your system, unpack it, and run **ReverseChess**.
+          The AI opponent is included.
+
+          * **Windows**: unzip, open the `ReverseChess` folder, run `ReverseChess.exe`.
+            SmartScreen may warn about an unknown publisher: *More info -> Run anyway*.
+          * **macOS** (Apple Silicon = `macos-arm64`, Intel = `macos-intel`): unzip, then right-click
+            `ReverseChess.app` -> *Open* the first time (the app is not notarized).  If macOS
+            still refuses: `xattr -dr com.apple.quarantine ReverseChess.app`.
+          * **Linux**: `tar xzf ReverseChess-linux-x64.tar.gz && ./ReverseChess/ReverseChess`
+          NOTES
