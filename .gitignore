@@ -37,7 +37,6 @@ runs/
 
 # --- trained networks: attach to a GitHub release instead of committing ---
 # (play.py looks for ai.npz next to itself; download it from the release page)
-ai.npz
 ai.pt
 
 # --- built native engine: build with ./build_native.sh ---
@@ -50,4 +49,3 @@ native/target/
 build/
 dist/
 *.zip
-*.npz

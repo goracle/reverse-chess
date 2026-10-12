@@ -960,6 +960,38 @@ def menu_rects(n, with_back=False):
 # Entry point
 # --------------------------------------------------------------------------
 
+def selftest(advisor, ai_note):
+    """Headless check of a (packaged) build: 0 = AI loaded and a search produced a move.
+
+    Windowed Windows builds have no stdout, so the report also goes to $RC_SELFTEST_LOG if set."""
+    import engine
+    lines = []
+
+    def say(msg):
+        lines.append(msg)
+        if sys.stdout is not None:
+            print(msg)
+    code = 0
+    say("engine: " + ("native (Rust)" if engine.NATIVE else "pure Python (slow)"))
+    if advisor is None:
+        say("FAIL: no AI loaded. " + (ai_note or "ai.npz not found next to the program"))
+        code = 1
+    else:
+        try:
+            import rustnet
+            say("native net: " + ("yes, SIMD=%s" % rustnet.simd_active() if rustnet.AVAILABLE else "no"))
+        except Exception as err:
+            say("native net: unavailable (%s)" % err)
+        job = mcts.Searcher(advisor, sims=40, think_ms=20000).search(Game(Rules()), rng=random.Random(0))
+        say("search ok: " + type(job).__name__)
+        say("selftest passed")
+    log = os.environ.get("RC_SELFTEST_LOG")
+    if log:
+        with open(log, "w") as fh:
+            fh.write("\n".join(lines) + "\n")
+    return code
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -989,6 +1021,9 @@ def main():
                     help="experimental: every piece of both teams must be on the board")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
     ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
+    ap.add_argument("--selftest", action="store_true",
+                    help="load the AI and engine, run a short search, print a report and exit "
+                         "(no window; used to check a packaged build)")
     args = ap.parse_args()
 
     rng = random.Random(args.seed)
@@ -1004,6 +1039,9 @@ def main():
             if args.ai:
                 raise SystemExit("cannot load the AI file %s: %s" % (path, err))
             ai_note = "Could not load %s (%s); the computer moves at random." % (os.path.basename(path), err)
+
+    if args.selftest:
+        raise SystemExit(selftest(advisor, ai_note))
 
     custom = {"b": None, "w": None}
     sides = set()

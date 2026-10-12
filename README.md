@@ -109,3 +109,18 @@ Contributions, issues, and ideas for new (and worse) features are welcome!
 * `python check_native.py` - plays random games on both backends in lockstep and
   fails on the first difference, then prints plies/second for each.
 * `RC_ENGINE=py` forces pure Python, `RC_ENGINE=native` makes a missing library an error.
+
+## Releases (Windows / macOS / Linux downloads)
+
+Pushing a tag builds and publishes everything via GitHub Actions (`.github/workflows/release.yml`):
+
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+Each platform is built on its own runner (Rust engine + PyInstaller), checked against the pure-Python
+reference engine, smoke-tested with `play.py --selftest`, then attached to the release.  `ai.npz` is
+committed to the repo and bundled into every download.  To test without publishing, use
+**Actions -> build-release -> Run workflow**; the zips appear as run artifacts.
+
+To build locally: `sh build_native.sh && pip install pyinstaller && pyinstaller --noconfirm reverse_chess.spec`.
