@@ -36,6 +36,27 @@ def classify(loss: float) -> str:
     return ""
 
 
+def summarize(turns: List[str], loss: List[float], marks: List[str]) -> Dict[str, Dict]:
+    """Per side: moves reviewed, average loss per move (a move that gained value counts as 0)
+    and how many of each mark.  ``turns`` may be longer than ``loss`` (a partly reviewed line)."""
+    out = {}
+    for team in ("w", "b"):
+        idx = [i for i in range(min(len(turns), len(loss))) if turns[i] == team]
+        out[team] = {
+            "moves": len(idx),
+            "avg_loss": sum(max(loss[i], 0.0) for i in idx) / len(idx) if idx else 0.0,
+            "counts": {mark: sum(1 for i in idx if marks[i] == mark) for _, mark, _ in MISTAKES},
+        }
+    return out
+
+
+def summary_text(team: str, info: Dict) -> str:
+    """'White 0.08 avg: 2 ?! 1 ? 0 ??' (average loss per move, then the mark counts)"""
+    c = info["counts"]
+    return "%s %.2f avg: %d ?! %d ? %d ??" % ("White" if team == "w" else "Black", info["avg_loss"],
+                                             c["?!"], c["?"], c["??"])
+
+
 def review_line(advisor, rules: Rules, actions: List[Action], stop=None, progress=None) -> Optional[Dict]:
     """Review a whole line.  Returns None if ``stop()`` became true half way.
 
@@ -118,8 +139,10 @@ def main():
     print("%s   %d plies   %s   (network %s)" % (os.path.basename(path), len(actions),
                                                    meta.get("result", ""), advisor.name))
     flagged = 0
+    turns = []
     for i, action in enumerate(actions):
         team = game.turn
+        turns.append(team)
         mark = out["marks"][i]
         line = "%3d %s  %-26s %+.2f" % (i + 1, team, texts[i] + mark, out["values"][i + 1])
         if mark:
@@ -128,6 +151,9 @@ def main():
         print(line)
         game.step(action)
     print("%d move(s) marked" % flagged)
+    summary = summarize(turns, out["loss"], out["marks"])
+    for team in ("w", "b"):
+        print(summary_text(team, summary[team]))
 
 
 if __name__ == "__main__":

@@ -76,6 +76,12 @@ The rules are simple...ish.
   blunders (`??`) in the move list, and graphs the game.  `M` jumps to the position before the next marked
   move and draws the network's preferred move (green) against the one played (red) -- so the "puzzles" come
   from your own games, nothing to author.  `python review.py [game.json]` prints the same in the terminal.
+  The gift a move gives is drawn as a translucent piece on the square it lands on (hints too).
+  `Shift+M` / `Ctrl+Left` jump to the previous marked move, `Ctrl+Right` to the next; `P` plays the
+  network's move instead of the one played there (the rest of the old line is dropped).  Under the
+  graph: each side's average loss per move and how many `?!` / `?` / `??` it made.
+* **Copy:** `Ctrl+C` puts the whole move list on the clipboard (one move per line), `Ctrl+Shift+C` the game as
+  JSON (what Save writes).  Uses pygame's clipboard, then `wl-copy` / `xclip` / `xsel` if that fails.
 
 ## Playing against the AI
 

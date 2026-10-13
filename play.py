@@ -66,8 +66,14 @@ Game history (the third column)
   (``?!`` inaccuracy, ``?`` mistake, ``??`` blunder).  It runs by itself when a game ends or is
   loaded.  M / the Next ? button jump to the position *before* the next marked move and draw the
   network's preferred move (green) and the move that was played (red); at a position where it is
-  your turn you can try to find something better.  The graph under the move list is the network's
-  view of the whole game (white up); click it to jump.  ``python review.py`` prints the same.
+  your turn you can try to find something better.  Shift+M / Ctrl+Left jump to the previous marked
+  move, Ctrl+Right to the next.  The gift of a move is drawn as a translucent piece on the square it
+  lands on (hints too).  P plays the network's move instead of the one played there (the rest of the
+  old line is dropped).  The graph under the move list is the network's view of the whole game
+  (white up); click it to jump; under it, each side's average loss per move and its mark counts.
+  ``python review.py`` prints the same.
+* Copy (Ctrl+C) puts the whole move list on the clipboard, one move per line; Ctrl+Shift+C the game
+  as JSON (what Save writes).
 
 Custom agents
 -------------
@@ -84,6 +90,8 @@ import importlib
 import math
 import os
 import random
+import shutil
+import subprocess
 import sys
 from collections import Counter, defaultdict
 
@@ -95,7 +103,7 @@ import mcts
 import numpy_net
 import review as reviewlib
 from chessassets import TEAMS, PTYPES, image_path
-from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team
+from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team, pawn_home_row
 from stats import Stats
 
 # --------------------------------------------------------------------------
@@ -172,7 +180,7 @@ def make_layout():
         'm_save': R(MOVES_X + 14, 74, 92, 28), 'm_load': R(MOVES_X + 114, 74, 92, 28),
         'm_review': R(MOVES_X + 14, 108, 92, 28), 'm_next': R(MOVES_X + 114, 108, 92, 28),
         'm_list': R(MOVES_X + 6, 182, MOVES_W - 12, ROW_H * 29),
-        'm_graph': R(MOVES_X + 14, 182 + ROW_H * 29 + 12, MOVES_W - 28, 84),
+        'm_graph': R(MOVES_X + 14, 182 + ROW_H * 29 + 12, MOVES_W - 28, 66),
     }
 
 
@@ -213,6 +221,33 @@ def next_choice(candidates):
 def sq_name(sq):
     """(row, col) -> 'a1'..'h8' (white at the bottom, as drawn)."""
     return "%s%d" % ("abcdefgh"[sq[1]], SIZE - sq[0])
+
+
+def clipboard_put(text):
+    """Put ``text`` on the system clipboard.  Tries pygame's clipboard, then the usual command line
+    tools; raises RuntimeError (with every reason) if none of them worked."""
+    reasons = []
+    try:
+        import pygame.scrap
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        if hasattr(pygame.scrap, "put_text"):
+            pygame.scrap.put_text(text)
+        else:
+            pygame.scrap.put(pygame.SCRAP_TEXT, text.encode("utf-8"))
+        return
+    except Exception as err:          # pygame.error, NotImplementedError, ... -- reported below if all fail
+        reasons.append("pygame.scrap: %s" % err)
+    for cmd in (["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"],
+                ["pbcopy"], ["clip"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            subprocess.run(cmd, input=text.encode("utf-8"), check=True, timeout=5)
+            return
+        except (OSError, subprocess.SubprocessError) as err:
+            reasons.append("%s: %s" % (cmd[0], err))
+    raise RuntimeError("no working clipboard (%s)" % "; ".join(reasons))
 
 
 def describe(game, action):
@@ -606,6 +641,47 @@ class App:
                 return
         self.message = "No more marked moves that way."
 
+    def play_network_move(self):
+        """At a reviewed position: replace the move that was played there by the network's choice and
+        play on from there (the rest of the old line is dropped, as with any new move)."""
+        if self.review is None:
+            self.message = "Press Review first (it runs by itself when a game ends)."
+            return
+        if not self.browsing or self.pos >= len(self.review["best"]):
+            self.message = "Step back to a position before a reviewed move first (M jumps to a marked one)."
+            return
+        best = self.review["best"][self.pos]
+        if best == self.line[self.pos]:
+            self.message = "That is already the network's move."
+            return
+        self.play(best)
+        if not self.message:
+            self.message = "Played the network's move; the rest of the old line is gone."
+
+    def copy_moves(self):
+        """Copy the whole move list (not just up to the position shown) to the clipboard."""
+        if not self.line:
+            self.message = "No moves to copy yet."
+            return
+        try:
+            clipboard_put(gamelog.move_list_text(self.turns, self.texts))
+        except RuntimeError as err:
+            self.message = "Could not copy: %s" % err
+            return
+        self.message = "Copied %d moves to the clipboard." % len(self.line)
+
+    def copy_json(self):
+        """Copy the whole game as the JSON that Save writes (see gamelog.py) to the clipboard."""
+        if not self.line:
+            self.message = "No moves to copy yet."
+            return
+        try:
+            clipboard_put(gamelog.game_json(self.rules, self.line, self.game_meta()))
+        except RuntimeError as err:
+            self.message = "Could not copy: %s" % err
+            return
+        self.message = "Copied the game (JSON, %d moves) to the clipboard." % len(self.line)
+
     def review_mark(self, i):
         """The review's mark for move ``i`` of the line ('' if none or not reviewed yet)."""
         if self.review is None or not (0 <= i < len(self.review["marks"])):
@@ -966,6 +1042,8 @@ class App:
             seen.add((action.src, action.dst))
             draw_arrow(overlay, self.sq_centre(action.src), self.sq_centre(action.dst),
                        HINT_COLOURS[rank], HINT_WIDTHS[rank])
+        if hint["top"]:
+            self.draw_gift_ghost(overlay, hint["top"][0][0], HINT_COLOURS[0])
         self.screen.blit(overlay, (0, 0))
 
     def draw_review_arrows(self):
@@ -976,7 +1054,37 @@ class App:
         overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
         for action, colour, width in ((played, REVIEW_PLAYED, 9), (best, REVIEW_BEST, 13)):
             draw_arrow(overlay, self.sq_centre(action.src), self.sq_centre(action.dst), colour, width)
+        shared = (played.gift is not None and best.gift is not None
+                  and self.gift_square(played) == self.gift_square(best))
+        self.draw_gift_ghost(overlay, played, REVIEW_PLAYED, small=shared)   # small: don't hide it under the green one
+        self.draw_gift_ghost(overlay, best, REVIEW_BEST)
         self.screen.blit(overlay, (0, 0))
+
+    def gift_square(self, action):
+        """Where the gift of ``action`` lands: the vacated source square, or the pawn home row for
+        reverse en passant."""
+        if action.en_passant:
+            return (pawn_home_row(other_team(self.game.turn)), action.src[1])
+        return action.src
+
+    def draw_gift_ghost(self, overlay, action, colour, small=False):
+        """Show the gift of ``action`` as a translucent piece on the square it would land on, ringed
+        in ``colour`` (``small``: a quarter-size piece in the corner instead)."""
+        if action.gift is None:
+            return
+        recv = other_team(self.game.turn)
+        x, y = self.sq_xy(*self.gift_square(action))
+        ptype = action.promote or action.gift
+        size = (SQ - 12) // 2 if small else SQ - 12
+        ghost = self.sprite(recv, ptype, size).copy()
+        ghost.set_alpha(150)
+        overlay.blit(ghost, (x + SQ - size - 4, y + SQ - size - 4) if small else (x + 6, y + 6))
+        pygame.draw.rect(overlay, colour, (x + 2, y + 2, SQ - 4, SQ - 4) if small else (x, y, SQ, SQ), 4 if not small else 3)
+        if action.promote:                    # a gifted pawn wearing another piece's type
+            centre = (x + SQ - 18, y + 18)
+            pygame.draw.circle(overlay, (230, 190, 40), centre, 12)
+            label = self.font_small.render("P", True, (20, 20, 20))
+            overlay.blit(label, label.get_rect(center=centre))
 
     def eval_target(self):
         """Where the bar should sit: 1 = all white, 0 = all black."""
@@ -1203,6 +1311,10 @@ class App:
         cx = int(xs(min(self.pos, len(values) - 1)))
         pygame.draw.line(self.screen, (240, 240, 240), (cx, g.y + 1), (cx, g.bottom - 2), 1)
         self.text("network's view, white up", (g.x, g.bottom + 3), self.font_small, MUTED)
+        summary = reviewlib.summarize(self.turns, self.review["loss"], self.review["marks"])
+        for k, team in enumerate(("w", "b")):
+            self.text(reviewlib.summary_text(team, summary[team]), (g.x, g.bottom + 20 + 17 * k),
+                      self.font_small, TEXT)
 
     def draw_status(self):
         game = self.game
@@ -1213,8 +1325,11 @@ class App:
             mark = self.review_mark(self.pos)
             if mark:
                 name = {"??": "a blunder", "?": "a mistake", "?!": "an inaccuracy"}[mark]
-                line = ("Next, move %d is %s (it lost %.2f).  Green arrow: the network's choice; red: what was "
-                        "played.  Right arrow shows it." % (self.pos + 1, name, self.review["loss"][self.pos]))
+                line = ("Next, move %d is %s (lost %.2f).  Green: network wanted %s.  Red: played %s.  "
+                        "P plays the green move."
+                        % (self.pos + 1, name, self.review["loss"][self.pos],
+                           describe(game, self.review["best"][self.pos]),
+                           describe(game, self.line[self.pos])))
                 colour = MARK_COLOURS[mark]
             else:
                 line = ("Looking at the position after move %d of %d.  Right / End: forward.  A new move "
@@ -1438,7 +1553,13 @@ def main():
                 elif event.key == pygame.K_r and not ctrl:
                     app.restart()
                 elif app.pending is None:
-                    if event.key == pygame.K_LEFT:
+                    if ctrl and event.key == pygame.K_LEFT:
+                        app.next_mistake(-1)
+                    elif ctrl and event.key == pygame.K_RIGHT:
+                        app.next_mistake(1)
+                    elif ctrl and event.key == pygame.K_c:
+                        app.copy_json() if event.mod & pygame.KMOD_SHIFT else app.copy_moves()
+                    elif event.key == pygame.K_LEFT:
                         app.step_back()
                     elif event.key == pygame.K_RIGHT:
                         app.step_forward()
@@ -1454,6 +1575,8 @@ def main():
                         app.next_mistake(-1 if event.mod & pygame.KMOD_SHIFT else 1)
                     elif event.key == pygame.K_v:
                         app.start_review()
+                    elif event.key == pygame.K_p and not ctrl:
+                        app.play_network_move()
                     elif ctrl:
                         pass
                     elif event.key == pygame.K_h:

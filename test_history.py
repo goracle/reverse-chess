@@ -143,6 +143,56 @@ def main():
         assert len(app3.review["marks"]) == 10 and len(app3.review["values"]) == 11
         print("ok: review")
 
+    # 5b. review extras: summary, gift ghosts, play the network's move, copy, mark navigation
+    if advisor is not None:
+        import review as reviewlib
+        app4 = make_app(advisor)
+        app4.load(saved[0])
+        wait_review(app4)
+        summ = reviewlib.summarize(app4.turns, app4.review["loss"], app4.review["marks"])
+        assert summ["w"]["moves"] + summ["b"]["moves"] == len(app4.line)
+        assert sum(sum(v["counts"].values()) for v in summ.values()) == sum(1 for m in app4.review["marks"] if m)
+        print(" ".join(reviewlib.summary_text(t, summ[t]) for t in "wb"))
+        gifted = [i for i, a in enumerate(app4.review["best"]) if a.gift is not None]
+        for i in gifted[:3]:                                   # best move with a gift: ghost must draw
+            app4.jump(i)
+            app4.draw_review_arrows()
+            app4.draw()
+        app4.hint = None
+        app4.toggle_hint()
+        app4.draw()
+        diff = [i for i, a in enumerate(app4.review["best"]) if a != app4.line[i]]
+        if diff:
+            i = diff[0]
+            app4.jump(i)
+            n_before = len(app4.line)
+            best = app4.review["best"][i]
+            app4.play_network_move()
+            assert app4.line[i] == best and len(app4.line) == i + 1 < n_before + 1, (i, len(app4.line))
+            assert len(app4.review["marks"]) == i
+            app4.draw()
+        app4.jump(len(app4.line))
+        app4.play_network_move()                               # not browsing: a message, no crash
+        assert app4.message.startswith("Step back"), app4.message
+        flagged = [i for i, m in enumerate(app4.review["marks"]) if m]
+        if len(flagged) >= 2:
+            app4.jump(flagged[0])
+            app4.next_mistake(1)
+            assert app4.pos == flagged[1]
+            app4.next_mistake(-1)
+            assert app4.pos == flagged[0]
+        got = []
+        play.clipboard_put = got.append                        # no real clipboard in a headless run
+        app4.copy_moves()
+        assert got[-1].count("\n") + 1 == len(app4.line) and app4.message.startswith("Copied")
+        app4.copy_json()
+        import json
+        assert json.loads(got[-1])["moves"] == gamelog.notation_list(app4.rules, app4.line)
+        fresh = make_app(advisor)
+        fresh.copy_moves()
+        assert fresh.message.startswith("No moves")
+        print("ok: review extras")
+
     # 6. flip geometry round trip, clicks while flipped
     app = make_app(advisor)
     for flipped in (False, True):

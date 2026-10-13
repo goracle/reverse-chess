@@ -102,19 +102,35 @@ def games_dir(base: Optional[str] = None) -> str:
     return base or os.path.join(os.path.dirname(default_path()), "games")
 
 
-def save_game(rules: Rules, actions: List[Action], meta: Optional[Dict] = None,
-              path: Optional[str] = None, base: Optional[str] = None) -> str:
-    """Write the game to ``path`` (default: a time-stamped file in games_dir()).  Returns the path."""
+def game_dict(rules: Rules, actions: List[Action], meta: Optional[Dict] = None) -> Dict:
+    """The JSON-able record of a game (what save_game writes to a file)."""
     game = replay(rules, actions)
     if game.done:
         result = game.end_reason or ("draw" if game.winner is None else "%s wins" % full_name(game.winner))
     else:
         result = "unfinished"
-    data = {"format": FORMAT, "rules": dataclasses.asdict(rules),
+    game.close()
+    return {"format": FORMAT, "rules": dataclasses.asdict(rules),
             "actions": [action_to_dict(a) for a in actions],
             "moves": notation_list(rules, actions), "result": result,
             "meta": dict(meta or {}, saved=time.strftime("%Y-%m-%d %H:%M:%S"))}
-    game.close()
+
+
+def game_json(rules: Rules, actions: List[Action], meta: Optional[Dict] = None) -> str:
+    return json.dumps(game_dict(rules, actions, meta), indent=1)
+
+
+def move_list_text(turns: List[str], texts: List[str]) -> str:
+    """One move per line: ``12 b Pe7-e6 +N`` (ply number, side, notation)."""
+    if len(turns) != len(texts):
+        raise ValueError("%d sides but %d moves" % (len(turns), len(texts)))
+    return "\n".join("%d %s %s" % (i + 1, t, x) for i, (t, x) in enumerate(zip(turns, texts)))
+
+
+def save_game(rules: Rules, actions: List[Action], meta: Optional[Dict] = None,
+              path: Optional[str] = None, base: Optional[str] = None) -> str:
+    """Write the game to ``path`` (default: a time-stamped file in games_dir()).  Returns the path."""
+    data = game_dict(rules, actions, meta)
     if path is None:
         folder = games_dir(base)
         os.makedirs(folder, exist_ok=True)
