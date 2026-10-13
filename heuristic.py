@@ -16,6 +16,17 @@ own piece geometry, ties are broken at random.
                                forces it, e.g. a diagonal pawn step)
                mode "gift":    always gifts when it can (what the demo race's
                                defender does), then picks by progress
+               mode "rush":    walks home like "nogift", but hands back the
+                               opponent's queens, rooks and pawns-promoted-to-queen
+                               -- and only ever with the KING.  The gift lands on
+                               the square the king just left, right next to it, so it
+                               attacks the king at once ("reverse check"); the engine
+                               then only lets the opponent play moves that end that
+                               attack, which in practice means moving the gifted
+                               piece.  Any other gift costs the huge penalty.
+                               It also moves nothing but the king until the king is
+                               on its home square (the king sets the tempo); after
+                               that the other pieces walk home too.
 
 Use ``choose(game, rng, mode)`` from other code; it returns an Action.  By default
 a one-ply safety check through the engine is added (``safe=True``, ``--no-safe``
@@ -29,6 +40,11 @@ from engine import SIZE, Game, Rules, pawn_home_row, promotion_row
 
 GIFT_PENALTY = 100.0
 ARRIVE = 5.0
+RUSH_CHECK_BONUS = 8.0     # "rush": king gives back a Q / R / pawn-promoted-to-Q and the gift checks the king
+RUSH_KING_FIRST = 50.0     # "rush": penalty for moving any other piece while the king is not home
+RUSH_QUIET_BONUS = 2.0     # ... same gift but it does not attack the king (a rook given back on a diagonal step)
+
+MODES = ("nogift", "gift", "rush")
 
 
 def distance(piece, pos):
@@ -48,6 +64,28 @@ def at_home_square(piece, pos):
     return (not piece.promoted) and pos[0] in rows and pos[1] in cols
 
 
+def rush_gift(mover, action):
+    """For mode "rush": what the king's gift is worth.  Returns None when the action
+    carries no gift of the wanted kind (queen, rook, pawn promoted to queen) or the
+    mover is not the king, else True if the gifted piece attacks the king.
+
+    The gift appears on ``action.src`` and the king stands on ``action.dst``, one
+    king step away, so a queen always attacks it and a rook does when the step was
+    orthogonal."""
+    if action.gift is None or mover.ptype != "k":
+        return None
+    kind = action.gift
+    if kind == "p":
+        if action.promote != "q" or action.en_passant:
+            return None
+        kind = "q"
+    if kind not in ("q", "r"):
+        return None
+    if kind == "q":
+        return True
+    return action.src[0] == action.dst[0] or action.src[1] == action.dst[1]
+
+
 def score(game, action, mode):
     mover = game.board[action.src[0], action.src[1]]
     d0 = distance(mover, action.src)
@@ -60,8 +98,19 @@ def score(game, action, mode):
         s -= ARRIVE
     if at_home_square(mover, action.dst) and not mover.promoted and not action.demote:
         s += ARRIVE
+    if mode == "rush" and mover.ptype != "k":
+        king = game.kings[mover.team]
+        if not at_home_square(king, king.pos):
+            s -= RUSH_KING_FIRST                   # king first; soft, so forced / safety moves still work
     if action.gift is not None:
-        s += GIFT_PENALTY if mode == "gift" else -GIFT_PENALTY
+        if mode == "rush":
+            hit = rush_gift(mover, action)
+            if hit is None:
+                s -= GIFT_PENALTY                  # not the king's Q/R gift: only when forced
+            else:
+                s += RUSH_CHECK_BONUS if hit else RUSH_QUIET_BONUS
+        else:
+            s += GIFT_PENALTY if mode == "gift" else -GIFT_PENALTY
     return s
 
 
@@ -158,7 +207,8 @@ if __name__ == "__main__":
     args = ap.parse_args()
     rules = Rules(max_plies=args.max_plies)
     rng = random.Random(args.seed)
-    for a, b in (("nogift", None), ("gift", None), ("nogift", "gift")):
+    for a, b in (("nogift", None), ("gift", None), ("nogift", "gift"),
+                 ("rush", None), ("rush", "nogift"), ("rush", "gift")):
         t = time.time()
         w, d, l, p = match(rules, rng, a, b, args.games, not args.no_safe)
         print("%-7s vs %-7s  +%d =%d -%d  score %.3f  avg %.0f plies  (%.0fs)" % (

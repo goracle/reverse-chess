@@ -49,6 +49,26 @@ With no file the computer moves at random and the eval bar and hints are unavail
   move to the last.  Games where you used hints are counted too, and noted.
 * Keys: R = new game, Esc = back out of the menu / deselect, H, E, A as above.
 
+Game history (the third column)
+-------------------------------
+* The move list shows every move in short notation (K = king, ``*`` = promoted piece, ``+Q`` = a
+  queen given back, ``u`` = un-promotion).  Click a move to see the position after it; the mouse
+  wheel scrolls.  Left / Right step through the game, Home / End jump to the start / the end.
+* Undo (Z or Backspace) takes back your last move (and the computer's reply).  Nothing is thrown
+  away until you play a different move: Right / End bring the old moves back.  A game in which you
+  took a move back is not counted in your record.
+* Flip (F) turns the board round; ``--flip`` starts that way.
+* Save (Ctrl+S) writes the game to your user data folder (see gamelog.py); Load (Ctrl+O) opens the
+  newest saved game, pressing it again the one before.  ``--load FILE`` opens a particular file,
+  ``--autosave`` saves every finished game by itself.  A loaded game that is not over can be
+  played on.
+* Review (V): the network rates every position and marks the moves that threw the game away
+  (``?!`` inaccuracy, ``?`` mistake, ``??`` blunder).  It runs by itself when a game ends or is
+  loaded.  M / the Next ? button jump to the position *before* the next marked move and draw the
+  network's preferred move (green) and the move that was played (red); at a position where it is
+  your turn you can try to find something better.  The graph under the move list is the network's
+  view of the whole game (white up); click it to jump.  ``python review.py`` prints the same.
+
 Custom agents
 -------------
 ``--black`` / ``--white`` accept ``human``, ``ai`` (the network above), ``random``,
@@ -70,8 +90,10 @@ from collections import Counter, defaultdict
 import numpy as np
 import pygame
 
+import gamelog
 import mcts
 import numpy_net
+import review as reviewlib
 from chessassets import TEAMS, PTYPES, image_path
 from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team
 from stats import Stats
@@ -84,8 +106,11 @@ BOARD_PX = SQ * SIZE
 BAR_W = 34                       # the eval bar, between the board and the panel
 PANEL_X = BOARD_PX + BAR_W
 PANEL_W = 280
+MOVES_X = PANEL_X + PANEL_W
+MOVES_W = 220                    # the move list / game history column
+ROW_H = 20
 STATUS_H = 92
-WIN_W = PANEL_X + PANEL_W
+WIN_W = MOVES_X + MOVES_W
 WIN_H = BOARD_PX + STATUS_H
 
 LIGHT = (238, 238, 210)
@@ -109,6 +134,9 @@ BUTTON_OFF = (46, 46, 52)
 HINT_COLOURS = ((60, 200, 90, 215), (240, 200, 60, 190), (235, 135, 60, 170))
 HINT_TEXT = ((130, 220, 130), (240, 205, 90), (240, 160, 100))
 HINT_WIDTHS = (15, 11, 8)
+MARK_COLOURS = {"??": (240, 90, 80), "?": (240, 150, 70), "?!": (235, 200, 80)}
+REVIEW_BEST = (60, 200, 90, 215)
+REVIEW_PLAYED = (235, 80, 70, 190)
 
 NAMES = {'p': 'pawn', 'k': 'king', 'r': 'rook', 'b': 'bishop', 'q': 'queen', 'n': 'knight'}
 
@@ -139,6 +167,12 @@ def make_layout():
         'hint_y': 524,
         'stats_y': 642,
         'reset': R(x0, 734, w, 24),
+        # the move list column
+        'm_undo': R(MOVES_X + 14, 40, 92, 28), 'm_flip': R(MOVES_X + 114, 40, 92, 28),
+        'm_save': R(MOVES_X + 14, 74, 92, 28), 'm_load': R(MOVES_X + 114, 74, 92, 28),
+        'm_review': R(MOVES_X + 14, 108, 92, 28), 'm_next': R(MOVES_X + 114, 108, 92, 28),
+        'm_list': R(MOVES_X + 6, 182, MOVES_W - 12, ROW_H * 29),
+        'm_graph': R(MOVES_X + 14, 182 + ROW_H * 29 + 12, MOVES_W - 28, 84),
     }
 
 
@@ -264,7 +298,7 @@ def app_dir():
 
 class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
-                 stats, show_eval, searcher=None):
+                 stats, show_eval, searcher=None, flipped=False, autosave=False):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -295,6 +329,9 @@ class App:
             self.default_ai = lambda game: rng.choice(game.legal_actions())
         self.stats_summary = stats.summary() if stats is not None else None
         self.confirm_reset_until = 0
+        self.flipped = flipped        # board drawn from black's side
+        self.autosave = autosave
+        self.load_index = -1          # which saved game the Load button opened last
         self.refresh_agents()
         self.new_game()
         if stats is not None and stats.error:
@@ -333,6 +370,12 @@ class App:
         self.bar_pos = None
         self.stop_search()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        self.line = []                # every action of the game, and the current position in it:
+        self.texts = []               # (notation of each action, the team that played it)
+        self.turns = []
+        self.pos = 0                  # pos < len(line) = looking at an earlier position
+        self.moves_top = None         # first visible row of the move list (None = follow the game)
+        self.drop_review()
         self.reindex()
 
     def restart(self):
@@ -392,17 +435,182 @@ class App:
             self.cancel()
 
     def play(self, action):
+        text, team = gamelog.move_text(self.game, action), self.game.turn
         try:
             self.game.step(action)
         except IllegalActionError as err:
             self.message = str(err)
         else:
             self.message = ""
+            if self.pos < len(self.line):      # a different move from an earlier position
+                self.truncate(self.pos)
+                self.stats_ok = False          # took a move back: not a clean game against the AI
+            self.line.append(action)
+            self.texts.append(text)
+            self.turns.append(team)
+            self.pos += 1
+            self.moves_top = None
         self.cancel_keep_message()
         self.reindex()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
         if self.game.done:
             self.record_finished()
+            if self.autosave:
+                self.save()
+            if self.advisor is not None:
+                self.start_review()
+
+    # -- game history: step, undo, flip, save, load, review --------------
+    @property
+    def browsing(self):
+        return self.pos < len(self.line)
+
+    def truncate(self, n):
+        """Forget every move after the first ``n`` (the review keeps what is still true)."""
+        del self.line[n:], self.texts[n:], self.turns[n:]
+        rev = self.review
+        if rev is not None:
+            for key in ("best", "loss", "marks"):
+                rev[key] = rev[key][:n]
+            rev["values"] = rev["values"][:n + 1]
+        elif self.reviewer is not None:
+            self.reviewer.stop()
+            self.reviewer = None
+
+    def jump(self, n):
+        """Show the position after the first ``n`` moves of the game (nothing is lost)."""
+        n = max(0, min(len(self.line), n))
+        if n == self.pos:
+            return
+        self.stop_search()
+        self.hint = None
+        old = self.game
+        self.game = gamelog.replay(self.rules, self.line, n)
+        old.close()
+        self.pos = n
+        self.moves_top = None
+        self.cancel()
+        self.reindex()
+        self.ai_due = pygame.time.get_ticks() + self.delay_ms
+
+    def step_back(self):
+        self.jump(self.pos - 1)
+
+    def step_forward(self):
+        self.jump(self.pos + 1)
+
+    def takeback(self):
+        """Back to the last position where it was a human's turn (so the computer's reply goes too)."""
+        if self.pos == 0:
+            self.message = "Nothing to take back."
+            return
+        target = self.pos - 1
+        for n in range(self.pos - 1, -1, -1):
+            if self.agents[self.turns[n]] is None:
+                target = n
+                break
+        self.jump(target)
+        self.message = "Taken back; Right / End bring the moves back, a new move replaces them."
+
+    def flip(self):
+        self.flipped = not self.flipped
+
+    def game_meta(self):
+        meta = {"ai": self.advisor.name if self.advisor is not None else None,
+                "ai_sides": sorted(self.ai_sides) if self.ai_on else []}
+        return meta
+
+    def save(self):
+        if not self.line:
+            self.message = "Nothing to save yet."
+            return
+        try:
+            path = gamelog.save_game(self.rules, self.line, self.game_meta())
+        except OSError as err:
+            self.message = "Could not save the game: %s" % err
+            return
+        self.load_index = -1
+        self.message = "Saved " + path
+
+    def load(self, path=None):
+        """Open ``path`` (default: the newest saved game; again: the one before it)."""
+        if path is None:
+            saved = gamelog.saved_games()
+            if not saved:
+                self.message = "No saved games yet (Ctrl+S saves the current one)."
+                return
+            self.load_index = (self.load_index + 1) % len(saved)
+            path = saved[self.load_index]
+            where = " (%d of %d)" % (self.load_index + 1, len(saved))
+        else:
+            where = ""
+        try:
+            rules, actions, meta = gamelog.load_game(path)
+            texts = gamelog.notation_list(rules, actions)
+        except (OSError, ValueError, KeyError, IllegalActionError) as err:
+            self.message = "Could not load %s: %s" % (os.path.basename(path), err)
+            return
+        self.rules = rules
+        self.new_game()
+        self.stats_ok = False                       # not a game played against the AI just now
+        self.line, self.texts = list(actions), texts
+        game = Game(rules)                          # who played each move
+        for action in actions:
+            self.turns.append(game.turn)
+            game.step(action)
+        game.close()
+        self.game.close()
+        self.game = gamelog.replay(rules, actions)
+        self.pos = len(actions)
+        self.recorded = True
+        self.reindex()
+        self.message = "Loaded %s%s" % (os.path.basename(path), where)
+        if self.advisor is not None and actions:
+            self.start_review()
+
+    def drop_review(self):
+        if getattr(self, "reviewer", None) is not None:
+            self.reviewer.stop()
+        self.reviewer = None
+        self.review = None
+
+    def start_review(self):
+        if self.advisor is None:
+            self.message = "Review needs the AI file (ai.npz or latest.pt next to play.py)."
+        elif not self.line:
+            self.message = "Nothing to review yet."
+        elif self.reviewer is None:
+            self.review = None
+            self.reviewer = reviewlib.Reviewer(self.advisor, self.rules, self.line)
+
+    def poll_review(self):
+        rv = self.reviewer
+        if rv is None or not rv.done:
+            return
+        self.reviewer = None
+        if rv.error:
+            self.message = "Review failed: " + rv.error
+        elif rv.result is not None and self.line[:len(rv.actions)] == rv.actions:
+            self.review = rv.result                 # (the game may have moved on meanwhile: still valid)
+
+    def next_mistake(self, step=1):
+        """Jump to the position before the next (step=1) / previous (-1) marked move."""
+        if self.review is None:
+            self.message = "Press Review first (it runs by itself when a game ends)."
+            return
+        marks = self.review["marks"]
+        order = range(self.pos + 1, len(marks)) if step > 0 else range(self.pos - 1, -1, -1)
+        for i in order:
+            if marks[i]:
+                self.jump(i)
+                return
+        self.message = "No more marked moves that way."
+
+    def review_mark(self, i):
+        """The review's mark for move ``i`` of the line ('' if none or not reviewed yet)."""
+        if self.review is None or not (0 <= i < len(self.review["marks"])):
+            return ""
+        return self.review["marks"][i]
 
     def cancel_keep_message(self):
         message = self.message
@@ -558,6 +766,26 @@ class App:
             self.toggle_hint()
         elif L['reset'].collidepoint(pos):
             self.click_reset()
+        elif L['m_undo'].collidepoint(pos):
+            self.takeback()
+        elif L['m_flip'].collidepoint(pos):
+            self.flip()
+        elif L['m_save'].collidepoint(pos):
+            self.save()
+        elif L['m_load'].collidepoint(pos):
+            self.load()
+        elif L['m_review'].collidepoint(pos):
+            self.start_review()
+        elif L['m_next'].collidepoint(pos):
+            self.next_mistake()
+        elif L['m_list'].collidepoint(pos):
+            row = self.moves_first_row() + (pos[1] - L['m_list'].y) // ROW_H
+            if 0 <= row < len(self.line):
+                self.jump(row + 1)                 # the position after that move
+        elif L['m_graph'].collidepoint(pos) and self.review is not None:
+            n = len(self.review["values"]) - 1
+            frac = (pos[0] - L['m_graph'].x) / max(L['m_graph'].w - 1, 1)
+            self.jump(int(round(frac * n)))
 
     # -- input -----------------------------------------------------------
     def human_to_move(self):
@@ -575,7 +803,7 @@ class App:
         x, y = pos
         if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX):
             return
-        sq = (y // SQ, x // SQ)
+        sq = self.xy_sq(x, y)
         game = self.game
         piece = game.board[sq]
         if piece is not None and piece.team == game.turn:
@@ -636,6 +864,8 @@ class App:
             if self.use_search and (self.show_eval or self.current_hint() is not None):
                 self.ensure_search(1800)
             return
+        if self.browsing:                         # looking at an earlier position: the computer waits
+            return
         if self.use_search and agent is self.default_ai:
             job = self.ensure_search()            # the network, with look-ahead
             if job is None or not job.finished or pygame.time.get_ticks() < self.ai_due:
@@ -658,6 +888,18 @@ class App:
         self.play(action)
 
     # -- drawing ---------------------------------------------------------
+    def sq_xy(self, r, c):
+        """Top-left pixel of square (r, c), honouring the flip."""
+        return ((SIZE - 1 - c) * SQ, (SIZE - 1 - r) * SQ) if self.flipped else (c * SQ, r * SQ)
+
+    def xy_sq(self, x, y):
+        r, c = y // SQ, x // SQ
+        return (SIZE - 1 - r, SIZE - 1 - c) if self.flipped else (r, c)
+
+    def sq_centre(self, sq):
+        x, y = self.sq_xy(*sq)
+        return (x + SQ // 2, y + SQ // 2)
+
     def sprite(self, team, ptype, size):
         key = (team, ptype, size)
         if key not in self._sprites:
@@ -672,8 +914,10 @@ class App:
         self.screen.fill(STATUS_BG)
         self.draw_board()
         self.draw_hint_arrows()
+        self.draw_review_arrows()
         self.draw_eval_bar()
         self.draw_panel()
+        self.draw_moves()
         self.draw_status()
         if self.pending is not None:
             self.draw_menu()
@@ -685,7 +929,8 @@ class App:
         movable = self.human_to_move()
         for r in range(SIZE):
             for c in range(SIZE):
-                rect = pygame.Rect(c * SQ, r * SQ, SQ, SQ)
+                x, y = self.sq_xy(r, c)
+                rect = pygame.Rect(x, y, SQ, SQ)
                 colour = LIGHT if (r + c) % 2 == 0 else DARK
                 if last is not None and (r, c) in (last.src, last.dst):
                     colour = LAST
@@ -694,17 +939,16 @@ class App:
                 pygame.draw.rect(self.screen, colour, rect)
                 piece = game.board[r, c]
                 if piece is not None:
-                    self.screen.blit(self.sprite(piece.team, piece.ptype, SQ - 12),
-                                     (c * SQ + 6, r * SQ + 6))
+                    self.screen.blit(self.sprite(piece.team, piece.ptype, SQ - 12), (x + 6, y + 6))
                     if piece.promoted:   # a pawn wearing another piece's type
-                        centre = (c * SQ + SQ - 18, r * SQ + 18)
+                        centre = (x + SQ - 18, y + 18)
                         pygame.draw.circle(self.screen, (230, 190, 40), centre, 12)
                         label = self.font_small.render("P", True, (20, 20, 20))
                         self.screen.blit(label, label.get_rect(center=centre))
                     if piece.locked:     # can never move again
-                        draw_padlock(self.screen, c * SQ + 6, r * SQ + SQ - 26, LOCKED)
+                        draw_padlock(self.screen, x + 6, y + SQ - 26, LOCKED)
                     elif (r, c) in self.blocked:   # cannot move right now
-                        draw_padlock(self.screen, c * SQ + 6, r * SQ + SQ - 26, BLOCKED)
+                        draw_padlock(self.screen, x + 6, y + SQ - 26, BLOCKED)
                 if movable and (r, c) in self.by_src:
                     pygame.draw.rect(self.screen, MOVABLE, rect, 4)
                 if (r, c) in dests:
@@ -720,9 +964,18 @@ class App:
             if (action.src, action.dst) in seen:
                 continue
             seen.add((action.src, action.dst))
-            centre = lambda sq: (sq[1] * SQ + SQ // 2, sq[0] * SQ + SQ // 2)
-            draw_arrow(overlay, centre(action.src), centre(action.dst),
+            draw_arrow(overlay, self.sq_centre(action.src), self.sq_centre(action.dst),
                        HINT_COLOURS[rank], HINT_WIDTHS[rank])
+        self.screen.blit(overlay, (0, 0))
+
+    def draw_review_arrows(self):
+        """At a position right before a marked move: the network's choice (green) and the move played (red)."""
+        if not self.review_mark(self.pos) or self.pending is not None:
+            return
+        best, played = self.review["best"][self.pos], self.line[self.pos]
+        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        for action, colour, width in ((played, REVIEW_PLAYED, 9), (best, REVIEW_BEST, 13)):
+            draw_arrow(overlay, self.sq_centre(action.src), self.sq_centre(action.dst), colour, width)
         self.screen.blit(overlay, (0, 0))
 
     def eval_target(self):
@@ -739,9 +992,14 @@ class App:
         target = self.eval_target()
         self.bar_pos = target if self.bar_pos is None else self.bar_pos + (target - self.bar_pos) * 0.25
         bar = pygame.Rect(BOARD_PX + 7, 8, BAR_W - 14, BOARD_PX - 16)
-        split = bar.bottom - int(round(bar.height * self.bar_pos))   # white fills up from the bottom
-        pygame.draw.rect(self.screen, (14, 14, 17), (bar.x, bar.y, bar.w, split - bar.y))
-        pygame.draw.rect(self.screen, (240, 240, 240), (bar.x, split, bar.w, bar.bottom - split))
+        if self.flipped:                  # white's side is at the top now: it fills down from the top
+            split = bar.y + int(round(bar.height * self.bar_pos))
+            pygame.draw.rect(self.screen, (240, 240, 240), (bar.x, bar.y, bar.w, split - bar.y))
+            pygame.draw.rect(self.screen, (14, 14, 17), (bar.x, split, bar.w, bar.bottom - split))
+        else:
+            split = bar.bottom - int(round(bar.height * self.bar_pos))   # white fills up from the bottom
+            pygame.draw.rect(self.screen, (14, 14, 17), (bar.x, bar.y, bar.w, split - bar.y))
+            pygame.draw.rect(self.screen, (240, 240, 240), (bar.x, split, bar.w, bar.bottom - split))
         for frac in (0.25, 0.5, 0.75):
             y = bar.y + int(bar.height * frac)
             pygame.draw.line(self.screen, (150, 150, 155) if frac != 0.5 else (230, 110, 40),
@@ -790,7 +1048,7 @@ class App:
         self.draw_controls()
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
-                  "H hint  E eval  A AI  S MCTS  R new  Esc back"]
+                  "H hint  E eval  A AI  S MCTS  R new"]
         for i, line in enumerate(legend):
             self.text(line, (x0, WIN_H - 8 - (len(legend) - i) * 21), self.font_small, MUTED)
 
@@ -869,14 +1127,101 @@ class App:
         self.draw_button(L['reset'], "Click again to erase" if confirming else "Reset record",
                          on=confirming, enabled=bool(self.stats.games))
 
+    def moves_first_row(self):
+        """Index of the first move-list row on screen."""
+        rows = self.layout['m_list'].h // ROW_H
+        last_first = max(0, len(self.line) - rows)
+        if self.moves_top is not None:
+            return max(0, min(self.moves_top, last_first))
+        cur = max(self.pos - 1, 0)
+        return cur if cur < last_first else last_first
+
+    def scroll_moves(self, dy):
+        self.moves_top = self.moves_first_row() - 3 * dy
+
+    def draw_moves(self):
+        L = self.layout
+        x0 = MOVES_X + 14
+        pygame.draw.rect(self.screen, PANEL_BG, (MOVES_X, 0, MOVES_W, WIN_H))
+        pygame.draw.line(self.screen, (22, 22, 26), (MOVES_X, 0), (MOVES_X, WIN_H), 2)
+        self.text("Moves", (x0, 8), self.font_big)
+        self.draw_button(L['m_undo'], "Undo", enabled=self.pos > 0)
+        self.draw_button(L['m_flip'], "Flip", on=self.flipped)
+        self.draw_button(L['m_save'], "Save", enabled=bool(self.line))
+        self.draw_button(L['m_load'], "Load")
+        if self.reviewer is not None:
+            review_label = "%d%%" % int(100 * self.reviewer.progress)
+        else:
+            review_label = "Review"
+        self.draw_button(L['m_review'], review_label, on=self.review is not None,
+                         enabled=self.advisor is not None and bool(self.line) and self.reviewer is None)
+        has_marks = self.review is not None and any(self.review["marks"])
+        self.draw_button(L['m_next'], "Next ?", enabled=has_marks)
+        self.text("<- -> step  Home/End", (x0, 144), self.font_small, MUTED)
+        self.text("Z undo  F flip  M next ?", (x0, 161), self.font_small, MUTED)
+        box = L['m_list']
+        pygame.draw.rect(self.screen, (30, 30, 34), box, border_radius=4)
+        if not self.line:
+            self.text("no moves yet", (box.x + 10, box.y + 8), self.font_small, MUTED)
+        first = self.moves_first_row()
+        rows = box.h // ROW_H
+        for i in range(first, min(len(self.line), first + rows)):
+            y = box.y + (i - first) * ROW_H
+            if i == self.pos - 1:
+                pygame.draw.rect(self.screen, (58, 86, 128), (box.x + 2, y, box.w - 4, ROW_H), border_radius=3)
+            num = self.font_small.render(str(i + 1), True, MUTED)
+            self.screen.blit(num, (box.x + 30 - num.get_width(), y + 3))
+            dot_c = (235, 235, 235) if self.turns[i] == 'w' else (12, 12, 14)
+            pygame.draw.circle(self.screen, dot_c, (box.x + 44, y + ROW_H // 2), 5)
+            pygame.draw.circle(self.screen, (140, 140, 145), (box.x + 44, y + ROW_H // 2), 5, 1)
+            mark = self.review_mark(i)
+            colour = MARK_COLOURS.get(mark, TEXT if i < self.pos else MUTED)
+            self.text(self.texts[i] + mark, (box.x + 56, y + 3), self.font_small, colour)
+        self.draw_graph()
+
+    def draw_graph(self):
+        g = self.layout['m_graph']
+        pygame.draw.rect(self.screen, (28, 28, 32), g)
+        pygame.draw.rect(self.screen, (70, 70, 76), g, 1)
+        if self.review is None:
+            label = ("reviewing..." if self.reviewer is not None else
+                     "Review rates every move")
+            self.text(label, (g.x + 10, g.centery - 8), self.font_small, MUTED)
+            return
+        values = self.review["values"]
+        n = max(len(values) - 1, 1)
+        mid, amp = g.centery, g.h / 2 - 5
+        xs = lambda i: g.x + (g.w - 1) * i / n
+        ys = lambda v: mid - max(-1.0, min(1.0, v)) * amp
+        pygame.draw.line(self.screen, (90, 90, 96), (g.x, mid), (g.right - 1, mid), 1)
+        if len(values) >= 2:
+            pygame.draw.lines(self.screen, (120, 190, 235), False,
+                              [(xs(i), ys(v)) for i, v in enumerate(values)], 2)
+        for i, mark in enumerate(self.review["marks"]):
+            if mark:
+                pygame.draw.circle(self.screen, MARK_COLOURS[mark], (int(xs(i + 1)), int(ys(values[i + 1]))), 3)
+        cx = int(xs(min(self.pos, len(values) - 1)))
+        pygame.draw.line(self.screen, (240, 240, 240), (cx, g.y + 1), (cx, g.bottom - 2), 1)
+        self.text("network's view, white up", (g.x, g.bottom + 3), self.font_small, MUTED)
+
     def draw_status(self):
         game = self.game
         colour = TEXT
         if self.message:
             line, colour = self.message, BAD
+        elif self.browsing:
+            mark = self.review_mark(self.pos)
+            if mark:
+                name = {"??": "a blunder", "?": "a mistake", "?!": "an inaccuracy"}[mark]
+                line = ("Next, move %d is %s (it lost %.2f).  Green arrow: the network's choice; red: what was "
+                        "played.  Right arrow shows it." % (self.pos + 1, name, self.review["loss"][self.pos]))
+                colour = MARK_COLOURS[mark]
+            else:
+                line = ("Looking at the position after move %d of %d.  Right / End: forward.  A new move "
+                        "from here replaces the rest." % (self.pos, len(self.line)))
         elif game.done:
             who = "Draw" if game.winner is None else "%s wins" % full_name(game.winner).capitalize()
-            line = "%s: %s.  Press R for a new game." % (who, game.end_reason)
+            line = "%s: %s.  R: new game, Ctrl+S: save it." % (who, game.end_reason)
             colour = GOOD
         else:
             name = full_name(game.turn).capitalize()
@@ -1026,6 +1371,9 @@ def main():
                     help="experimental: every piece of both teams must be on the board")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
     ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
+    ap.add_argument("--flip", action="store_true", help="draw the board from black's side")
+    ap.add_argument("--load", default=None, metavar="FILE", help="open a saved game (Ctrl+S in the window saves one)")
+    ap.add_argument("--autosave", action="store_true", help="save every finished game to your user data folder")
     ap.add_argument("--selftest", action="store_true",
                     help="load the AI and engine, run a short search, print a report and exit "
                          "(no window; used to check a packaged build)")
@@ -1067,9 +1415,11 @@ def main():
                   max_plies=args.max_plies)
     searcher = mcts.Searcher(advisor, sims=args.sims, think_ms=args.think_ms) if advisor else None
     app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
-              searcher)
+              searcher, flipped=args.flip, autosave=args.autosave)
     if args.no_search:
         app.use_search = False
+    if args.load:
+        app.load(args.load)
 
     clock = pygame.time.Clock()
     running = True
@@ -1078,12 +1428,35 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
+                ctrl = bool(event.mod & pygame.KMOD_CTRL)
                 if event.key == pygame.K_ESCAPE:
                     app.escape()
-                elif event.key == pygame.K_r:
+                elif ctrl and event.key == pygame.K_s and app.pending is None:
+                    app.save()
+                elif ctrl and event.key == pygame.K_o and app.pending is None:
+                    app.load()
+                elif event.key == pygame.K_r and not ctrl:
                     app.restart()
                 elif app.pending is None:
-                    if event.key == pygame.K_h:
+                    if event.key == pygame.K_LEFT:
+                        app.step_back()
+                    elif event.key == pygame.K_RIGHT:
+                        app.step_forward()
+                    elif event.key == pygame.K_HOME:
+                        app.jump(0)
+                    elif event.key == pygame.K_END:
+                        app.jump(len(app.line))
+                    elif event.key in (pygame.K_z, pygame.K_BACKSPACE):
+                        app.takeback()
+                    elif event.key == pygame.K_f:
+                        app.flip()
+                    elif event.key == pygame.K_m:
+                        app.next_mistake(-1 if event.mod & pygame.KMOD_SHIFT else 1)
+                    elif event.key == pygame.K_v:
+                        app.start_review()
+                    elif ctrl:
+                        pass
+                    elif event.key == pygame.K_h:
                         app.toggle_hint()
                     elif event.key == pygame.K_e:
                         app.toggle_eval()
@@ -1093,6 +1466,10 @@ def main():
                         app.toggle_search()
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 app.handle_click(event.pos)
+            elif event.type == pygame.MOUSEWHEEL:
+                if app.layout['m_list'].collidepoint(pygame.mouse.get_pos()):
+                    app.scroll_moves(event.y)
+        app.poll_review()
         app.update_ai()
         app.draw()
         pygame.display.flip()

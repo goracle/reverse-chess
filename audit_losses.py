@@ -5,7 +5,7 @@
     python audit_losses.py runs/run2/latest.pt heur:nogift  # the net (needs torch) vs a bot
     python audit_losses.py heur:gift heur:nogift --games 400 --probe 20 --playouts 150
 
-Players are "random", "heur:nogift", "heur:gift" or a checkpoint path.  Games are
+Players are "random", "heur:nogift", "heur:gift", "heur:rush" or a checkpoint path.  Games are
 played with both colours; every game that ends in a dead-end detection
 (pawn_scan / bishop_wall_check / pawn wall-off) is replayed to the position before
 the last move and classified:

@@ -87,7 +87,7 @@ def _opponent_model(path):
 
 
 def _bot_mode(spec):
-    """'heur:gift' / 'heur:nogift' -> 'gift' / 'nogift' (the rule-based bot in heuristic.py);
+    """'heur:gift' / 'heur:nogift' / 'heur:rush' -> 'gift' / 'nogift' / 'rush' (the rule-based bot in heuristic.py);
     anything else (a snapshot path, None) -> None."""
     return spec.split(":", 1)[1] if spec and spec.startswith("heur:") else None
 
@@ -157,7 +157,7 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
     recorded.  With a snapshot path, the current network plays ``net_team`` against
     that older network; only the current network's decisions are recorded (the
     learner must not train on moves it did not make).  ``opp_path`` may also be
-    ``"heur:nogift"`` or ``"heur:gift"``: the rule-based walk-home bots from heuristic.py,
+    ``"heur:nogift"``, ``"heur:gift"`` or ``"heur:rush"``: the rule-based walk-home bots from heuristic.py,
     handled the same way.
     """
     model, version = _current_model()

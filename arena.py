@@ -5,7 +5,7 @@
     python arena.py runs/run2/latest.pt runs/run2/iter_00700.pt --games 400 --workers 8
 
 Either side may also be the rule-based walk-home player from heuristic.py, written
-heur:nogift or heur:gift (e.g. ``python arena.py runs/run2/latest.pt heur:nogift``).
+heur:nogift, heur:gift or heur:rush (e.g. ``python arena.py runs/run2/latest.pt heur:nogift``).
 Both networks sample from their policy (same as the vs-random EVAL in train.py),
 half the games with A as black and half as white.  Score is from A's point of
 view: win = 1, draw = 0.5, loss = 0.  0.5 means equal strength; the +/- is a
@@ -37,8 +37,8 @@ def _load(spec):
     """(model, version) for a checkpoint path, or (("heur", mode), 0)."""
     if _is_heur(spec):
         mode = spec.split(":", 1)[1]
-        if mode not in ("nogift", "gift"):
-            raise SystemExit("unknown heuristic %r (use heur:nogift or heur:gift)" % spec)
+        if mode not in ("nogift", "gift", "rush"):
+            raise SystemExit("unknown heuristic %r (use heur:nogift, heur:gift or heur:rush)" % spec)
         return ("heur", mode), 0
     import net as netlib
     model, ckpt = netlib.load_checkpoint(spec)
@@ -80,8 +80,8 @@ def _play(seed, a_team, greedy=False):
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("a", help="checkpoint A (e.g. the newest), or heur:nogift / heur:gift")
-    ap.add_argument("b", help="checkpoint B (e.g. an older snapshot), or heur:nogift / heur:gift")
+    ap.add_argument("a", help="checkpoint A (e.g. the newest), or heur:nogift / heur:gift / heur:rush")
+    ap.add_argument("b", help="checkpoint B (e.g. an older snapshot), or heur:nogift / heur:gift / heur:rush")
     ap.add_argument("--games", type=int, default=200)
     ap.add_argument("--workers", type=int, default=max(1, (os.cpu_count() or 4) - 2))
     ap.add_argument("--max-plies", type=int, default=300, help="draw after this many plies (train.py default)")

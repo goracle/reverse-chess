@@ -62,6 +62,21 @@ The rules are simple...ish.
 
 * Strategy - You are trying to force your opponent to make a mistake and trap themselves (leading to a loss) or to clutter the board.
 
+## Game history, undo, save/load and review
+
+`play.py` has a move list (third column) with the usual conveniences:
+
+* **Step / jump:** Left / Right, Home / End, or click a move.  Mouse wheel scrolls the list.
+* **Undo:** `Z` / Backspace takes back your move (and the computer's reply).  Right / End bring it back;
+  playing a different move replaces the old line.  A game with a take-back is not counted in your record.
+* **Flip board:** `F` (or `--flip`).
+* **Save / load:** `Ctrl+S` / `Ctrl+O` (or the buttons); `--load FILE`; `--autosave` saves every finished game.
+  Files are small JSON in your user data folder (`ReverseChess/games/`).
+* **Review:** `V`.  The network rates every position and marks inaccuracies (`?!`), mistakes (`?`) and
+  blunders (`??`) in the move list, and graphs the game.  `M` jumps to the position before the next marked
+  move and draws the network's preferred move (green) against the one played (red) -- so the "puzzles" come
+  from your own games, nothing to author.  `python review.py [game.json]` prints the same in the terminal.
+
 ## Playing against the AI
 
 `play.py` is the pygame front end.  The computer opponent is the network trained by `train.py`:

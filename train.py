@@ -65,6 +65,7 @@ from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import numpy as np
 import torch
 
+import heuristic
 import net as netlib
 import returns
 import rollout
@@ -648,7 +649,7 @@ def parse_args():
                         "(0 = pick uniformly, 2 = default, higher = focus harder on the toughest)")
     g.add_argument("--heur-frac", type=float, default=0.25,
                    help="fraction of games played against the rule-based walk-home bots from heuristic.py "
-                        "(heur:nogift and heur:gift; the one the net scores worse against is picked more "
+                        "(heur:nogift, heur:gift and heur:rush; the one the net scores worse against is picked more "
                         "often, see --pool-power) -- but only while games are being queued in every "
                         "--heur-every-th iteration.  0 = never.  Only the net's own moves are trained on, "
                         "and the 'vs bots' line reports only those training games (no separate eval games).")
@@ -782,9 +783,9 @@ def top_up(pending, pool, args, next_seed):
         pick = np.random.default_rng(seed + 1)               # picks opponent and colour
         u = pick.random()
         if getattr(args, "bots_now", False) and u < args.heur_frac:     # a rule-based bot
-            bots = ["heur:nogift", "heur:gift"]
+            bots = ["heur:" + m for m in heuristic.MODES]
             pending.append(pool.submit(rollout.selfplay_task, seed,
-                                       bots[int(pick.choice(2, p=_pool_weights(bots, args.pool_power)))],
+                                       bots[int(pick.choice(len(bots), p=_pool_weights(bots, args.pool_power)))],
                                        "b" if pick.random() < 0.5 else "w"))
         elif snaps and pick.random() < args.pool_frac:       # an older snapshot of the net
             pending.append(pool.submit(rollout.selfplay_task, seed,
@@ -1037,7 +1038,7 @@ def main():
                 POOL_SCORE[g["opp"]] = (sc * 0.97 + s_, c * 0.97 + 1.0)       # recent games count more
             if vs_bots:
                 parts = []
-                for mode in ("heur:nogift", "heur:gift"):
+                for mode in ["heur:" + m for m in heuristic.MODES]:
                     gs = [g for g in vs_bots if g["opp"] == mode]
                     if not gs:
                         continue
