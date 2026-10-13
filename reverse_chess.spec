@@ -30,7 +30,7 @@ a = Analysis(
 )
 pyz = PYZ(a.pure)
 exe = EXE(pyz, a.scripts, [], exclude_binaries=True, name="ReverseChess",
-          console=False, upx=False)
+          console=(os.environ.get("RC_CONSOLE") == "1"), upx=False)
 coll = COLLECT(exe, a.binaries, a.datas, name="ReverseChess", upx=False)
 if sys.platform == "darwin":
     app = BUNDLE(coll, name="ReverseChess.app", icon=None,

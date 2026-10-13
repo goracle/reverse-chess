@@ -21,6 +21,7 @@ jobs:
           - { os: macos-14,        name: macos-arm64 }       # Apple Silicon
           - { os: macos-15-intel,  name: macos-intel }       # Intel Macs
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     defaults:
       run:
         shell: bash
@@ -50,24 +51,45 @@ jobs:
           python check_rustnet.py
 
       - name: Package with PyInstaller
+        if: runner.os != 'Windows'
+        run: pyinstaller --noconfirm reverse_chess.spec
+
+      # Windows: a windowed .exe that crashes shows a modal error box and hangs a headless runner,
+      # so test a console build of the same code first (errors print to the log), then rebuild
+      # the real windowed one for the release.
+      - name: Package with PyInstaller (windows, console build for testing)
+        if: runner.os == 'Windows'
+        env:
+          RC_CONSOLE: "1"
         run: pyinstaller --noconfirm reverse_chess.spec
 
       - name: Smoke-test the packaged app (windows)
         if: runner.os == 'Windows'
+        timeout-minutes: 3
         shell: pwsh
         run: |
-          $p = Start-Process dist\ReverseChess\ReverseChess.exe -ArgumentList '--selftest','--no-stats' -Wait -PassThru
-          Get-Content $env:RC_SELFTEST_LOG
-          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
+          & dist\ReverseChess\ReverseChess.exe --selftest --no-stats
+          $code = $LASTEXITCODE
+          if (Test-Path $env:RC_SELFTEST_LOG) { Get-Content $env:RC_SELFTEST_LOG }
+          if ($code -ne 0) { exit $code }
+
+      - name: Rebuild the windowed (no console) app for release
+        if: runner.os == 'Windows'
+        run: |
+          rm -rf build dist
+          pyinstaller --noconfirm --clean reverse_chess.spec
+          ls dist/ReverseChess | head -20
 
       - name: Smoke-test the packaged app (mac)
         if: runner.os == 'macOS'
+        timeout-minutes: 3
         run: |
           dist/ReverseChess.app/Contents/MacOS/ReverseChess --selftest --no-stats
           cat "$RC_SELFTEST_LOG"
 
       - name: Smoke-test the packaged app (linux)
         if: runner.os == 'Linux'
+        timeout-minutes: 3
         run: |
           dist/ReverseChess/ReverseChess --selftest --no-stats
           cat "$RC_SELFTEST_LOG"

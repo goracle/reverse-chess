@@ -972,19 +972,24 @@ def selftest(advisor, ai_note):
         if sys.stdout is not None:
             print(msg)
     code = 0
-    say("engine: " + ("native (Rust)" if engine.NATIVE else "pure Python (slow)"))
-    if advisor is None:
-        say("FAIL: no AI loaded. " + (ai_note or "ai.npz not found next to the program"))
+    try:
+        say("engine: " + ("native (Rust)" if engine.NATIVE else "pure Python (slow)"))
+        if advisor is None:
+            say("FAIL: no AI loaded. " + (ai_note or "ai.npz not found next to the program"))
+            code = 1
+        else:
+            try:
+                import rustnet
+                say("native net: " + ("yes, SIMD=%s" % rustnet.simd_active() if rustnet.AVAILABLE else "no"))
+            except Exception as err:
+                say("native net: unavailable (%s)" % err)
+            job = mcts.Searcher(advisor, sims=40, think_ms=20000).search(Game(Rules()), rng=random.Random(0))
+            say("search ok: " + type(job).__name__)
+            say("selftest passed")
+    except BaseException:
+        import traceback
+        say("FAIL:\n" + traceback.format_exc())
         code = 1
-    else:
-        try:
-            import rustnet
-            say("native net: " + ("yes, SIMD=%s" % rustnet.simd_active() if rustnet.AVAILABLE else "no"))
-        except Exception as err:
-            say("native net: unavailable (%s)" % err)
-        job = mcts.Searcher(advisor, sims=40, think_ms=20000).search(Game(Rules()), rng=random.Random(0))
-        say("search ok: " + type(job).__name__)
-        say("selftest passed")
     log = os.environ.get("RC_SELFTEST_LOG")
     if log:
         with open(log, "w") as fh:
