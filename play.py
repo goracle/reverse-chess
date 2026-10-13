@@ -52,7 +52,7 @@ With no file the computer moves at random and the eval bar and hints are unavail
 Game history (the third column)
 -------------------------------
 * The move list shows every move in short notation (K = king, ``*`` = promoted piece, ``+Q`` = a
-  queen given back, ``u`` = un-promotion).  Click a move to see the position after it; the mouse
+  queen given back, ``u`` = un-promotion).  Click a move to see the position after it (the top row, "start position", the position before the first move); the mouse
   wheel scrolls.  Left / Right step through the game, Home / End jump to the start / the end.
 * Undo (Z or Backspace) takes back your last move (and the computer's reply).  Nothing is thrown
   away until you play a different move: Right / End bring the old moves back.  A game in which you
@@ -1543,8 +1543,8 @@ class App:
                 self.message = "The think-time slider needs the AI file and MCTS switched on (S)."
         elif L['m_list'].collidepoint(pos):
             row = self.moves_first_row() + (pos[1] - L['m_list'].y) // ROW_H
-            if 0 <= row < len(self.line):
-                self.jump(row + 1)                 # the position after that move
+            if 0 <= row <= len(self.line):
+                self.jump(row)                     # row 0 = the start, row k = the position after move k
         elif L['m_graph'].collidepoint(pos) and self.review is not None:
             i = self.graph_mark_at(pos)
             if i is not None:                      # a marked move: the position before it, with its details
@@ -2064,12 +2064,13 @@ class App:
                          on=confirming, enabled=bool(self.stats.games))
 
     def moves_first_row(self):
-        """Index of the first move-list row on screen."""
+        """Index of the first move-list row on screen.  Row 0 is the starting position, row k the position
+        after move k (so clicking a row jumps to that many moves played)."""
         rows = self.layout['m_list'].h // ROW_H
-        last_first = max(0, len(self.line) - rows)
+        last_first = max(0, len(self.line) + 1 - rows)
         if self.moves_top is not None:
             return max(0, min(self.moves_top, last_first))
-        cur = max(self.pos - 1, 0)
+        cur = self.pos
         return cur if cur < last_first else last_first
 
     def scroll_moves(self, dy):
@@ -2102,12 +2103,15 @@ class App:
                   TEXT if self.variations else MUTED)
         box = L['m_list']
         pygame.draw.rect(self.screen, (30, 30, 34), box, border_radius=4)
-        if not self.line:
-            self.text("no moves yet", (box.x + 10, box.y + 8), self.font_small, MUTED)
         first = self.moves_first_row()
         rows = box.h // ROW_H
-        for i in range(first, min(len(self.line), first + rows)):
-            y = box.y + (i - first) * ROW_H
+        if first == 0:                                    # row 0: the position before any move
+            if self.pos == 0:
+                pygame.draw.rect(self.screen, (58, 86, 128), (box.x + 2, box.y, box.w - 4, ROW_H), border_radius=3)
+            self.text("start position" if self.line else "start position (no moves yet)", (box.x + 10, box.y + 3),
+                      self.font_small, TEXT if self.pos == 0 else MUTED)
+        for i in range(max(first - 1, 0), min(len(self.line), first + rows - 1)):
+            y = box.y + (i + 1 - first) * ROW_H
             if i == self.pos - 1:
                 pygame.draw.rect(self.screen, (58, 86, 128), (box.x + 2, y, box.w - 4, ROW_H), border_radius=3)
             num = self.font_small.render(str(i + 1), True, MUTED)

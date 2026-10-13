@@ -66,7 +66,8 @@ The rules are simple...ish.
 
 `play.py` has a move list (third column) with the usual conveniences:
 
-* **Step / jump:** Left / Right, Home / End, or click a move.  Mouse wheel scrolls the list.
+* **Step / jump:** Left / Right, Home / End, or click a move (the top row, "start position", is the position
+  before the first move).  Mouse wheel scrolls the list.
 * **Undo:** `Z` / Backspace takes back your move (and the computer's reply).  Right / End bring it back;
   playing a different move starts another line and the old one is kept as a variation (see below).
   A game with a take-back is not counted in your record.

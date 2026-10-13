@@ -200,6 +200,19 @@ def main():
     assert not app.review_here()
     print("ok: review of the first move")
 
+    # 6c. the move list has a start row: clicking it shows the position before the first move
+    app.jump(len(app.line))
+    box = app.layout["m_list"]
+    app.moves_top = 0
+    app.draw()
+    app.handle_click((box.x + 20, box.y + 5))
+    assert app.pos == 0
+    app.handle_click((box.x + 20, box.y + 5 + play.ROW_H))     # the first move's row: the position after it
+    assert app.pos == 1
+    app.moves_top = None
+    app.draw()
+    print("ok: start row")
+
     # 7. think-time slider
     app = make_app(advisor)
     track = app.think_track()
