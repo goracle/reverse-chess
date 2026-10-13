@@ -91,6 +91,8 @@ def main():
         app.resolve()
         assert app.pending is not None
         dim, values = app.pending
+        panel = play.menu_rects(len(values), False)[0]
+        assert panel.left >= play.BOARD_PX and panel.right <= play.WIN_W and panel.top >= 0 and panel.bottom <= play.WIN_H
         app.draw()
         app.menu_key(pygame.K_DOWN)
         assert app.menu_sel == 0
@@ -116,8 +118,9 @@ def main():
         print("ok: menu keys / preview (%s)" % dim)
 
     # 4. premove
-    app = make_app(ai_on=True, sides=("w",))          # you are black; white (the computer) is to move
-    black = app.game.on_board("b")[0].pos
+    app = make_app(ai_on=True, sides=("b",))          # you are white; black (the computer) moves first
+    assert app.flipped is False
+    black = app.game.on_board("w")[0].pos             # (the name is from when this was written the other way round)
     empty = next((r, c) for r in range(8) for c in range(8) if app.game.board[r, c] is None)
     app.handle_click(app.sq_centre(black))
     assert app.pre_src == black and app.selected is None
@@ -138,6 +141,18 @@ def main():
     app.update_ai()
     assert app.premove is None
     print("ok: premove")
+
+    # 4b. the board turns so that your colour is at the bottom
+    assert make_app(ai_on=True, sides=("w",)).flipped is True       # you are black
+    assert make_app(ai_on=True, sides=("b",)).flipped is False      # you are white
+    assert make_app(ai_on=False).flipped is False                   # two humans: left alone
+    assert make_app(ai_on=True, sides=("w",), auto_orient=False).flipped is False
+    app = make_app(ai_on=True, sides=("w",))
+    app.set_sides({"b"})
+    assert app.flipped is False
+    app.flip()
+    assert app.flipped is True
+    print("ok: orientation")
 
     # 5. window scale: resizing keeps the mouse mapping; frames present
     app = make_app()
@@ -165,6 +180,25 @@ def main():
     if advisor is None:
         print("no AI file: skipped the think-time and network-picker checks")
         return
+
+    # 6b. the review shows the network's view of every position, the opening one included
+    app = make_app(advisor)
+    play_rng = random.Random(9)
+    for _ in range(10):
+        app.play(play_rng.choice(app.game.legal_actions()))
+    app.start_review()
+    import time
+    t = time.time()
+    while app.reviewer is not None and time.time() - t < 120:
+        app.poll_review()
+        time.sleep(0.01)
+    assert app.review is not None
+    app.jump(0)
+    assert app.review_here() and app.review_alts() is not None
+    app.draw()
+    app.jump(len(app.line))
+    assert not app.review_here()
+    print("ok: review of the first move")
 
     # 7. think-time slider
     app = make_app(advisor)

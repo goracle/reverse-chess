@@ -70,13 +70,17 @@ The rules are simple...ish.
 * **Undo:** `Z` / Backspace takes back your move (and the computer's reply).  Right / End bring it back;
   playing a different move starts another line and the old one is kept as a variation (see below).
   A game with a take-back is not counted in your record.
-* **Flip board:** `F` (or `--flip`).
+* **Flip board:** with one human side the board is turned by itself so that your colour is at the bottom
+  (you always move up); `F` flips it by hand.  `--fixed-board` stops the automatic turn, `--flip` also
+  starts from black's side and keeps it.
 * **Save / load:** `Ctrl+S` / `Ctrl+O` (or the buttons); `--load FILE`; `--autosave` saves every finished game.
   Files are small JSON in your user data folder (`ReverseChess/games/`).
 * **Review:** `V`.  The network rates every position and marks inaccuracies (`?!`), mistakes (`?`) and
   blunders (`??`) in the move list, and graphs the game.  `M` jumps to the position before the next marked
   move and draws the network's preferred move (green) against the one played (red) -- so the "puzzles" come
   from your own games, nothing to author.  `python review.py [game.json]` prints the same in the terminal.
+  Browsing any position of a reviewed line (the opening position included) shows the network's choice
+  there in green and the move played in grey (red if it was marked), with its top three in the panel.
   The gift a move gives is drawn as a translucent piece on the square it lands on (hints too).
   `Shift+M` / `Ctrl+Left` jump to the previous marked move, `Ctrl+Right` to the next; `P` plays the
   network's move instead of the one played there (the old line is kept, see Variations).  Under the
@@ -105,7 +109,7 @@ The rules are simple...ish.
   `Backspace` goes back.  A move with a single variant plays at once; hold `Shift` while clicking the
   destination to get a "Play this move?" confirmation anyway.
 * **Gift preview:** hovering (or highlighting) a menu option ghosts the piece it gives back on the square
-  where it would land.  It is drawn over the menu.
+  where it would land.  The menu opens to the right of the board, so the board stays fully in view.
 * **Premove:** on the computer's turn click one of your pieces, then where it should go; it is played as soon
   as it is your turn if still legal (a move that needs a decision opens its menu).  Right-click or `Esc`
   cancels.

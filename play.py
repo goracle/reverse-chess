@@ -494,7 +494,8 @@ def synth_sounds():
 class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
                  stats, show_eval, searcher=None, flipped=False, autosave=False,
-                 review_sims=0, session=False, scale=None, sound=True, coords=True, net_dirs=()):
+                 review_sims=0, session=False, scale=None, sound=True, coords=True, net_dirs=(),
+                 auto_orient=True):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         # Everything is drawn on a fixed-size canvas (WIN_W x WIN_H); present() scales it into the
@@ -531,6 +532,7 @@ class App:
         self.stats_summary = stats.summary() if stats is not None else None
         self.confirm_reset_until = 0
         self.flipped = flipped        # board drawn from black's side
+        self.auto_orient = auto_orient  # turn the board so the human's colour is at the bottom
         self.autosave = autosave      # save every finished game (--autosave)
         self.review_sims = review_sims  # search simulations per position in the review (0: network only)
         self.session = session        # keep the game in progress on disk after every move (resume)
@@ -548,6 +550,7 @@ class App:
         self.dragging = None          # 'think' while the think-time slider is being dragged
         self.refresh_agents()
         self.new_game()
+        self.orient()
         if stats is not None and stats.error:
             self.message = stats.error
 
@@ -879,6 +882,7 @@ class App:
         self.clear_premove()
         self.stop_search()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        self.orient()
         self.line = []                # every action of the game, and the current position in it:
         self.texts = []               # (notation of each action, the team that played it)
         self.turns = []
@@ -1044,6 +1048,12 @@ class App:
 
     def flip(self):
         self.flipped = not self.flipped
+
+    def orient(self):
+        """With exactly one human side, draw the board from that side (your pieces at the bottom, moving
+        up).  Two humans or two computers: leave the board as it is.  F still flips it by hand."""
+        if self.auto_orient and self.ai_on and len(self.ai_sides) == 1:
+            self.flipped = self.human_colour() == 'b'
 
     def game_meta(self):
         meta = {"ai": self.advisor.name if self.advisor is not None else None,
@@ -1317,12 +1327,19 @@ class App:
                 best = (key, i)
         return None if best is None else best[1]
 
+    def review_here(self):
+        """True when the review has the network's view of the position on the board (every position
+        before a move of the reviewed line, the opening position included)."""
+        rev = self.review
+        return (rev is not None and self.browsing and self.pos < len(rev.get("top", []))
+                and self.pos < len(rev["best"]))
+
     def review_alts(self):
         """At a position just before a marked move: the panel's lines for the top three moves there
         (share of the search's visits or the network's probability, and the value after each for the
         side to move) and for the move that was played, or None."""
         rev, n = self.review, self.pos
-        if rev is None or not self.browsing or not self.review_mark(n) or n >= len(rev.get("top", [])):
+        if not self.review_here():
             return None
         game, sims = self.game, rev.get("sims", 0)
         rows = []
@@ -1368,6 +1385,7 @@ class App:
         elif self.game.ply == 0:
             self.stats_ok = self.stats_eligible()
         self.refresh_agents()
+        self.orient()
         self.cancel()
         self.clear_premove()
         self.hint = None
@@ -1733,7 +1751,7 @@ class App:
 
     def draw_menu_preview(self):
         """While a move menu is open: the highlighted option's gift, ghosted on the board where it lands
-        (over the menu if need be), so the choice can be judged before it is made."""
+        (the menu is beside the board), so the choice can be judged before it is made."""
         action = self.menu_preview_action()
         if action is None or action.gift is None:
             return
@@ -1835,15 +1853,22 @@ class App:
 
     def draw_review_arrows(self):
         """At a position right before a marked move: the network's choice (green) and the move played (red)."""
-        if not self.review_mark(self.pos) or self.pending is not None:
+        if not self.review_here() or self.pending is not None:
             return
         best, played = self.review["best"][self.pos], self.line[self.pos]
         overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
-        for action, colour, width in ((played, REVIEW_PLAYED, 9), (best, REVIEW_BEST, 13)):
+        marked = bool(self.review_mark(self.pos))
+        if played == best and not marked:
+            draw_arrow(overlay, self.sq_centre(best.src), self.sq_centre(best.dst), REVIEW_BEST, 13)
+            self.draw_gift_ghost(overlay, best, REVIEW_BEST)
+            self.screen.blit(overlay, (0, 0))
+            return
+        played_colour = REVIEW_PLAYED if marked else (170, 170, 185, 150)   # not a mistake: just "what was played"
+        for action, colour, width in ((played, played_colour, 9), (best, REVIEW_BEST, 13)):
             draw_arrow(overlay, self.sq_centre(action.src), self.sq_centre(action.dst), colour, width)
         shared = (played.gift is not None and best.gift is not None
                   and self.gift_square(played) == self.gift_square(best))
-        self.draw_gift_ghost(overlay, played, REVIEW_PLAYED, small=shared)   # small: don't hide it under the green one
+        self.draw_gift_ghost(overlay, played, played_colour, small=shared)   # small: don't hide it under the green one
         self.draw_gift_ghost(overlay, best, REVIEW_BEST)
         self.screen.blit(overlay, (0, 0))
 
@@ -2179,6 +2204,13 @@ class App:
                            describe(game, self.review["best"][self.pos]),
                            describe(game, self.line[self.pos])))
                 colour = MARK_COLOURS[mark]
+            elif self.review_here():
+                best = self.review["best"][self.pos]
+                line = ("Before move %d of %d: the network's choice is %s (green)%s.  P plays it; a new move "
+                        "from here starts another line (the old one is kept: Tab)."
+                        % (self.pos + 1, len(self.line), describe(game, best),
+                           "" if best == self.line[self.pos] else ", the game went %s (grey)"
+                           % describe(game, self.line[self.pos])))
             else:
                 line = ("Looking at the position after move %d of %d.  Right / End: forward.  A new move "
                         "from here starts another line (the old one is kept: Tab)." % (self.pos, len(self.line)))
@@ -2211,9 +2243,6 @@ class App:
         game = self.game
         mover = game.board[self.selected]
         recv = other_team(game.turn)        # the team that receives a gift
-        veil = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
-        veil.fill((0, 0, 0, 140))
-        self.screen.blit(veil, (0, 0))
         panel, rects, x_rect, back_rect = menu_rects(len(values), bool(self.history))
         pygame.draw.rect(self.screen, PANEL_BG, panel, border_radius=12)
         titles = {
@@ -2261,11 +2290,13 @@ class App:
 
 
 def menu_rects(n, with_back=False):
-    """(background, one rect per option, X button, Back button or None) for a centred menu of n options."""
-    width, height, gap, head, foot = 600, 70, 10, 60, 56
+    """(background, one rect per option, X button, Back button or None) for a menu of n options.  It sits
+    to the right of the board (over the panel columns), so the board stays in view: the gift preview and the
+    pieces being decided about are never covered."""
+    width, height, gap, head, foot = 480, 70, 10, 60, 56
     total = head + n * height + (n - 1) * gap + (foot if with_back else 0)
-    left = (BOARD_PX - width) // 2
-    top = (BOARD_PX - total) // 2
+    left = BOARD_PX + (WIN_W - BOARD_PX - width) // 2
+    top = (WIN_H - total) // 2
     panel = pygame.Rect(left - 20, top - 10, width + 40, total + 30)
     rects = [pygame.Rect(left, top + head + i * (height + gap), width, height)
              for i in range(n)]
@@ -2359,7 +2390,11 @@ def main():
                          "lists *.npz / *.pt next to play.py, in runs/*/ and in nets/")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
     ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
-    ap.add_argument("--flip", action="store_true", help="draw the board from black's side")
+    ap.add_argument("--flip", action="store_true",
+                    help="draw the board from black's side and keep it that way (by default the board is "
+                         "turned so that your colour is at the bottom)")
+    ap.add_argument("--fixed-board", action="store_true",
+                    help="never turn the board by itself: white at the bottom unless F / --flip says otherwise")
     ap.add_argument("--load", default=None, metavar="FILE", help="open a saved game (Ctrl+S in the window saves one)")
     ap.add_argument("--autosave", action="store_true", help="save every finished game to your user data folder")
     ap.add_argument("--selftest", action="store_true",
@@ -2405,7 +2440,8 @@ def main():
     app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
               searcher, flipped=args.flip, autosave=args.autosave,
               review_sims=args.review_sims, session=not args.no_resume, scale=args.scale,
-              sound=not args.no_sound, coords=not args.no_coords, net_dirs=args.net_dir)
+              sound=not args.no_sound, coords=not args.no_coords, net_dirs=args.net_dir,
+              auto_orient=not (args.flip or args.fixed_board))
     if args.no_search:
         app.use_search = False
     if args.load:
