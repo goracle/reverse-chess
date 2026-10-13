@@ -97,6 +97,29 @@ The rules are simple...ish.
 * **Resume:** the game in progress is written to `ReverseChess/autosave.json` after every move (side lines
   included) and reopened at the next start if it was not over.  `R` discards it; `--no-resume` turns it off.
 
+## Play feel and window
+
+* **Coordinates:** rank numbers and file letters on the board edge, following the flip.  `C` or the Coords
+  button toggles them; `--no-coords` starts without.
+* **Move menu from the keyboard:** `1`-`9` pick an option, `Up` / `Down` + `Enter` pick the highlighted one,
+  `Backspace` goes back.  A move with a single variant plays at once; hold `Shift` while clicking the
+  destination to get a "Play this move?" confirmation anyway.
+* **Gift preview:** hovering (or highlighting) a menu option ghosts the piece it gives back on the square
+  where it would land.  It is drawn over the menu.
+* **Premove:** on the computer's turn click one of your pieces, then where it should go; it is played as soon
+  as it is your turn if still legal (a move that needs a decision opens its menu).  Right-click or `Esc`
+  cancels.
+* **AI think time:** the slider in the move column sets how long the search may think (100 ms - 20 s); the
+  simulation cap scales with it.  Needs MCTS on.
+* **Sound:** short synthesised move / gift / game-end sounds; `U` or the Sound button toggles, `--no-sound`
+  starts without.
+* **Window size:** the window is resizable and defaults to what fits the screen; `--scale F`, `Ctrl +` /
+  `Ctrl -`, `Ctrl+0` (fit the screen), `Ctrl+1` (100%).
+* **Network picker:** `N` (or click the AI's name in the panel) lists the network files next to `play.py`, in
+  `runs/*/` (including `iter_NNNNN.pt` snapshots) and `nets/`, plus any `--net-dir DIR`.  Choosing one makes
+  it the AI (play, search, eval, hints); the current review is dropped and a game under way stops counting in
+  your record.  `.pt` files need PyTorch; `export_weights.py` makes an `.npz` that does not.
+
 ## Playing against the AI
 
 `play.py` is the pygame front end.  The computer opponent is the network trained by `train.py`:

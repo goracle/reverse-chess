@@ -88,6 +88,15 @@ Game history (the third column)
   games) after every move, side lines included, and reopened the next time you start play.py
   if it was not over.  R (new game) discards it; ``--no-resume`` turns all of this off.
 
+Play feel and window
+--------------------
+* C = rank / file labels (flip-aware), U = move sounds, N = pick another network file for the AI
+  (next to play.py, runs/*/, nets/, --net-dir), Ctrl +/- / Ctrl+0 / Ctrl+1 = window size (also --scale).
+* Move menu: keys 1-9, Up / Down + Enter, Backspace.  Shift+click on the destination confirms even a
+  single-variant move.  The highlighted option's gift is ghosted on the board.
+* Premove: on the computer's turn click your piece and its destination; right-click / Esc cancels.
+* The slider in the move column sets the AI's think time (the simulation cap scales with it).
+
 Custom agents
 -------------
 ``--black`` / ``--white`` accept ``human``, ``ai`` (the network above), ``random``,
@@ -99,13 +108,16 @@ The function is called as ``function(game)`` and must return one of
 Only pygame and numpy are needed; there is no tkinter and no pop-up window.
 """
 import argparse
+import glob
 import importlib
 import math
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
+import time
 from collections import Counter, defaultdict
 
 import numpy as np
@@ -132,6 +144,9 @@ MOVES_W = 220                    # the move list / game history column
 ROW_H = 20
 EVAL_COL_W = 34                  # the little eval bar at the right of each move-list row
 MAX_VARIATIONS = 12              # side lines kept by the variation stack (Tab)
+THINK_STEPS = (100, 250, 500, 1000, 2500, 5000, 10000, 20000)   # ms: the AI think-time slider's stops
+PICK_ROWS = 14                   # rows of the network picker that show at once
+PREMOVE_COLOUR = (70, 140, 255, 200)
 STATUS_H = 92
 WIN_W = MOVES_X + MOVES_W
 WIN_H = BOARD_PX + STATUS_H
@@ -177,7 +192,7 @@ def make_layout():
     R = pygame.Rect
     return {
         'x0': x0, 'w': w,
-        'ai_label_y': 344,
+        'net': R(x0, 340, w, 38),            # the AI's name: click to pick another network
         'ai': R(x0, 382, third, 30),
         'eval': R(x0 + third + 8, 382, third, 30),
         'search': R(x0 + 2 * (third + 8), 382, third, 30),
@@ -194,8 +209,10 @@ def make_layout():
         'm_undo': R(MOVES_X + 14, 40, 92, 28), 'm_flip': R(MOVES_X + 114, 40, 92, 28),
         'm_save': R(MOVES_X + 14, 74, 92, 28), 'm_load': R(MOVES_X + 114, 74, 92, 28),
         'm_review': R(MOVES_X + 14, 108, 92, 28), 'm_next': R(MOVES_X + 114, 108, 92, 28),
-        'm_list': R(MOVES_X + 6, 182, MOVES_W - 12, ROW_H * 29),
-        'm_graph': R(MOVES_X + 14, 182 + ROW_H * 29 + 12, MOVES_W - 28, 66),
+        'm_sound': R(MOVES_X + 14, 142, 92, 28), 'm_coords': R(MOVES_X + 114, 142, 92, 28),
+        'm_think': R(MOVES_X + 14, 176, MOVES_W - 28, 30),     # the AI think-time slider
+        'm_list': R(MOVES_X + 6, 246, MOVES_W - 12, ROW_H * 25),
+        'm_graph': R(MOVES_X + 14, 246 + ROW_H * 25 + 12, MOVES_W - 28, 66),
     }
 
 
@@ -378,6 +395,98 @@ def app_dir():
     return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 
 
+def auto_scale():
+    """The window scale that fits the desktop (at most 1): the board is 1334 x 892 pixels at 1.0."""
+    try:
+        width, height = pygame.display.get_desktop_sizes()[0]
+    except Exception:                                  # old pygame, no display: no opinion
+        return 1.0
+    if width <= 0 or height <= 0:
+        return 1.0
+    return max(0.4, min(1.0, (height - 90) / WIN_H, (width - 30) / WIN_W))
+
+
+def think_label(ms):
+    return "%d ms" % ms if ms < 1000 else "%.1f s" % (ms / 1000.0)
+
+
+def find_nets(extra_dirs=()):
+    """Network files that could be the AI: ``[{path, rel, version, mtime}]``, grouped by folder, newest
+    version first.  Looks next to play.py, in the working directory and in ``extra_dirs``, each for
+    ``*.npz`` / ``*.pt`` and under ``runs/*/`` and ``nets/`` (train.py's ``iter_NNNNN.pt`` snapshots)."""
+    bases = []
+    for base in [app_dir(), os.getcwd()] + list(extra_dirs):
+        if base and os.path.isdir(base) and os.path.realpath(base) not in [os.path.realpath(b) for b in bases]:
+            bases.append(base)
+    found = {}
+    for base in bases:
+        for pattern in ("*.npz", "*.pt", os.path.join("runs", "*", "*.pt"), os.path.join("runs", "*", "*.npz"),
+                        os.path.join("nets", "*.npz"), os.path.join("nets", "*.pt")):
+            for path in glob.glob(os.path.join(base, pattern)):
+                name = os.path.basename(path)
+                if ".tmp." in name or not os.path.isfile(path):
+                    continue
+                found.setdefault(os.path.realpath(path), (path, os.path.relpath(path, base)))
+    items = []
+    for real, (path, rel) in found.items():
+        version = None
+        match = re.search(r"iter_(\d+)", os.path.basename(path))
+        if match:
+            version = int(match.group(1))
+        elif path.lower().endswith(".npz"):
+            try:
+                with np.load(path, allow_pickle=False) as data:
+                    if "meta_version" in data.files and int(data["meta_version"]) >= 0:
+                        version = int(data["meta_version"])
+            except Exception:                          # not one of ours: still listed, loading will say why
+                pass
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        items.append({"path": path, "real": real, "rel": rel, "version": version, "mtime": mtime})
+    items.sort(key=lambda it: (os.path.dirname(it["real"]), -(it["version"] if it["version"] is not None else -1),
+                               -it["mtime"], it["real"]))
+    return items[:500]
+
+
+def synth_sounds():
+    """The three move sounds (``move``, ``gift``, ``end``) as pygame Sounds matching the open mixer, or {}
+    if there is no audio output.  They are made with numpy, so there is no sound file to ship."""
+    try:
+        if pygame.mixer.get_init() is None:
+            pygame.mixer.init()
+        rate, fmt, channels = pygame.mixer.get_init()
+    except pygame.error:
+        return {}
+    if fmt != -16 or channels not in (1, 2):
+        return {}
+    rng = np.random.default_rng(7)
+
+    def note(partials, dur, knock=0.0):
+        t = np.arange(int(rate * dur)) / float(rate)
+        wave = sum(amp * np.sin(2 * np.pi * f * t) * np.exp(-t * decay) for f, amp, decay in partials)
+        if knock:
+            wave = wave + knock * rng.standard_normal(len(t)) * np.exp(-t * 70)
+        return wave * np.minimum(1.0, t / 0.002)             # a 2 ms attack: no click
+
+    def make(wave):
+        data = (np.clip(wave, -1.0, 1.0) * 0.45 * 32767).astype(np.int16)
+        if channels == 2:
+            data = np.repeat(data[:, None], 2, axis=1)
+        return pygame.mixer.Sound(buffer=np.ascontiguousarray(data).tobytes())
+
+    try:
+        return {
+            "move": make(note([(190, 1.0, 40), (380, 0.4, 60)], 0.12, knock=0.3)),
+            "gift": make(np.concatenate([note([(660, 0.8, 14)], 0.11), note([(990, 0.8, 11)], 0.2)])),
+            "end": make(np.concatenate([note([(392, 0.8, 7)], 0.2), note([(294, 0.8, 5)], 0.2),
+                                        note([(196, 0.9, 4)], 0.45)])),
+        }
+    except (pygame.error, ValueError):
+        return {}
+
+
 # --------------------------------------------------------------------------
 # The app
 # --------------------------------------------------------------------------
@@ -385,10 +494,16 @@ def app_dir():
 class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
                  stats, show_eval, searcher=None, flipped=False, autosave=False,
-                 review_sims=0, session=False):
+                 review_sims=0, session=False, scale=None, sound=True, coords=True, net_dirs=()):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
-        self.screen = pygame.display.set_mode((WIN_W, WIN_H))
+        # Everything is drawn on a fixed-size canvas (WIN_W x WIN_H); present() scales it into the
+        # (resizable) window, and to_logical() / mouse() map the pointer back.
+        self.canvas = self.screen = pygame.Surface((WIN_W, WIN_H))
+        self.window = None
+        self.scale = 1.0
+        self.view = pygame.Rect(0, 0, WIN_W, WIN_H)         # where the canvas sits in the window
+        self.apply_scale(auto_scale() if scale is None else scale)
         self.font = pygame.font.SysFont(None, 28)
         self.font_big = pygame.font.SysFont(None, 38)
         self.font_small = pygame.font.SysFont(None, 20)
@@ -409,11 +524,10 @@ class App:
         self.searcher = searcher if advisor is not None else None   # mcts.Searcher or None
         self.use_search = self.searcher is not None
         self.search_job = None
-        np_rng = np.random.default_rng(rng.randrange(2 ** 32))
-        if advisor is not None:
-            self.default_ai = lambda game: advisor.choose(game, np_rng)
-        else:
-            self.default_ai = lambda game: rng.choice(game.legal_actions())
+        self.default_ai = self.make_default_ai()
+        self.base_think = self.searcher.think_ms if self.searcher is not None else 2500
+        self.base_sims = self.searcher.sims if self.searcher is not None else 600
+        self.think_ms = self.base_think   # the think-time slider (scales the search's simulation cap with it)
         self.stats_summary = stats.summary() if stats is not None else None
         self.confirm_reset_until = 0
         self.flipped = flipped        # board drawn from black's side
@@ -423,10 +537,58 @@ class App:
         self.variations = []
         self.tooltip = None           # (text, colour) for the hovered graph mark / eval chip, set while drawing
         self.load_index = -1          # which saved game the Load button opened last
+        self.coords = coords          # rank / file labels on the board edge (C)
+        self.sound_on = sound         # move sounds (U)
+        self.sounds = None            # built on first use (synth_sounds); {} = no audio
+        self.net_dirs = list(net_dirs)
+        self.picker = None            # the open network picker (N), see open_picker
+        self.premove = None           # (src, dst) queued while the computer thinks
+        self.pre_src = None           # the piece picked for a premove, waiting for its destination
+        self.menu_sel = None          # the menu option highlighted from the keyboard
+        self.dragging = None          # 'think' while the think-time slider is being dragged
         self.refresh_agents()
         self.new_game()
         if stats is not None and stats.error:
             self.message = stats.error
+
+    # -- the window: one logical canvas, scaled to whatever size the window has ----------
+    def apply_scale(self, factor):
+        """Open (or resize) the window at ``factor`` times the canvas size (1.0 = 1334 x 892)."""
+        factor = max(0.4, min(2.0, factor))
+        self.window = pygame.display.set_mode((int(WIN_W * factor), int(WIN_H * factor)), pygame.RESIZABLE)
+        self.fit_view()
+
+    def fit_view(self):
+        """Place the canvas in the window: as large as fits, centred, aspect ratio kept."""
+        ww, wh = self.window.get_size()
+        s = min(ww / float(WIN_W), wh / float(WIN_H))
+        w, h = max(1, int(WIN_W * s)), max(1, int(WIN_H * s))
+        self.view = pygame.Rect((ww - w) // 2, (wh - h) // 2, w, h)
+        self.scale = w / float(WIN_W)
+
+    def zoom(self, factor):
+        self.apply_scale(self.scale * factor)
+        self.message = "Window scale %d%%  (Ctrl +/- resize, Ctrl+0 fit the screen, Ctrl+1 100%%)." % round(100 * self.scale)
+
+    def present(self):
+        """Show the finished frame: the canvas, scaled into the window."""
+        self.window = pygame.display.get_surface()
+        self.fit_view()
+        if self.view.size != self.window.get_size():
+            self.window.fill((0, 0, 0))
+        if self.view.size == (WIN_W, WIN_H):
+            self.window.blit(self.canvas, self.view.topleft)
+        else:
+            self.window.blit(pygame.transform.smoothscale(self.canvas, self.view.size), self.view.topleft)
+        pygame.display.flip()
+
+    def to_logical(self, pos):
+        """A window pixel -> the canvas pixel under it (outside the canvas: outside 0..WIN_W/H)."""
+        return (int(math.floor((pos[0] - self.view.x) / self.scale)),
+                int(math.floor((pos[1] - self.view.y) / self.scale)))
+
+    def mouse(self):
+        return self.to_logical(pygame.mouse.get_pos())
 
     # -- who plays what --------------------------------------------------
     def agent_for(self, team):
@@ -446,6 +608,261 @@ class App:
     def human_colour(self):
         return other_team(next(iter(self.ai_sides)))
 
+    def make_default_ai(self):
+        """The computer's move function for the network now loaded (random moves with none)."""
+        advisor, rng = self.advisor, self.rng
+        if advisor is None:
+            return lambda game: rng.choice(game.legal_actions())
+        np_rng = np.random.default_rng(rng.randrange(2 ** 32))
+        return lambda game: advisor.choose(game, np_rng)
+
+    def set_advisor(self, advisor):
+        """Swap the network that plays, searches, evaluates and reviews."""
+        self.stop_search()
+        self.advisor = advisor
+        self.ai_note = ""
+        self.default_ai = self.make_default_ai()
+        if self.searcher is None:
+            self.searcher = mcts.Searcher(advisor, sims=self.sims_for(self.think_ms), think_ms=self.think_ms)
+            self.use_search = True
+        else:
+            self.searcher.advisor = advisor
+        self.hint = None
+        self.bar_pos = None
+        self.drop_review()                              # those ratings were the old network's
+        for line in self.variations:
+            line["review"] = None
+        if self.game.ply > 0 and not self.game.done:
+            self.stats_ok = False                       # the opponent changed part-way
+        elif self.game.ply == 0:
+            self.stats_ok = self.stats_eligible()
+        self.refresh_agents()
+        self.cancel()
+        self.clear_premove()
+        self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        self.message = "The AI is now %s." % advisor.name
+
+    # -- board coordinates, sound, think time ----------------------------------
+    def toggle_coords(self):
+        self.coords = not self.coords
+
+    def toggle_sound(self):
+        if self.sound_on:
+            self.sound_on = False
+            return
+        if self.sounds is None:
+            self.sounds = synth_sounds()
+        if not self.sounds:
+            self.message = "No audio output available, so no sound."
+            return
+        self.sound_on = True
+        self.sounds["move"].play()
+
+    def play_sound(self, action):
+        if not self.sound_on:
+            return
+        if self.sounds is None:
+            self.sounds = synth_sounds()
+        name = "end" if self.game.done else "gift" if action.gift else "move"
+        sound = self.sounds.get(name)
+        if sound is not None:
+            sound.play()
+
+    def sims_for(self, think_ms):
+        """The search's simulation cap that goes with ``think_ms`` (both grow together, so the slider
+        does something whether this machine is limited by time or by the cap)."""
+        return max(10, int(round(self.base_sims * think_ms / float(self.base_think))))
+
+    def set_think(self, ms):
+        self.think_ms = ms
+        if self.searcher is not None:
+            self.searcher.think_ms = ms
+            self.searcher.sims = self.sims_for(ms)
+
+    def think_enabled(self):
+        return self.searcher is not None and self.use_search
+
+    def think_track(self):
+        r = self.layout['m_think']
+        return pygame.Rect(r.x + 6, r.y + 20, r.w - 12, 8)
+
+    def think_frac(self):
+        lo, hi = THINK_STEPS[0], THINK_STEPS[-1]
+        ms = max(lo, min(hi, self.think_ms))
+        return (math.log(ms) - math.log(lo)) / (math.log(hi) - math.log(lo))
+
+    def set_think_from_x(self, x):
+        """Move the slider to the pixel ``x``: the nearest stop on a log scale."""
+        track = self.think_track()
+        frac = max(0.0, min(1.0, (x - track.x) / float(max(track.w, 1))))
+        lo, hi = THINK_STEPS[0], THINK_STEPS[-1]
+        target = math.log(lo) + frac * (math.log(hi) - math.log(lo))
+        self.set_think(min(THINK_STEPS, key=lambda step: abs(math.log(step) - target)))
+
+    def drag(self, pos):
+        if self.dragging == 'think':
+            self.set_think_from_x(pos[0])
+
+    # -- premove: queue a move while the computer thinks ---------------------
+    def premove_possible(self):
+        game = self.game
+        return (not game.done and not self.browsing and self.agents[game.turn] is not None
+                and self.agents[other_team(game.turn)] is None)
+
+    def clear_premove(self):
+        self.premove = self.pre_src = None
+
+    def right_click(self):
+        if self.premove is not None or self.pre_src is not None:
+            self.clear_premove()
+            self.message = "Premove cancelled."
+
+    def premove_click(self, pos):
+        """A click on the computer's turn: pick one of your pieces, then where it goes."""
+        x, y = pos
+        if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX) or not self.premove_possible():
+            return
+        mine = other_team(self.game.turn)
+        sq = self.xy_sq(x, y)
+        piece = self.game.board[sq]
+        own = piece is not None and piece.team == mine
+        if self.pre_src is None:
+            if own:
+                self.pre_src = sq
+                self.message = "Premove: now click where it goes (right-click cancels)."
+            else:
+                self.message = "It is the computer's turn.  Click one of your pieces to queue a premove."
+        elif sq == self.pre_src:
+            self.clear_premove()
+            self.message = ""
+        elif own:
+            self.pre_src = sq                           # picked another piece instead
+        else:
+            self.premove = (self.pre_src, sq)
+            self.pre_src = None
+            self.message = "Premove %s-%s queued; it is played if still legal (right-click cancels)." % (
+                sq_name(self.premove[0]), sq_name(sq))
+
+    def run_premove(self):
+        """It is the human's turn and a premove is waiting: play it, or say why not."""
+        src, dst = self.premove
+        self.clear_premove()
+        candidates = [a for a in self.by_src.get(src, []) if a.dst == dst]
+        if not candidates:
+            self.message = "Premove %s-%s is not legal now." % (sq_name(src), sq_name(dst))
+            return
+        self.selected = src
+        self.candidates = candidates
+        self.history = []
+        self.message = ""
+        self.resolve()                                  # a move that needs a decision opens its menu
+
+    # -- the network picker (N) ------------------------------------------------
+    def open_picker(self):
+        items = find_nets(self.net_dirs)
+        if not items:
+            self.message = ("No network files found (looked next to play.py, in runs/*/ and nets/, and in "
+                            "--net-dir folders).")
+            return
+        cur = os.path.realpath(self.advisor.path) if self.advisor is not None else None
+        sel = next((i for i, it in enumerate(items) if it["real"] == cur), 0)
+        self.picker = {"items": items, "sel": sel, "top": max(0, sel - PICK_ROWS // 2), "cur": cur}
+        self.picker_visible()
+
+    def close_picker(self):
+        self.picker = None
+
+    def picker_visible(self):
+        """Scroll the picker so the selected row shows."""
+        pk = self.picker
+        rows = min(PICK_ROWS, len(pk["items"]))
+        pk["top"] = max(0, min(pk["top"], len(pk["items"]) - rows))
+        if pk["sel"] < pk["top"]:
+            pk["top"] = pk["sel"]
+        elif pk["sel"] >= pk["top"] + rows:
+            pk["top"] = pk["sel"] - rows + 1
+
+    def picker_rects(self):
+        """(panel, one rect per visible row, X button) of the picker."""
+        n = min(PICK_ROWS, len(self.picker["items"]))
+        width, row = 700, 30
+        height = 62 + n * row + 30
+        panel = pygame.Rect((BOARD_PX - width) // 2, (BOARD_PX - height) // 2, width, height)
+        rows = [pygame.Rect(panel.x + 14, panel.y + 56 + i * row, width - 28, row - 2) for i in range(n)]
+        return panel, rows, pygame.Rect(panel.right - 46, panel.y + 10, 34, 34)
+
+    def picker_scroll(self, dy):
+        pk = self.picker
+        pk["top"] -= 3 * dy
+        pk["top"] = max(0, min(pk["top"], max(0, len(pk["items"]) - PICK_ROWS)))
+
+    def picker_key(self, key):
+        pk = self.picker
+        n = len(pk["items"])
+        if key == pygame.K_ESCAPE:
+            self.close_picker()
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.picker_choose(pk["sel"])
+        elif key in (pygame.K_UP, pygame.K_DOWN, pygame.K_PAGEUP, pygame.K_PAGEDOWN, pygame.K_HOME, pygame.K_END):
+            step = {pygame.K_UP: -1, pygame.K_DOWN: 1, pygame.K_PAGEUP: -PICK_ROWS, pygame.K_PAGEDOWN: PICK_ROWS}
+            pk["sel"] = (0 if key == pygame.K_HOME else n - 1 if key == pygame.K_END
+                         else max(0, min(n - 1, pk["sel"] + step[key])))
+            self.picker_visible()
+
+    def click_picker(self, pos):
+        panel, rows, x_rect = self.picker_rects()
+        if x_rect.collidepoint(pos) or not panel.collidepoint(pos):
+            self.close_picker()
+            return
+        for i, rect in enumerate(rows):
+            if rect.collidepoint(pos):
+                self.picker_choose(self.picker["top"] + i)
+                return
+
+    def picker_choose(self, index):
+        path = self.picker["items"][index]["path"]
+        self.close_picker()
+        try:
+            advisor = numpy_net.Advisor(path, self.advisor.max_plies if self.advisor is not None else 300)
+        except Exception as err:                        # a damaged file, a .pt without PyTorch, ...
+            self.message = "Could not load %s: %s" % (os.path.basename(path), err)
+            return
+        self.set_advisor(advisor)
+
+    # -- the move menu from the keyboard, and a preview of the highlighted option -----------
+    def menu_key(self, key):
+        """Keys while a move menu is open: 1-9 choose, Up / Down + Enter choose, Backspace goes back."""
+        dim, values = self.pending
+        digits = {pygame.K_1 + i: i for i in range(9)}
+        digits.update({pygame.K_KP1 + i: i for i in range(9)})
+        if key in digits:
+            if digits[key] < len(values):
+                self.choose(digits[key])
+        elif key in (pygame.K_UP, pygame.K_DOWN):
+            step = -1 if key == pygame.K_UP else 1
+            self.menu_sel = (len(values) - 1 if step < 0 else 0) if self.menu_sel is None \
+                else (self.menu_sel + step) % len(values)
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.choose(self.menu_sel if self.menu_sel is not None else 0)
+        elif key == pygame.K_BACKSPACE:
+            self.menu_back() if self.history else self.close_menu()
+
+    def menu_preview_action(self):
+        """The action the highlighted (hovered, or keyboard-selected) menu option would lead to, or None.
+        With a choice of variants it is the plainest one (no reverse en passant, no promotion)."""
+        if self.pending is None:
+            return None
+        dim, values = self.pending
+        _, rects, _, _ = menu_rects(len(values), bool(self.history))
+        mouse = self.mouse()
+        index = next((i for i, rect in enumerate(rects) if rect.collidepoint(mouse)), self.menu_sel)
+        if index is None or index >= len(values):
+            return None
+        pool = self.candidates if dim == 'confirm' else [a for a in self.candidates if getattr(a, dim) == values[index]]
+        if len({a.gift for a in pool}) != 1:          # which piece is given is not settled yet: nothing to show
+            return None
+        return min(pool, key=lambda a: (a.en_passant, a.promote is not None))
+
     # -- state -----------------------------------------------------------
     def new_game(self):
         self.game = Game(self.rules)
@@ -459,6 +876,7 @@ class App:
         self.recorded = False
         self.stats_ok = self.stats_eligible()
         self.bar_pos = None
+        self.clear_premove()
         self.stop_search()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
         self.line = []                # every action of the game, and the current position in it:
@@ -506,6 +924,7 @@ class App:
         self.selected = None
         self.candidates = []
         self.pending = None
+        self.menu_sel = None
         self.history = []
         self.message = ""
 
@@ -513,6 +932,7 @@ class App:
         """Close the move menu without playing; the piece stays selected."""
         self.candidates = []
         self.pending = None
+        self.menu_sel = None
         self.history = []
         self.message = ""
 
@@ -520,10 +940,14 @@ class App:
         """Undo the last answer in the menu (only offered when there is one)."""
         self.candidates = self.history.pop()
         self.pending = next_choice(self.candidates)
+        self.menu_sel = None
 
     def escape(self):
         if self.pending is not None:
             self.close_menu()
+        elif self.premove is not None or self.pre_src is not None:
+            self.clear_premove()
+            self.message = ""
         else:
             self.cancel()
 
@@ -535,6 +959,7 @@ class App:
             self.message = str(err)
         else:
             self.message = ""
+            self.play_sound(action)
             if self.pos < len(self.line) and self.line[self.pos] == action:
                 # the move that is already next in the line: nothing branches, nothing is lost
                 self.pos += 1
@@ -588,6 +1013,7 @@ class App:
             return
         self.stop_search()
         self.hint = None
+        self.clear_premove()
         old = self.game
         self.game = gamelog.replay(self.rules, self.line, n)
         old.close()
@@ -766,6 +1192,7 @@ class App:
         self.keep_line(list(self.line), fork, self.review)
         self.stop_search()
         self.hint = None
+        self.clear_premove()
         if self.reviewer is not None:
             self.reviewer.stop()
         self.reviewer = None
@@ -942,6 +1369,7 @@ class App:
             self.stats_ok = self.stats_eligible()
         self.refresh_agents()
         self.cancel()
+        self.clear_premove()
         self.hint = None
         self.stop_search()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
@@ -1055,7 +1483,9 @@ class App:
 
     def click_panel(self, pos):
         L = self.layout
-        if L['ai'].collidepoint(pos):
+        if L['net'].collidepoint(pos):
+            self.open_picker()
+        elif L['ai'].collidepoint(pos):
             self.toggle_ai()
         elif L['eval'].collidepoint(pos):
             self.toggle_eval()
@@ -1083,6 +1513,16 @@ class App:
             self.start_review()
         elif L['m_next'].collidepoint(pos):
             self.next_mistake()
+        elif L['m_sound'].collidepoint(pos):
+            self.toggle_sound()
+        elif L['m_coords'].collidepoint(pos):
+            self.toggle_coords()
+        elif L['m_think'].collidepoint(pos):
+            if self.think_enabled():
+                self.dragging = 'think'
+                self.set_think_from_x(pos[0])
+            else:
+                self.message = "The think-time slider needs the AI file and MCTS switched on (S)."
         elif L['m_list'].collidepoint(pos):
             row = self.moves_first_row() + (pos[1] - L['m_list'].y) // ROW_H
             if 0 <= row < len(self.line):
@@ -1101,7 +1541,12 @@ class App:
     def human_to_move(self):
         return not self.game.done and self.agents[self.game.turn] is None
 
-    def handle_click(self, pos):
+    def handle_click(self, pos, force_menu=False):
+        """A left click at canvas pixel ``pos``.  ``force_menu`` (Shift held): ask even about a move that
+        has only one variant, with a preview of it, before playing."""
+        if self.picker is not None:               # so is the network picker
+            self.click_picker(pos)
+            return
         if self.pending is not None:              # the menu is modal
             self.click_menu(pos)
             return
@@ -1109,6 +1554,7 @@ class App:
             self.click_panel(pos)
             return
         if not self.human_to_move():
+            self.premove_click(pos)               # the computer's turn: queue a move for afterwards
             return
         x, y = pos
         if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX):
@@ -1134,18 +1580,37 @@ class App:
         if sq in {a.dst for a in self.by_src.get(self.selected, [])}:
             self.candidates = [a for a in self.by_src[self.selected] if a.dst == sq]
             self.history = []
-            self.resolve()
+            self.resolve(force_menu)
         else:
             self.message = (game.explain_illegal(self.selected, sq)
                             or "That move is not available.")
 
-    def resolve(self):
-        """Play the move, or open a menu for the next undecided choice."""
+    def resolve(self, force_menu=False):
+        """Play the move, or open a menu for the next undecided choice.  A move with a single variant
+        is played at once (nothing to decide); ``force_menu`` shows it first, to confirm."""
         choice = next_choice(self.candidates)
-        if choice is None:
-            self.play(self.candidates[0])
-        else:
+        self.menu_sel = None
+        if choice is not None:
             self.pending = choice
+        elif force_menu and len(self.candidates) == 1:
+            self.pending = ('confirm', [True])
+        else:
+            self.play(self.candidates[0])
+
+    def choose(self, index):
+        """Answer the open menu with its ``index``-th option."""
+        dim, values = self.pending
+        self.menu_sel = None
+        if dim == 'confirm':
+            action = self.candidates[0]
+            self.pending = None
+            self.play(action)
+            return
+        value = values[index]
+        self.history.append(self.candidates)
+        self.candidates = [a for a in self.candidates if getattr(a, dim) == value]
+        self.pending = None
+        self.resolve()
 
     def click_menu(self, pos):
         dim, values = self.pending
@@ -1155,12 +1620,9 @@ class App:
         elif back_rect is not None and back_rect.collidepoint(pos):
             self.menu_back()
         else:
-            for value, rect in zip(values, rects):
+            for i, rect in enumerate(rects):
                 if rect.collidepoint(pos):
-                    self.history.append(self.candidates)
-                    self.candidates = [a for a in self.candidates if getattr(a, dim) == value]
-                    self.pending = None
-                    self.resolve()
+                    self.choose(i)
                     return
             if not panel.collidepoint(pos):   # a click away from the menu closes it
                 self.close_menu()
@@ -1171,6 +1633,9 @@ class App:
             return
         agent = self.agents[game.turn]
         if agent is None:                         # a human's turn: think ahead for the eval bar / hint
+            if self.premove is not None and not self.browsing and self.pending is None:
+                self.run_premove()
+                return
             if self.use_search and (self.show_eval or self.current_hint() is not None):
                 self.ensure_search(1800)
             return
@@ -1223,15 +1688,87 @@ class App:
     def draw(self):
         self.screen.fill(STATUS_BG)
         self.draw_board()
+        self.draw_coords()
         self.draw_hint_arrows()
         self.draw_review_arrows()
+        self.draw_premove()
         self.draw_eval_bar()
         self.draw_panel()
         self.draw_moves()
         self.draw_status()
         if self.pending is not None:
             self.draw_menu()
+            self.draw_menu_preview()
+        if self.picker is not None:
+            self.draw_picker()
         self.draw_tooltip()
+
+    def draw_coords(self):
+        """Rank numbers down the left edge and file letters along the bottom, whichever way the board is
+        turned: each label sits in its square's corner, in the other square colour."""
+        if not self.coords:
+            return
+        for i in range(SIZE):
+            r, c = self.xy_sq(2, i * SQ + 2)                  # screen row i, left-hand column
+            x, y = self.sq_xy(r, c)
+            label = self.font_small.render(str(SIZE - r), True, DARK if (r + c) % 2 == 0 else LIGHT)
+            self.screen.blit(label, (x + 4, y + 3))
+            r, c = self.xy_sq(i * SQ + 2, (SIZE - 1) * SQ + 2)  # screen column i, bottom row
+            x, y = self.sq_xy(r, c)
+            label = self.font_small.render("abcdefgh"[c], True, DARK if (r + c) % 2 == 0 else LIGHT)
+            self.screen.blit(label, (x + SQ - label.get_width() - 5, y + SQ - label.get_height() - 3))
+
+    def draw_premove(self):
+        """The queued premove as a blue arrow; while only its piece is picked, that square is ringed."""
+        if self.premove is None and self.pre_src is None:
+            return
+        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        if self.premove is not None:
+            src, dst = self.premove
+            draw_arrow(overlay, self.sq_centre(src), self.sq_centre(dst), PREMOVE_COLOUR, 12)
+        else:
+            x, y = self.sq_xy(*self.pre_src)
+            pygame.draw.rect(overlay, PREMOVE_COLOUR, (x, y, SQ, SQ), 6)
+        self.screen.blit(overlay, (0, 0))
+
+    def draw_menu_preview(self):
+        """While a move menu is open: the highlighted option's gift, ghosted on the board where it lands
+        (over the menu if need be), so the choice can be judged before it is made."""
+        action = self.menu_preview_action()
+        if action is None or action.gift is None:
+            return
+        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        self.draw_gift_ghost(overlay, action, HINT_COLOURS[0])
+        self.screen.blit(overlay, (0, 0))
+
+    def draw_picker(self):
+        pk = self.picker
+        veil = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 150))
+        self.screen.blit(veil, (0, 0))
+        panel, rows, x_rect = self.picker_rects()
+        pygame.draw.rect(self.screen, PANEL_BG, panel, border_radius=12)
+        self.text("Choose the AI's network", (panel.x + 20, panel.y + 14), self.font_big)
+        self.draw_button(x_rect, "X")
+        mouse = self.mouse()
+        for i, rect in enumerate(rows):
+            index = pk["top"] + i
+            item = pk["items"][index]
+            current = item["real"] == pk["cur"]
+            hot = rect.collidepoint(mouse) or index == pk["sel"]
+            pygame.draw.rect(self.screen, BUTTON_ON if current else BUTTON_HOVER if hot else BUTTON, rect, border_radius=6)
+            if hot and current:
+                pygame.draw.rect(self.screen, TEXT, rect, 1, border_radius=6)
+            name = ("v%d   " % item["version"] if item["version"] is not None else "") + item["rel"]
+            date = time.strftime("%Y-%m-%d", time.localtime(item["mtime"])) if item["mtime"] else ""
+            self.screen.set_clip(pygame.Rect(rect.x, rect.y, rect.w - 110, rect.h))
+            self.text(name + ("   (in use)" if current else ""), (rect.x + 10, rect.y + 6), self.font_btn)
+            self.screen.set_clip(None)
+            self.text(date, (rect.right - 100, rect.y + 7), self.font_small, MUTED)
+        n = len(pk["items"])
+        shown = len(rows)
+        self.text("%d-%d of %d   click or Enter loads it, Esc closes, wheel / arrows scroll"
+                  % (pk["top"] + 1, pk["top"] + shown, n), (panel.x + 20, panel.bottom - 24), self.font_small, MUTED)
 
     def draw_tooltip(self):
         """The text a hovered graph mark / move-list chip asked for while the frame was drawn."""
@@ -1240,7 +1777,7 @@ class App:
             return
         text, colour = tip
         surf = self.font_small.render(text, True, colour)
-        x, y = pygame.mouse.get_pos()
+        x, y = self.mouse()
         rect = surf.get_rect().inflate(14, 8)
         rect.topright = (x - 10, y + 14)            # left of the pointer: the graph is at the window's right edge
         rect.clamp_ip(self.screen.get_rect())
@@ -1369,7 +1906,7 @@ class App:
             bg, fg = BUTTON_OFF, MUTED
         elif on:
             bg, fg = BUTTON_ON, TEXT
-        elif rect.collidepoint(pygame.mouse.get_pos()):
+        elif rect.collidepoint(self.mouse()):
             bg, fg = BUTTON_HOVER, TEXT
         else:
             bg, fg = BUTTON, TEXT
@@ -1406,9 +1943,10 @@ class App:
         self.draw_controls()
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
-                  "H hint  E eval  A AI  S MCTS  R new"]
+                  "H hint  E eval  A AI  S MCTS  R new",
+                  "N network  C coords  U sound  Ctrl +/- size"]
         for i, line in enumerate(legend):
-            self.text(line, (x0, WIN_H - 8 - (len(legend) - i) * 21), self.font_small, MUTED)
+            self.text(line, (x0, WIN_H - 6 - (len(legend) - i) * 20), self.font_small, MUTED)
 
     def draw_controls(self):
         L = self.layout
@@ -1417,8 +1955,14 @@ class App:
             label = "AI: " + self.advisor.name
         else:
             label = self.ai_note or "No AI file found: the computer moves at random."
-        for i, line in enumerate(wrap(label, self.font_small, w)[:2]):
-            self.text(line, (x0, L['ai_label_y'] + i * 17), self.font_small, MUTED)
+        net = L['net']                                   # click: pick another network (N)
+        pygame.draw.rect(self.screen, BUTTON_HOVER if net.collidepoint(self.mouse()) else BUTTON, net, border_radius=6)
+        lines = wrap(label, self.font_small, net.w - 34)[:2]
+        top = net.y + (net.h - 17 * len(lines)) // 2
+        for i, line in enumerate(lines):
+            self.text(line, (net.x + 9, top + i * 17), self.font_small, TEXT)
+        pygame.draw.polygon(self.screen, MUTED, [(net.right - 22, net.centery - 3), (net.right - 10, net.centery - 3),
+                                                 (net.right - 16, net.centery + 4)])
         self.draw_button(L['ai'], "AI ON" if self.ai_on else "AI OFF", on=self.ai_on)
         self.draw_button(L['eval'], "Eval ON" if self.show_eval else "Eval OFF",
                          on=self.show_eval, enabled=self.advisor is not None)
@@ -1524,9 +2068,12 @@ class App:
                          enabled=self.advisor is not None and bool(self.line) and self.reviewer is None)
         has_marks = self.review is not None and any(self.review["marks"])
         self.draw_button(L['m_next'], "Next ?", enabled=has_marks)
-        self.text("<- -> step  Home/End", (x0, 144), self.font_small, MUTED)
+        self.draw_button(L['m_sound'], "Sound ON" if self.sound_on else "Sound OFF", on=self.sound_on)
+        self.draw_button(L['m_coords'], "Coords ON" if self.coords else "Coords OFF", on=self.coords)
+        self.draw_think()
+        self.text("<- -> step  Home/End", (x0, 212), self.font_small, MUTED)
         self.text("Tab: other line (%d)" % len(self.variations) if self.variations
-                  else "Z undo  F flip  M next ?", (x0, 161), self.font_small,
+                  else "Z undo  F flip  M next ?", (x0, 228), self.font_small,
                   TEXT if self.variations else MUTED)
         box = L['m_list']
         pygame.draw.rect(self.screen, (30, 30, 34), box, border_radius=4)
@@ -1554,6 +2101,23 @@ class App:
                                     self.review["values"][i + 1], i)
         self.draw_graph()
 
+    def draw_think(self):
+        """The AI think-time slider: how long (and, with it, how many simulations) the search may take."""
+        r = self.layout['m_think']
+        on = self.think_enabled()
+        colour = TEXT if on else MUTED
+        self.text("AI thinks: " + (think_label(self.think_ms) if on else "(needs MCTS)"), (r.x, r.y), self.font_small, colour)
+        track = self.think_track()
+        pygame.draw.rect(self.screen, (22, 22, 26), track, border_radius=4)
+        x = track.x + int(round(self.think_frac() * track.w))
+        if on:
+            pygame.draw.rect(self.screen, BUTTON_ON, (track.x, track.y, x - track.x, track.h), border_radius=4)
+        for step in THINK_STEPS:                                  # a tick at every stop
+            tx = track.x + int(round((math.log(step) - math.log(THINK_STEPS[0])) /
+                                     (math.log(THINK_STEPS[-1]) - math.log(THINK_STEPS[0])) * track.w))
+            pygame.draw.line(self.screen, (110, 110, 118), (tx, track.bottom), (tx, track.bottom + 3), 1)
+        pygame.draw.circle(self.screen, (235, 235, 235) if on else (100, 100, 106), (x, track.centery), 7)
+
     def draw_eval_chip(self, rect, white_value, i):
         """A tiny eval bar for the move list: the white part is white's share, centre line = even."""
         frac = (max(-1.0, min(1.0, white_value)) + 1.0) / 2.0
@@ -1561,7 +2125,7 @@ class App:
         pygame.draw.rect(self.screen, (225, 225, 225), (rect.x, rect.y, int(round(rect.w * frac)), rect.h))
         pygame.draw.line(self.screen, (230, 110, 40), (rect.centerx, rect.y), (rect.centerx, rect.bottom - 1), 1)
         pygame.draw.rect(self.screen, (110, 110, 116), rect, 1)
-        if rect.inflate(0, 8).collidepoint(pygame.mouse.get_pos()):
+        if rect.inflate(0, 8).collidepoint(self.mouse()):
             who = "white ahead" if white_value > 0.05 else "black ahead" if white_value < -0.05 else "about even"
             self.tooltip = ("After move %d: %+.2f (%s)" % (i + 1, white_value, who), TEXT)
 
@@ -1583,7 +2147,7 @@ class App:
         if len(values) >= 2:
             pygame.draw.lines(self.screen, (120, 190, 235), False,
                               [(xs(i), ys(v)) for i, v in enumerate(values)], 2)
-        hover = self.graph_mark_at(pygame.mouse.get_pos())
+        hover = self.graph_mark_at(self.mouse())
         for i, mark in enumerate(self.review["marks"]):
             if mark:
                 centre = (int(xs(i + 1)), int(ys(values[i + 1])))
@@ -1630,6 +2194,10 @@ class App:
                      if last is not None and last.extra_turn and last.team == game.turn else "")
             if kind == "computer" and self.searching():
                 extra += " - thinking (%d sims)" % self.search_for_here().sims
+            if self.premove is not None:
+                extra += " - premove %s-%s queued" % (sq_name(self.premove[0]), sq_name(self.premove[1]))
+            elif self.pre_src is not None:
+                extra += " - premove: click where %s goes" % sq_name(self.pre_src)
             line = "%s to move (%s)%s" % (name, kind, extra)
         lines = wrap(line, self.font_status, PANEL_X - 28)
         if len(lines) > 3:
@@ -1654,17 +2222,23 @@ class App:
                      else "Which piece do you give back?"),
             'en_passant': "Where does the gifted pawn go?",
             'promote': "Promote the gifted pawn?",
+            'confirm': "Play this move?",
         }
         self.text(titles[dim], (panel.x + 20, panel.y + 18), self.font_big)
+        self.text("click, or keys 1-9 / Up Down + Enter;  Backspace back", (panel.x + 20, panel.y + 54),
+                  self.font_small, MUTED)
         self.draw_button(x_rect, "X")
         if back_rect is not None:
             self.draw_button(back_rect, "< Back")
-        mouse = pygame.mouse.get_pos()
-        for value, rect in zip(values, rects):
-            pygame.draw.rect(self.screen, (84, 84, 96) if rect.collidepoint(mouse)
+        mouse = self.mouse()
+        for i, (value, rect) in enumerate(zip(values, rects)):
+            pygame.draw.rect(self.screen, (84, 84, 96) if rect.collidepoint(mouse) or i == self.menu_sel
                              else (58, 58, 66), rect, border_radius=8)
+            self.text(str(i + 1), (rect.x + 3, rect.y + 2), self.font_small, MUTED)
             team, ptype, label = mover.team, mover.ptype, ""
-            if dim == 'demote':
+            if dim == 'confirm':
+                label = describe(game, self.candidates[0])
+            elif dim == 'demote':
                 label = ("Un-promote: step off as a pawn" if value
                          else "Keep going as a %s" % NAMES[mover.ptype])
                 ptype = 'p' if value else mover.ptype
@@ -1682,7 +2256,8 @@ class App:
                 team, ptype = recv, value or 'p'
             if not (dim == 'gift' and value is None):
                 self.screen.blit(self.sprite(team, ptype, 56), (rect.x + 8, rect.y + 7))
-            self.text(label, (rect.x + 76, rect.y + 24), self.font)
+            font = self.font if self.font.size(label)[0] <= rect.w - 90 else self.font_small
+            self.text(label, (rect.x + 76, rect.y + 24 if font is self.font else rect.y + 27), font)
 
 
 def menu_rects(n, with_back=False):
@@ -1774,6 +2349,14 @@ def main():
     ap.add_argument("--no-resume", action="store_true",
                     help="do not reopen the unfinished game of the last session, and do not keep this "
                          "one on disk after every move")
+    ap.add_argument("--scale", type=float, default=None, metavar="F",
+                    help="window size as a multiple of 1334 x 892 (default: whatever fits the screen, at most 1; "
+                         "Ctrl +/- change it, and the window can be dragged to any size)")
+    ap.add_argument("--no-sound", action="store_true", help="start with the move sounds off (U toggles)")
+    ap.add_argument("--no-coords", action="store_true", help="start without rank / file labels on the board (C toggles)")
+    ap.add_argument("--net-dir", action="append", default=[], metavar="DIR",
+                    help="another folder of network files for the picker (N); may be repeated.  The picker also "
+                         "lists *.npz / *.pt next to play.py, in runs/*/ and in nets/")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
     ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
     ap.add_argument("--flip", action="store_true", help="draw the board from black's side")
@@ -1821,7 +2404,8 @@ def main():
     searcher = mcts.Searcher(advisor, sims=args.sims, think_ms=args.think_ms) if advisor else None
     app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
               searcher, flipped=args.flip, autosave=args.autosave,
-              review_sims=args.review_sims, session=not args.no_resume)
+              review_sims=args.review_sims, session=not args.no_resume, scale=args.scale,
+              sound=not args.no_sound, coords=not args.no_coords, net_dirs=args.net_dir)
     if args.no_search:
         app.use_search = False
     if args.load:
@@ -1837,7 +2421,9 @@ def main():
                 running = False
             elif event.type == pygame.KEYDOWN:
                 ctrl = bool(event.mod & pygame.KMOD_CTRL)
-                if event.key == pygame.K_ESCAPE:
+                if app.picker is not None:
+                    app.picker_key(event.key)
+                elif event.key == pygame.K_ESCAPE:
                     app.escape()
                 elif ctrl and event.key == pygame.K_s and app.pending is None:
                     app.save()
@@ -1854,6 +2440,14 @@ def main():
                         app.copy_json() if event.mod & pygame.KMOD_SHIFT else app.copy_moves()
                     elif ctrl and event.key == pygame.K_v:
                         app.paste()
+                    elif ctrl and event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+                        app.zoom(1.1)
+                    elif ctrl and event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+                        app.zoom(1 / 1.1)
+                    elif ctrl and event.key in (pygame.K_0, pygame.K_KP0):
+                        app.apply_scale(auto_scale())
+                    elif ctrl and event.key in (pygame.K_1, pygame.K_KP1):
+                        app.apply_scale(1.0)
                     elif event.key == pygame.K_TAB:
                         app.swap_variation(-1 if event.mod & pygame.KMOD_SHIFT else 1)
                     elif event.key == pygame.K_LEFT:
@@ -1868,6 +2462,12 @@ def main():
                         app.takeback()
                     elif event.key == pygame.K_f:
                         app.flip()
+                    elif event.key == pygame.K_c and not ctrl:
+                        app.toggle_coords()
+                    elif event.key == pygame.K_n and not ctrl:
+                        app.open_picker()
+                    elif event.key == pygame.K_u and not ctrl:
+                        app.toggle_sound()
                     elif event.key == pygame.K_m:
                         app.next_mistake(-1 if event.mod & pygame.KMOD_SHIFT else 1)
                     elif event.key == pygame.K_v:
@@ -1884,19 +2484,30 @@ def main():
                         app.toggle_ai()
                     elif event.key == pygame.K_s:
                         app.toggle_search()
+                else:                                  # a move menu is open: keys choose from it
+                    app.menu_key(event.key)
             elif event.type == pygame.DROPFILE and app.pending is None:
                 app.drop_file(event.file)
             elif event.type == pygame.DROPTEXT and app.pending is None:
                 app.paste_text(event.text)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-                app.handle_click(event.pos)
+                # (Shift held: a move with one variant still shows its menu, to confirm)
+                app.handle_click(app.to_logical(event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
+            elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+                app.right_click()
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                app.dragging = None
+            elif event.type == pygame.MOUSEMOTION and app.dragging:
+                app.drag(app.to_logical(event.pos))
             elif event.type == pygame.MOUSEWHEEL:
-                if app.layout['m_list'].collidepoint(pygame.mouse.get_pos()):
+                if app.picker is not None:
+                    app.picker_scroll(event.y)
+                elif app.layout['m_list'].collidepoint(app.mouse()):
                     app.scroll_moves(event.y)
         app.poll_review()
         app.update_ai()
         app.draw()
-        pygame.display.flip()
+        app.present()
         clock.tick(30)
     pygame.quit()
 
