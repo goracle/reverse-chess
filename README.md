@@ -68,7 +68,8 @@ The rules are simple...ish.
 
 * **Step / jump:** Left / Right, Home / End, or click a move.  Mouse wheel scrolls the list.
 * **Undo:** `Z` / Backspace takes back your move (and the computer's reply).  Right / End bring it back;
-  playing a different move replaces the old line.  A game with a take-back is not counted in your record.
+  playing a different move starts another line and the old one is kept as a variation (see below).
+  A game with a take-back is not counted in your record.
 * **Flip board:** `F` (or `--flip`).
 * **Save / load:** `Ctrl+S` / `Ctrl+O` (or the buttons); `--load FILE`; `--autosave` saves every finished game.
   Files are small JSON in your user data folder (`ReverseChess/games/`).
@@ -78,10 +79,23 @@ The rules are simple...ish.
   from your own games, nothing to author.  `python review.py [game.json]` prints the same in the terminal.
   The gift a move gives is drawn as a translucent piece on the square it lands on (hints too).
   `Shift+M` / `Ctrl+Left` jump to the previous marked move, `Ctrl+Right` to the next; `P` plays the
-  network's move instead of the one played there (the rest of the old line is dropped).  Under the
+  network's move instead of the one played there (the old line is kept, see Variations).  Under the
   graph: each side's average loss per move and how many `?!` / `?` / `??` it made.
+  With `--review-sims N` (default 30; `review.py --sims N` likewise) every position is searched, so a move
+  is only marked when the *search* sees the value drop; `0` is the bare network.  At a marked position the
+  panel lists the top three moves with their share (search visits, or network probability) and value.  Each
+  move-list row has a small eval bar (white's share after the move; hover for the number); hover a dot on
+  the graph for the loss, click it to jump to the position before that move.
+* **Variations:** a different move from an earlier position keeps the line it cut off, with its review.
+  `Tab` swaps to the most recent one (`Shift+Tab`: the oldest), showing where the lines part; the line you
+  leave is kept, so `Tab` again comes back.  Up to 12 are kept per game.  Playing the move that was already
+  next in the line just steps forward.
 * **Copy:** `Ctrl+C` puts the whole move list on the clipboard (one move per line), `Ctrl+Shift+C` the game as
   JSON (what Save writes).  Uses pygame's clipboard, then `wl-copy` / `xclip` / `xsel` if that fails.
+* **Paste / drop:** `Ctrl+V` opens a game from the clipboard (that JSON, or a move list as copied), and a `.json`
+  game file dropped on the window opens it (`wl-paste` / `xclip` / `xsel` as fallbacks).
+* **Resume:** the game in progress is written to `ReverseChess/autosave.json` after every move (side lines
+  included) and reopened at the next start if it was not over.  `R` discards it; `--no-resume` turns it off.
 
 ## Playing against the AI
 

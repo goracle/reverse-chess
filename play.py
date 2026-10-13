@@ -73,7 +73,20 @@ Game history (the third column)
   (white up); click it to jump; under it, each side's average loss per move and its mark counts.
   ``python review.py`` prints the same.
 * Copy (Ctrl+C) puts the whole move list on the clipboard, one move per line; Ctrl+Shift+C the game
-  as JSON (what Save writes).
+  as JSON (what Save writes).  Paste (Ctrl+V) opens either of those from the clipboard, and a
+  ``.json`` game file dropped onto the window opens too.
+* Variations: a different move from an earlier position (or P, the network's move) no longer throws
+  the old line away: it is kept, with its review, and Tab swaps to it (Shift+Tab: the oldest kept
+  line).  The board shows where the two lines part; the current line is kept in its place, so Tab
+  again comes back.  Up to 12 lines are kept for the game.
+* Review details: with ``--review-sims N`` (default 30) every position is searched, so a move is only
+  marked when the search sees the value drop (``--review-sims 0``: the bare network).  At a marked
+  position the panel lists the top three moves there with their share and value, and the move that
+  was played.  Every move-list row has a small eval bar (white's share after that move; hover for the
+  number); hover a dot on the graph for the loss, click it to jump to the position before that move.
+* Resume: the game in progress is written to your user data folder (autosave.json, next to the saved
+  games) after every move, side lines included, and reopened the next time you start play.py
+  if it was not over.  R (new game) discards it; ``--no-resume`` turns all of this off.
 
 Custom agents
 -------------
@@ -117,6 +130,8 @@ PANEL_W = 280
 MOVES_X = PANEL_X + PANEL_W
 MOVES_W = 220                    # the move list / game history column
 ROW_H = 20
+EVAL_COL_W = 34                  # the little eval bar at the right of each move-list row
+MAX_VARIATIONS = 12              # side lines kept by the variation stack (Tab)
 STATUS_H = 92
 WIN_W = MOVES_X + MOVES_W
 WIN_H = BOARD_PX + STATUS_H
@@ -250,6 +265,42 @@ def clipboard_put(text):
     raise RuntimeError("no working clipboard (%s)" % "; ".join(reasons))
 
 
+def clipboard_get():
+    """The text on the system clipboard.  Tries pygame's clipboard, then the usual command line
+    tools; raises RuntimeError (with every reason) if there is nothing to read."""
+    reasons = []
+    try:
+        import pygame.scrap
+        if not pygame.scrap.get_init():
+            pygame.scrap.init()
+        if hasattr(pygame.scrap, "get_text"):
+            text = pygame.scrap.get_text()
+        else:
+            raw = pygame.scrap.get(pygame.SCRAP_TEXT)
+            text = raw.decode("utf-8", "replace") if raw else ""
+        text = (text or "").replace("\x00", "")
+        if text.strip():
+            return text
+        reasons.append("pygame.scrap: empty")
+    except Exception as err:          # pygame.error, NotImplementedError, ... -- reported below if all fail
+        reasons.append("pygame.scrap: %s" % err)
+    for cmd in (["wl-paste", "--no-newline"], ["xclip", "-selection", "clipboard", "-o"],
+                ["xsel", "--clipboard", "--output"], ["pbpaste"],
+                ["powershell", "-command", "Get-Clipboard"]):
+        if shutil.which(cmd[0]) is None:
+            continue
+        try:
+            out = subprocess.run(cmd, check=True, timeout=5, capture_output=True).stdout
+        except (OSError, subprocess.SubprocessError) as err:
+            reasons.append("%s: %s" % (cmd[0], err))
+            continue
+        text = out.decode("utf-8", "replace")
+        if text.strip():
+            return text
+        reasons.append("%s: empty" % cmd[0])
+    raise RuntimeError("nothing to paste (%s)" % "; ".join(reasons))
+
+
 def describe(game, action):
     """One line for an action: 'rook a3-a1, give back a knight'."""
     piece = game.board[action.src]
@@ -333,7 +384,8 @@ def app_dir():
 
 class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
-                 stats, show_eval, searcher=None, flipped=False, autosave=False):
+                 stats, show_eval, searcher=None, flipped=False, autosave=False,
+                 review_sims=0, session=False):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         self.screen = pygame.display.set_mode((WIN_W, WIN_H))
@@ -365,7 +417,11 @@ class App:
         self.stats_summary = stats.summary() if stats is not None else None
         self.confirm_reset_until = 0
         self.flipped = flipped        # board drawn from black's side
-        self.autosave = autosave
+        self.autosave = autosave      # save every finished game (--autosave)
+        self.review_sims = review_sims  # search simulations per position in the review (0: network only)
+        self.session = session        # keep the game in progress on disk after every move (resume)
+        self.variations = []
+        self.tooltip = None           # (text, colour) for the hovered graph mark / eval chip, set while drawing
         self.load_index = -1          # which saved game the Load button opened last
         self.refresh_agents()
         self.new_game()
@@ -410,11 +466,13 @@ class App:
         self.turns = []
         self.pos = 0                  # pos < len(line) = looking at an earlier position
         self.moves_top = None         # first visible row of the move list (None = follow the game)
+        self.variations = []          # lines cut off by a different move, newest first (see stash_line)
         self.drop_review()
         self.reindex()
 
     def restart(self):
         """Start a new game; one abandoned part-way is noted in the record."""
+        self.clear_session()
         if self.stats_ok and not self.recorded and not self.game.done and self.game.ply > 0:
             self.stats.add(self.human_colour(), "abandoned", self.game.ply, self.hint_used,
                            self.advisor.version)
@@ -477,7 +535,16 @@ class App:
             self.message = str(err)
         else:
             self.message = ""
+            if self.pos < len(self.line) and self.line[self.pos] == action:
+                # the move that is already next in the line: nothing branches, nothing is lost
+                self.pos += 1
+                self.moves_top = None
+                self.cancel_keep_message()
+                self.reindex()
+                self.ai_due = pygame.time.get_ticks() + self.delay_ms
+                return
             if self.pos < len(self.line):      # a different move from an earlier position
+                self.stash_line(self.pos)      # the old line is kept (Tab brings it back)
                 self.truncate(self.pos)
                 self.stats_ok = False          # took a move back: not a clean game against the AI
             self.line.append(action)
@@ -488,6 +555,7 @@ class App:
         self.cancel_keep_message()
         self.reindex()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        self.save_session()
         if self.game.done:
             self.record_finished()
             if self.autosave:
@@ -505,8 +573,9 @@ class App:
         del self.line[n:], self.texts[n:], self.turns[n:]
         rev = self.review
         if rev is not None:
-            for key in ("best", "loss", "marks"):
-                rev[key] = rev[key][:n]
+            for key in ("best", "loss", "marks", "top"):
+                if key in rev:
+                    rev[key] = rev[key][:n]
             rev["values"] = rev["values"][:n + 1]
         elif self.reviewer is not None:
             self.reviewer.stop()
@@ -545,7 +614,7 @@ class App:
                 target = n
                 break
         self.jump(target)
-        self.message = "Taken back; Right / End bring the moves back, a new move replaces them."
+        self.message = "Taken back; Right / End bring the moves back, a new move starts another line (Tab)."
 
     def flip(self):
         self.flipped = not self.flipped
@@ -581,27 +650,140 @@ class App:
             where = ""
         try:
             rules, actions, meta = gamelog.load_game(path)
-            texts = gamelog.notation_list(rules, actions)
         except (OSError, ValueError, KeyError, IllegalActionError) as err:
             self.message = "Could not load %s: %s" % (os.path.basename(path), err)
             return
+        self.open_game(rules, actions, "Loaded %s%s" % (os.path.basename(path), where))
+
+    def open_game(self, rules, actions, message, review=True, variations=None):
+        """Make ``actions`` (a legal line under ``rules``) the game on the board, at its end."""
+        texts, turns = gamelog.notation_and_turns(rules, actions)
         self.rules = rules
         self.new_game()
         self.stats_ok = False                       # not a game played against the AI just now
-        self.line, self.texts = list(actions), texts
-        game = Game(rules)                          # who played each move
-        for action in actions:
-            self.turns.append(game.turn)
-            game.step(action)
-        game.close()
+        self.line, self.texts, self.turns = list(actions), texts, turns
         self.game.close()
         self.game = gamelog.replay(rules, actions)
         self.pos = len(actions)
         self.recorded = True
+        self.variations = [dict(v, review=None) for v in (variations or [])][:MAX_VARIATIONS]
         self.reindex()
-        self.message = "Loaded %s%s" % (os.path.basename(path), where)
-        if self.advisor is not None and actions:
+        self.message = message
+        self.save_session()
+        if review and self.advisor is not None and actions:
             self.start_review()
+
+    def paste_text(self, text):
+        """Open a game from text: the JSON that Ctrl+Shift+C copies, or a move list as Ctrl+C copies it."""
+        text = text.strip()
+        if not text:
+            self.message = "The clipboard is empty."
+            return
+        try:
+            if text.startswith("{"):
+                rules, actions, _ = gamelog.loads_game(text)
+            else:
+                rules, actions = self.rules, gamelog.parse_move_list(self.rules, text)
+        except (ValueError, KeyError, IllegalActionError) as err:
+            self.message = "Could not paste a game: %s" % err
+            return
+        self.open_game(rules, actions, "Pasted a game of %d moves." % len(actions))
+
+    def paste(self):
+        try:
+            text = clipboard_get()
+        except RuntimeError as err:
+            self.message = "Could not paste: %s" % err
+            return
+        self.paste_text(text)
+
+    def drop_file(self, path):
+        """A file dropped on the window."""
+        if path.lower().endswith(".json"):
+            self.load(path)
+        else:
+            self.message = "Drop a saved game (.json) here, or paste one with Ctrl+V."
+
+    # -- the session: resume after a crash or a closed window -----------------
+    def save_session(self):
+        """Write the game in progress (and its side lines) to disk; called after every move."""
+        if not self.session or not self.line:
+            return
+        try:
+            gamelog.write_autosave(self.rules, self.line, self.texts, self.variations, self.game_meta())
+        except OSError:
+            pass                                    # never interrupt a game over a full disk
+
+    def clear_session(self):
+        if self.session:
+            gamelog.clear_autosave()
+
+    def resume(self):
+        """Reopen the game the last session left unfinished.  True if there was one."""
+        try:
+            got = gamelog.read_autosave()
+        except (OSError, ValueError, IllegalActionError) as err:
+            self.message = "Could not resume the last game: %s" % err
+            return False
+        if got is None:
+            return False
+        rules, actions, _, variations = got
+        if rules != self.rules or not actions:
+            return False                            # other rules this time: start fresh
+        game = gamelog.replay(rules, actions)
+        over = game.done
+        game.close()
+        if over:
+            return False
+        self.open_game(rules, actions, "Resumed the unfinished game from last time (%d moves).  "
+                       "R starts a new one." % len(actions), review=False, variations=variations)
+        return True
+
+    # -- variations: lines cut off by a different move are kept ---------------
+    def stash_line(self, branch):
+        """Keep the current line, which a different move at ``branch`` is about to cut off."""
+        if len(self.line) <= branch:
+            return
+        self.keep_line(list(self.line), branch, dict(self.review) if self.review is not None else None)
+
+    def keep_line(self, line, branch, review):
+        self.variations = [v for v in self.variations if v["line"] != line]
+        self.variations.insert(0, {"line": line, "branch": branch, "review": review})
+        del self.variations[MAX_VARIATIONS:]
+
+    def swap_variation(self, step=1):
+        """Tab: trade the current line for the most recently kept one (Shift+Tab: the oldest).  The
+        current line is kept in its place, so Tab again comes back; the board shows the position
+        where the two lines part."""
+        if not self.variations:
+            self.message = ("No other line yet: play a different move from an earlier position "
+                            "and the old line is kept here.")
+            return
+        v = self.variations.pop(0 if step > 0 else -1)
+        fork = 0
+        while fork < min(len(self.line), len(v["line"])) and self.line[fork] == v["line"][fork]:
+            fork += 1
+        self.keep_line(list(self.line), fork, self.review)
+        self.stop_search()
+        self.hint = None
+        if self.reviewer is not None:
+            self.reviewer.stop()
+        self.reviewer = None
+        self.line = list(v["line"])
+        self.texts, self.turns = gamelog.notation_and_turns(self.rules, self.line)
+        self.review = v.get("review")
+        old = self.game
+        self.game = gamelog.replay(self.rules, self.line, fork)
+        old.close()
+        self.pos = fork
+        self.stats_ok = False
+        self.moves_top = None
+        self.cancel()
+        self.reindex()
+        self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        self.save_session()
+        self.message = ("Switched to the other line, which parts from the old one at move %d.  "
+                        "Tab swaps back; %d line(s) kept." % (fork + 1, len(self.variations)))
 
     def drop_review(self):
         if getattr(self, "reviewer", None) is not None:
@@ -616,7 +798,7 @@ class App:
             self.message = "Nothing to review yet."
         elif self.reviewer is None:
             self.review = None
-            self.reviewer = reviewlib.Reviewer(self.advisor, self.rules, self.line)
+            self.reviewer = reviewlib.Reviewer(self.advisor, self.rules, self.line, self.review_sims)
 
     def poll_review(self):
         rv = self.reviewer
@@ -642,8 +824,8 @@ class App:
         self.message = "No more marked moves that way."
 
     def play_network_move(self):
-        """At a reviewed position: replace the move that was played there by the network's choice and
-        play on from there (the rest of the old line is dropped, as with any new move)."""
+        """At a reviewed position: play the network's choice instead of the move that was played there.
+        The old line is kept as a variation (Tab swaps back to it), as with any new move."""
         if self.review is None:
             self.message = "Press Review first (it runs by itself when a game ends)."
             return
@@ -656,7 +838,7 @@ class App:
             return
         self.play(best)
         if not self.message:
-            self.message = "Played the network's move; the rest of the old line is gone."
+            self.message = "Played the network's move; the old line is kept (Tab swaps back to it)."
 
     def copy_moves(self):
         """Copy the whole move list (not just up to the position shown) to the clipboard."""
@@ -681,6 +863,53 @@ class App:
             self.message = "Could not copy: %s" % err
             return
         self.message = "Copied the game (JSON, %d moves) to the clipboard." % len(self.line)
+
+    def mark_text(self, i):
+        """'Move 12 (Rg7-g8, black) is a blunder: lost 0.41.' for the marked move i."""
+        mark = self.review_mark(i)
+        name = {"??": "a blunder", "?": "a mistake", "?!": "an inaccuracy"}.get(mark, "fine")
+        return "Move %d (%s, %s) is %s: lost %.2f." % (
+            i + 1, self.texts[i], full_name(self.turns[i]), name, self.review["loss"][i])
+
+    def graph_x(self, i):
+        g = self.layout['m_graph']
+        n = max(len(self.review["values"]) - 1, 1)
+        return g.x + (g.w - 1) * i / n
+
+    def graph_mark_at(self, pos, reach=4):
+        """Index of the marked move whose dot is within ``reach`` pixels (sideways) of ``pos``, or None.
+        The graph is narrow and a game long, so the nearest dot wins (a bigger loss on a tie)."""
+        if self.review is None or not self.layout['m_graph'].collidepoint(pos):
+            return None
+        best = None
+        for i, mark in enumerate(self.review["marks"]):
+            if not mark or i >= len(self.texts):
+                continue
+            key = (abs(self.graph_x(i + 1) - pos[0]), -self.review["loss"][i])
+            if key[0] <= reach and (best is None or key < best[0]):
+                best = (key, i)
+        return None if best is None else best[1]
+
+    def review_alts(self):
+        """At a position just before a marked move: the panel's lines for the top three moves there
+        (share of the search's visits or the network's probability, and the value after each for the
+        side to move) and for the move that was played, or None."""
+        rev, n = self.review, self.pos
+        if rev is None or not self.browsing or not self.review_mark(n) or n >= len(rev.get("top", [])):
+            return None
+        game, sims = self.game, rev.get("sims", 0)
+        rows = []
+        for rank, (action, share, value) in enumerate(rev["top"][n][:3]):
+            text = "%d. %s  %d%%" % (rank + 1, gamelog.move_text(game, action), round(100 * share))
+            if value is not None:
+                text += "  %+.2f" % value
+            if action == self.line[n]:
+                text += "  (played)"
+            rows.append(text)
+        mover_value = rev["values"][n + 1] if self.turns[n] == "w" else -rev["values"][n + 1]
+        source = "search, %d sims; %% = visits" % sims if sims else "network; % = policy"
+        return {"header": "Top moves here (%s):" % source, "rows": rows,
+                "played": "Played: %s  %+.2f" % (self.texts[n], mover_value)}
 
     def review_mark(self, i):
         """The review's mark for move ``i`` of the line ('' if none or not reviewed yet)."""
@@ -859,6 +1088,11 @@ class App:
             if 0 <= row < len(self.line):
                 self.jump(row + 1)                 # the position after that move
         elif L['m_graph'].collidepoint(pos) and self.review is not None:
+            i = self.graph_mark_at(pos)
+            if i is not None:                      # a marked move: the position before it, with its details
+                self.jump(i)
+                self.message = self.mark_text(i)
+                return
             n = len(self.review["values"]) - 1
             frac = (pos[0] - L['m_graph'].x) / max(L['m_graph'].w - 1, 1)
             self.jump(int(round(frac * n)))
@@ -997,6 +1231,22 @@ class App:
         self.draw_status()
         if self.pending is not None:
             self.draw_menu()
+        self.draw_tooltip()
+
+    def draw_tooltip(self):
+        """The text a hovered graph mark / move-list chip asked for while the frame was drawn."""
+        tip, self.tooltip = self.tooltip, None
+        if tip is None or self.pending is not None:
+            return
+        text, colour = tip
+        surf = self.font_small.render(text, True, colour)
+        x, y = pygame.mouse.get_pos()
+        rect = surf.get_rect().inflate(14, 8)
+        rect.topright = (x - 10, y + 14)            # left of the pointer: the graph is at the window's right edge
+        rect.clamp_ip(self.screen.get_rect())
+        pygame.draw.rect(self.screen, (16, 16, 20), rect, border_radius=5)
+        pygame.draw.rect(self.screen, (120, 120, 128), rect, 1, border_radius=5)
+        self.screen.blit(surf, (rect.x + 7, rect.y + 4))
 
     def draw_board(self):
         game = self.game
@@ -1196,6 +1446,15 @@ class App:
                 how = "forced win"
             self.text("Eval %+.2f  (%s, %s)" % (vw, who, how), (x0, L['eval_text_y']),
                       self.font_small, TEXT)
+        alts = self.review_alts() if hint is None else None
+        if alts is not None:
+            y = L['hint_y']
+            self.text(alts["header"], (x0, y), self.font_small, MUTED)
+            y += 18
+            for rank, line in enumerate(alts["rows"]):
+                self.text(line, (x0, y), self.font_small, HINT_TEXT[rank])
+                y += 17
+            self.text(alts["played"], (x0, y + 3), self.font_small, REVIEW_PLAYED[:3])
         if hint is not None:
             y = L['hint_y']
             for rank, (action, p) in enumerate(hint["top"]):
@@ -1266,7 +1525,9 @@ class App:
         has_marks = self.review is not None and any(self.review["marks"])
         self.draw_button(L['m_next'], "Next ?", enabled=has_marks)
         self.text("<- -> step  Home/End", (x0, 144), self.font_small, MUTED)
-        self.text("Z undo  F flip  M next ?", (x0, 161), self.font_small, MUTED)
+        self.text("Tab: other line (%d)" % len(self.variations) if self.variations
+                  else "Z undo  F flip  M next ?", (x0, 161), self.font_small,
+                  TEXT if self.variations else MUTED)
         box = L['m_list']
         pygame.draw.rect(self.screen, (30, 30, 34), box, border_radius=4)
         if not self.line:
@@ -1284,8 +1545,25 @@ class App:
             pygame.draw.circle(self.screen, (140, 140, 145), (box.x + 44, y + ROW_H // 2), 5, 1)
             mark = self.review_mark(i)
             colour = MARK_COLOURS.get(mark, TEXT if i < self.pos else MUTED)
+            show_bar = self.review is not None and i + 1 < len(self.review["values"])
+            self.screen.set_clip(pygame.Rect(box.x + 56, y, box.w - 56 - (EVAL_COL_W + 8 if show_bar else 2), ROW_H))
             self.text(self.texts[i] + mark, (box.x + 56, y + 3), self.font_small, colour)
+            self.screen.set_clip(None)
+            if show_bar:
+                self.draw_eval_chip(pygame.Rect(box.right - EVAL_COL_W - 6, y + 5, EVAL_COL_W, ROW_H - 10),
+                                    self.review["values"][i + 1], i)
         self.draw_graph()
+
+    def draw_eval_chip(self, rect, white_value, i):
+        """A tiny eval bar for the move list: the white part is white's share, centre line = even."""
+        frac = (max(-1.0, min(1.0, white_value)) + 1.0) / 2.0
+        pygame.draw.rect(self.screen, (14, 14, 17), rect)
+        pygame.draw.rect(self.screen, (225, 225, 225), (rect.x, rect.y, int(round(rect.w * frac)), rect.h))
+        pygame.draw.line(self.screen, (230, 110, 40), (rect.centerx, rect.y), (rect.centerx, rect.bottom - 1), 1)
+        pygame.draw.rect(self.screen, (110, 110, 116), rect, 1)
+        if rect.inflate(0, 8).collidepoint(pygame.mouse.get_pos()):
+            who = "white ahead" if white_value > 0.05 else "black ahead" if white_value < -0.05 else "about even"
+            self.tooltip = ("After move %d: %+.2f (%s)" % (i + 1, white_value, who), TEXT)
 
     def draw_graph(self):
         g = self.layout['m_graph']
@@ -1305,9 +1583,15 @@ class App:
         if len(values) >= 2:
             pygame.draw.lines(self.screen, (120, 190, 235), False,
                               [(xs(i), ys(v)) for i, v in enumerate(values)], 2)
+        hover = self.graph_mark_at(pygame.mouse.get_pos())
         for i, mark in enumerate(self.review["marks"]):
             if mark:
-                pygame.draw.circle(self.screen, MARK_COLOURS[mark], (int(xs(i + 1)), int(ys(values[i + 1]))), 3)
+                centre = (int(xs(i + 1)), int(ys(values[i + 1])))
+                pygame.draw.circle(self.screen, MARK_COLOURS[mark], centre, 5 if i == hover else 3)
+                if i == hover:
+                    pygame.draw.circle(self.screen, (240, 240, 240), centre, 6, 1)
+        if hover is not None:
+            self.tooltip = (self.mark_text(hover), MARK_COLOURS[self.review["marks"][hover]])
         cx = int(xs(min(self.pos, len(values) - 1)))
         pygame.draw.line(self.screen, (240, 240, 240), (cx, g.y + 1), (cx, g.bottom - 2), 1)
         self.text("network's view, white up", (g.x, g.bottom + 3), self.font_small, MUTED)
@@ -1333,7 +1617,7 @@ class App:
                 colour = MARK_COLOURS[mark]
             else:
                 line = ("Looking at the position after move %d of %d.  Right / End: forward.  A new move "
-                        "from here replaces the rest." % (self.pos, len(self.line)))
+                        "from here starts another line (the old one is kept: Tab)." % (self.pos, len(self.line)))
         elif game.done:
             who = "Draw" if game.winner is None else "%s wins" % full_name(game.winner).capitalize()
             line = "%s: %s.  R: new game, Ctrl+S: save it." % (who, game.end_reason)
@@ -1484,6 +1768,12 @@ def main():
                     help="most milliseconds the search thinks per move (default 2500)")
     ap.add_argument("--strict-win", action="store_true",
                     help="experimental: every piece of both teams must be on the board")
+    ap.add_argument("--review-sims", type=int, default=reviewlib.DEFAULT_SIMS, metavar="N",
+                    help="search simulations per position in the game review (default %d; 0 = "
+                         "the bare network, a second or two for a whole game)" % reviewlib.DEFAULT_SIMS)
+    ap.add_argument("--no-resume", action="store_true",
+                    help="do not reopen the unfinished game of the last session, and do not keep this "
+                         "one on disk after every move")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
     ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
     ap.add_argument("--flip", action="store_true", help="draw the board from black's side")
@@ -1530,11 +1820,14 @@ def main():
                   max_plies=args.max_plies)
     searcher = mcts.Searcher(advisor, sims=args.sims, think_ms=args.think_ms) if advisor else None
     app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
-              searcher, flipped=args.flip, autosave=args.autosave)
+              searcher, flipped=args.flip, autosave=args.autosave,
+              review_sims=args.review_sims, session=not args.no_resume)
     if args.no_search:
         app.use_search = False
     if args.load:
         app.load(args.load)
+    elif not args.no_resume:
+        app.resume()
 
     clock = pygame.time.Clock()
     running = True
@@ -1559,6 +1852,10 @@ def main():
                         app.next_mistake(1)
                     elif ctrl and event.key == pygame.K_c:
                         app.copy_json() if event.mod & pygame.KMOD_SHIFT else app.copy_moves()
+                    elif ctrl and event.key == pygame.K_v:
+                        app.paste()
+                    elif event.key == pygame.K_TAB:
+                        app.swap_variation(-1 if event.mod & pygame.KMOD_SHIFT else 1)
                     elif event.key == pygame.K_LEFT:
                         app.step_back()
                     elif event.key == pygame.K_RIGHT:
@@ -1587,6 +1884,10 @@ def main():
                         app.toggle_ai()
                     elif event.key == pygame.K_s:
                         app.toggle_search()
+            elif event.type == pygame.DROPFILE and app.pending is None:
+                app.drop_file(event.file)
+            elif event.type == pygame.DROPTEXT and app.pending is None:
+                app.paste_text(event.text)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 app.handle_click(event.pos)
             elif event.type == pygame.MOUSEWHEEL:
