@@ -21,7 +21,9 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::OnceLock;
 
+mod mcts;
 mod nnet;
+mod play;
 mod step;
 
 const PAWN: u8 = 0;

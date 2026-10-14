@@ -22,6 +22,7 @@ import numpy as np
 import torch
 
 import engine
+import nativegame
 import net as netlib
 import rustnet
 from engine import Game, Rules
@@ -167,6 +168,14 @@ def selfplay_task(seed: int, opp_path: str = None, net_team: str = "b") -> dict:
         import heuristic
         py_rng = random.Random(seed)
     rng = np.random.default_rng(seed)
+    if bot is None and nativegame.usable(model, opp):
+        # The whole game in Rust (nativegame.py): only searched decisions come back to Python.
+        # RC_NATIVEGAME=0 plays it the old way below (engine.Game), which stays the reference.
+        mask = 3 if opp is None else (1 if net_team == "b" else 2)
+        result = nativegame.play(model, opp, _STATE["rules"], rng, mask, version, _STATE["search"])
+        result["opp"] = opp_path                              # None = plain self-play
+        result["net_team"] = net_team if opp_path else None
+        return result
     game = Game(_STATE["rules"])
     rec = _Recorder()
     cfg = _STATE["search"]

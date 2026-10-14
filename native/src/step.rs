@@ -45,22 +45,22 @@ use crate::{
     PAWN, PROMO_TYPES, QUEEN, ROOK,
 };
 
-const HDR: usize = 200;
+pub(crate) const HDR: usize = 200;
 
-const ST_LIVE: u8 = 0;
-const ST_WIN: u8 = 1;
-const ST_DRAW_BOTH: u8 = 2;
-const ST_DRAW_QUIET: u8 = 3;
-const ST_MAXPLY: u8 = 4;
-const ST_NO_MOVES: u8 = 5;
-const ST_BLOCKED: u8 = 6;
+pub(crate) const ST_LIVE: u8 = 0;
+pub(crate) const ST_WIN: u8 = 1;
+pub(crate) const ST_DRAW_BOTH: u8 = 2;
+pub(crate) const ST_DRAW_QUIET: u8 = 3;
+pub(crate) const ST_MAXPLY: u8 = 4;
+pub(crate) const ST_NO_MOVES: u8 = 5;
+pub(crate) const ST_BLOCKED: u8 = 6;
 
 /// rules flag bit 0: Rules.win_requires_all_pieces_on_board
 const FLAG_ALL_ON_BOARD: i32 = 1;
 
 impl State {
     /// Inverse of `State::from_bytes` (engine.Game._pack's wire format).
-    fn write_bytes(&self, out: &mut [u8]) {
+    pub(crate) fn write_bytes(&self, out: &mut [u8]) {
         for i in 0..32 {
             let p = &self.p[i];
             if p.on {
@@ -76,7 +76,7 @@ impl State {
     }
 
     /// engine.Piece.code of the piece on each square (0 = empty): the repetition fingerprint.
-    fn write_snapshot(&self, out: &mut [u8]) {
+    pub(crate) fn write_snapshot(&self, out: &mut [u8]) {
         for sq in 0..64 {
             let k = self.board[sq];
             out[sq] = if k < 0 {
@@ -117,7 +117,7 @@ impl State {
 /// Everything rc_step does, on safe types.  Returns the number of actions written after
 /// the header (0 when the game is decided), or a negative error code.
 #[allow(clippy::too_many_arguments)]
-fn do_step(
+pub(crate) fn do_step(
     before: &State,
     turn: usize,
     act: &[u8],
@@ -267,6 +267,49 @@ pub unsafe extern "C" fn rc_step(
     r.unwrap_or(-99)
 }
 
+/// Core of `rc_observe` on safe types (also used by play.rs).
+pub(crate) fn observe_into(st: &State, me: usize, board: &mut [f32], scal: &mut [f32]) {
+    board.fill(0.0);
+    scal.fill(0.0);
+    for i in 0..32 {
+        let p = &st.p[i];
+        if !p.on {
+            continue;
+        }
+        let side = if team_of(i) == me { 0 } else { 1 };
+        let (mut r, c) = crate::rc(p.pos);
+        if me == 0 {
+            r = 7 - r; // the board is flipped for black
+        }
+        let sq = sqi(r, c);
+        board[(side * 6 + p.ptype as usize) * 64 + sq] = 1.0;
+        if p.promoted {
+            board[(12 + side) * 64 + sq] = 1.0;
+        }
+        if p.locked {
+            board[(14 + side) * 64 + sq] = 1.0;
+        }
+        if st.at_home(i) {
+            board[(16 + side) * 64 + sq] = 1.0;
+        }
+    }
+    // off-board counts of the giftable types p, r, b, q, n (own first, then the opponent's)
+    const TYPES: [u8; 5] = [PAWN, ROOK, BISHOP, QUEEN, KNIGHT];
+    const MAXN: [f64; 5] = [8.0, 2.0, 2.0, 1.0, 2.0];
+    let _ = KING;
+    let mut k = 0;
+    for &team in [me, other(me)].iter() {
+        for (t, &ty) in TYPES.iter().enumerate() {
+            let count = (0..16).filter(|&j| !st.p[team * 16 + j].on && st.p[team * 16 + j].ptype == ty).count();
+            scal[k] = (count as f64 / MAXN[t]) as f32;
+            k += 1;
+        }
+    }
+    scal[14] = st.all_on_board(me) as u8 as f32;
+    scal[15] = st.all_on_board(other(me)) as u8 as f32;
+    scal[16] = (me == 0) as u8 as f32;
+}
+
 /// env.encode_observation for a packed state, from the point of view of `me` (0 black,
 /// 1 white): `board` receives 18 * 64 f32 (planes, then rows flipped for black) and `scal`
 /// 17 f32.  Only the scalars that come from the position are written (off-board counts,
@@ -286,45 +329,7 @@ pub unsafe extern "C" fn rc_observe(state: *const u8, me: u32, board: *mut f32, 
         let me = (me & 1) as usize;
         let board = std::slice::from_raw_parts_mut(board, 18 * 64);
         let scal = std::slice::from_raw_parts_mut(scal, 17);
-        board.fill(0.0);
-        scal.fill(0.0);
-        for i in 0..32 {
-            let p = &st.p[i];
-            if !p.on {
-                continue;
-            }
-            let side = if team_of(i) == me { 0 } else { 1 };
-            let (mut r, c) = crate::rc(p.pos);
-            if me == 0 {
-                r = 7 - r; // the board is flipped for black
-            }
-            let sq = sqi(r, c);
-            board[(side * 6 + p.ptype as usize) * 64 + sq] = 1.0;
-            if p.promoted {
-                board[(12 + side) * 64 + sq] = 1.0;
-            }
-            if p.locked {
-                board[(14 + side) * 64 + sq] = 1.0;
-            }
-            if st.at_home(i) {
-                board[(16 + side) * 64 + sq] = 1.0;
-            }
-        }
-        // off-board counts of the giftable types p, r, b, q, n (own first, then the opponent's)
-        const TYPES: [u8; 5] = [PAWN, ROOK, BISHOP, QUEEN, KNIGHT];
-        const MAXN: [f64; 5] = [8.0, 2.0, 2.0, 1.0, 2.0];
-        let _ = KING;
-        let mut k = 0;
-        for &team in [me, other(me)].iter() {
-            for (t, &ty) in TYPES.iter().enumerate() {
-                let count = (0..16).filter(|&j| !st.p[team * 16 + j].on && st.p[team * 16 + j].ptype == ty).count();
-                scal[k] = (count as f64 / MAXN[t]) as f32;
-                k += 1;
-            }
-        }
-        scal[14] = st.all_on_board(me) as u8 as f32;
-        scal[15] = st.all_on_board(other(me)) as u8 as f32;
-        scal[16] = (me == 0) as u8 as f32;
+        observe_into(&st, me, board, scal);
         0
     }));
     r.unwrap_or(-99)

@@ -144,6 +144,8 @@ class FastGame:
         """Snapshot of a real game (which is only read, never changed)."""
         if not AVAILABLE:
             raise RuntimeError("native engine with rc_step not available (run ./build_native.sh)")
+        if isinstance(game, FastGame):      # immutable: a search may own it as it is
+            return game
         self = object.__new__(cls)
         self.cfg = _Config(game.rules)
         self.turn = game.turn
@@ -160,6 +162,29 @@ class FastGame:
         self.extra_turn = bool(lm is not None and lm.extra_turn and lm.team == game.turn)
         self._base = dict(game.seen)    # positions seen before the root; never changed
         self._path = {}                 # positions reached below the root -> total count
+        return self
+
+    @classmethod
+    def from_native(cls, cfg: "_Config", state: bytes, raw: bytes, key: bytes, turn: str, ply: int,
+                    quiet_plies: int, rep: int, extra_turn: bool, seen: Dict[bytes, int]) -> "FastGame":
+        """The live position of a ``nativegame.NativeGame`` (see nativegame.py): a search rooted
+        here counts repetitions against ``seen``, the positions the game has been through
+        (the root's own included, as ``from_game`` does with ``Game.seen``)."""
+        self = object.__new__(cls)
+        self.cfg = cfg
+        self.turn = turn
+        self.ply = ply
+        self.quiet_plies = quiet_plies
+        self.done = not raw
+        self.winner = None
+        self.end_reason = ""
+        self.state = state
+        self.raw = raw
+        self.key = key
+        self.rep = rep
+        self.extra_turn = bool(extra_turn)
+        self._base = dict(seen)
+        self._path = {}
         return self
 
     # -- what search and the networks read ---------------------------------

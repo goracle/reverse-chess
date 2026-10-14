@@ -141,6 +141,14 @@ exactly for an immediate win/loss, then the network's policy and value guide a P
 in the background while the window stays responsive.  `--sims N` / `--think-ms MS` set how hard it
 thinks per move, `--no-search` (or the **MCTS** button / `S`) switches back to the plain network.
 
+Training uses the same search natively: `native/src/mcts.rs` (PUCT, first-play urgency, exact terminals,
+virtual-loss batches) is called from `nativegame.py` via `rc_game_search`, so a searched self-play decision
+never leaves Rust except to draw the root noise and the move.  `RC_NATIVESEARCH=0` (or `--sweep` != 0)
+falls back to `mcts.Searcher`; `python check_nativesearch.py` compares the two.  `play.py` and `review.py`
+use it too: `mcts.Searcher` hands the position to `nativesearch.py` / `rc_search_run` when the library has
+it (the same think-time slider, live eval and hints, many more simulations per second); `RC_NATIVESEARCH=0`
+or `Searcher(native=False)` keeps the pure-Python search.
+
 In the window: **AI on/off** and which colour it plays, an **eval bar** (the network's opinion of who
 is ahead, white at the bottom), a **Hint** button (its three favourite moves), and a **record** of your
 games against it.  The move menu has a **Back** button and an **X**.  Keys: `H` hint, `E` eval bar,

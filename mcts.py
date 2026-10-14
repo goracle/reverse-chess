@@ -160,12 +160,14 @@ class Job:
         self.sweep_done = 0                   # root moves checked exactly
         self.sweep_total = 0
         self._stop = threading.Event()
+        self.stop_flag = np.zeros(1, dtype=np.int32)    # the same request, for the native search
         self._lock = threading.Lock()
         self.started = time.monotonic()
 
     # -- control ---------------------------------------------------------
     def stop(self):
         self._stop.set()
+        self.stop_flag[0] = 1
 
     # -- results (safe to call any time) ----------------------------------
     @property
@@ -231,13 +233,18 @@ class Searcher:
     """Runs searches for play.py.  One search at a time: starting a new one stops the old."""
 
     def __init__(self, advisor, sims: int = 600, think_ms: int = 2500, c_puct: float = C_PUCT,
-                 batch: int = 1, light: Optional[bool] = None, vl: float = VL_DEFAULT):
+                 batch: int = 1, light: Optional[bool] = None, vl: float = VL_DEFAULT,
+                 native: Optional[bool] = None):
         if light and not fastgame.AVAILABLE:
             raise RuntimeError("light search needs the native engine with rc_step "
                                "(run ./build_native.sh)")
         if not 0.0 <= vl <= 1.0:
             raise ValueError("vl (virtual-loss strength) must be in [0, 1], got %r" % (vl,))
         self.light = light_default() if light is None else bool(light)
+        # the whole search in Rust (nativesearch.py) when the advisor and the library allow it;
+        # native=False keeps the Python search (the reference check_nativesearch.py compares to)
+        import nativesearch
+        self.native = nativesearch.default() if native is None else bool(native)
         self.advisor = advisor
         self.batch = max(1, int(batch))       # leaves evaluated per network call (virtual loss)
         # What a descent that is still in flight counts as: one extra visit of an edge whose result
@@ -451,10 +458,18 @@ class Searcher:
                 alpha = min(1.0, max(0.03, 10.0 / n))
                 root.priors = ((1.0 - job.noise) * root.priors
                                + job.noise * rng.dirichlet([alpha] * n))
+            import nativesearch
+            if nativesearch.eligible(self, job, root):
+                root = nativesearch.make_root(job, root)
             with job._lock:
                 job.root = root
             if root.terminal:
                 return
+            if isinstance(root, nativesearch.NativeRoot):
+                # the search thread blocks in Rust; the UI reads root.N / W / total as they grow
+                if nativesearch.run(self, job, root, t0, end) == 0:
+                    return
+                # Rust refused before searching anything: carry on in Python on the same root
             if job.sweep_k != 0:
                 self._sweep(job, root, t0 + SWEEP_SHARE * job.deadline_ms / 1000.0)
             while (not job._stop.is_set() and root.win_idx is None

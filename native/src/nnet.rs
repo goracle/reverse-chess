@@ -31,7 +31,7 @@ thread_local! {
     static LAST_ERR: RefCell<String> = RefCell::new(String::new());
 }
 
-fn set_err(msg: String) {
+pub(crate) fn set_err(msg: String) {
     LAST_ERR.with(|e| *e.borrow_mut() = msg);
 }
 
@@ -574,7 +574,7 @@ impl Net {
 
     /// Validates the inputs (so the unsafe kernels never see a bad index), then runs.
     #[allow(clippy::too_many_arguments)]
-    fn forward_checked(
+    pub(crate) fn forward_checked(
         &self,
         batch: usize,
         board: &[f32],
