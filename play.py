@@ -209,6 +209,7 @@ def make_layout():
         'm_undo': R(MOVES_X + 14, 40, 92, 28), 'm_flip': R(MOVES_X + 114, 40, 92, 28),
         'm_save': R(MOVES_X + 14, 74, 92, 28), 'm_load': R(MOVES_X + 114, 74, 92, 28),
         'm_review': R(MOVES_X + 14, 108, 92, 28), 'm_next': R(MOVES_X + 114, 108, 92, 28),
+        'm_help': R(MOVES_X + MOVES_W - 48, 8, 34, 28),
         'm_sound': R(MOVES_X + 14, 142, 92, 28), 'm_coords': R(MOVES_X + 114, 142, 92, 28),
         'm_think': R(MOVES_X + 14, 176, MOVES_W - 28, 30),     # the AI think-time slider
         'm_list': R(MOVES_X + 6, 246, MOVES_W - 12, ROW_H * 25),
@@ -544,6 +545,7 @@ class App:
         self.sounds = None            # built on first use (synth_sounds); {} = no audio
         self.net_dirs = list(net_dirs)
         self.picker = None            # the open network picker (N), see open_picker
+        self.help_open = False        # modal in-app shortcut / control reference (F1 or ?)
         self.premove = None           # (src, dst) queued while the computer thinks
         self.pre_src = None           # the piece picked for a premove, waiting for its destination
         self.menu_sel = None          # the menu option highlighted from the keyboard
@@ -1501,7 +1503,9 @@ class App:
 
     def click_panel(self, pos):
         L = self.layout
-        if L['net'].collidepoint(pos):
+        if L['m_help'].collidepoint(pos):
+            self.help_open = not self.help_open
+        elif L['net'].collidepoint(pos):
             self.open_picker()
         elif L['ai'].collidepoint(pos):
             self.toggle_ai()
@@ -1556,12 +1560,103 @@ class App:
             self.jump(int(round(frac * n)))
 
     # -- input -----------------------------------------------------------
+    def handle_key(self, event):
+        """Dispatch one key event. Modal UI gets first refusal, then global shortcuts, then menu keys."""
+        key, mod = event.key, event.mod
+        ctrl = bool(mod & pygame.KMOD_CTRL)
+        help_key = key == pygame.K_F1 or (key == pygame.K_SLASH and bool(mod & pygame.KMOD_SHIFT))
+
+        # The guide is a true modal overlay: no hidden move/navigation actions while it is open.
+        if self.help_open:
+            if key in (pygame.K_ESCAPE, pygame.K_F1) or help_key:
+                self.help_open = False
+            return
+        if help_key:
+            self.help_open = True
+            return
+        if self.picker is not None:
+            self.picker_key(key)
+            return
+        if key == pygame.K_ESCAPE:
+            self.escape()
+            return
+        if ctrl and key == pygame.K_s and self.pending is None:
+            self.save()
+            return
+        if ctrl and key == pygame.K_o and self.pending is None:
+            self.load()
+            return
+        # Keep the long-standing restart shortcut global, including while a move menu is open.
+        if key == pygame.K_r and not ctrl:
+            self.restart()
+            return
+
+        if self.pending is not None:
+            self.menu_key(key)
+            return
+
+        if ctrl and key == pygame.K_LEFT:
+            self.next_mistake(-1)
+        elif ctrl and key == pygame.K_RIGHT:
+            self.next_mistake(1)
+        elif ctrl and key == pygame.K_c:
+            self.copy_json() if mod & pygame.KMOD_SHIFT else self.copy_moves()
+        elif ctrl and key == pygame.K_v:
+            self.paste()
+        elif ctrl and key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
+            self.zoom(1.1)
+        elif ctrl and key in (pygame.K_MINUS, pygame.K_KP_MINUS):
+            self.zoom(1 / 1.1)
+        elif ctrl and key in (pygame.K_0, pygame.K_KP0):
+            self.apply_scale(auto_scale())
+        elif ctrl and key in (pygame.K_1, pygame.K_KP1):
+            self.apply_scale(1.0)
+        elif key == pygame.K_TAB:
+            self.swap_variation(-1 if mod & pygame.KMOD_SHIFT else 1)
+        elif key == pygame.K_LEFT:
+            self.step_back()
+        elif key == pygame.K_RIGHT:
+            self.step_forward()
+        elif key == pygame.K_HOME:
+            self.jump(0)
+        elif key == pygame.K_END:
+            self.jump(len(self.line))
+        elif key in (pygame.K_z, pygame.K_BACKSPACE):
+            self.takeback()
+        elif key == pygame.K_f:
+            self.flip()
+        elif key == pygame.K_c and not ctrl:
+            self.toggle_coords()
+        elif key == pygame.K_n and not ctrl:
+            self.open_picker()
+        elif key == pygame.K_u and not ctrl:
+            self.toggle_sound()
+        elif key == pygame.K_m:
+            self.next_mistake(-1 if mod & pygame.KMOD_SHIFT else 1)
+        elif key == pygame.K_v:
+            self.start_review()
+        elif key == pygame.K_p and not ctrl:
+            self.play_network_move()
+        elif ctrl:
+            return
+        elif key == pygame.K_h:
+            self.toggle_hint()
+        elif key == pygame.K_e:
+            self.toggle_eval()
+        elif key == pygame.K_a:
+            self.toggle_ai()
+        elif key == pygame.K_s:
+            self.toggle_search()
+
     def human_to_move(self):
         return not self.game.done and self.agents[self.game.turn] is None
 
     def handle_click(self, pos, force_menu=False):
         """A left click at canvas pixel ``pos``.  ``force_menu`` (Shift held): ask even about a move that
         has only one variant, with a preview of it, before playing."""
+        if self.help_open:
+            self.help_open = False
+            return
         if self.picker is not None:               # so is the network picker
             self.click_picker(pos)
             return
@@ -1720,6 +1815,76 @@ class App:
         if self.picker is not None:
             self.draw_picker()
         self.draw_tooltip()
+        if self.help_open:
+            self.draw_help()
+
+    def draw_help(self):
+        """Draw the modal quick reference above the game without disturbing its state."""
+        veil = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        veil.fill((0, 0, 0, 205))
+        self.screen.blit(veil, (0, 0))
+
+        panel = pygame.Rect(86, 48, WIN_W - 172, WIN_H - 96)
+        pygame.draw.rect(self.screen, (31, 32, 38), panel, border_radius=14)
+        pygame.draw.rect(self.screen, (105, 110, 125), panel, 2, border_radius=14)
+        self.text("Reverse Chess — quick reference", (panel.x + 26, panel.y + 18), self.font_big)
+        self.text("F1 or ? closes this guide too. The game stays paused behind it.",
+                  (panel.x + 28, panel.y + 54), self.font_small, MUTED)
+
+        gutter = 36
+        col_w = (panel.w - 3 * gutter) // 2
+        left_x = panel.x + gutter
+        right_x = left_x + col_w + gutter
+        body_y = panel.y + 98
+
+        left = [
+            ("PLAYING", [
+                "Click a blue-outlined piece, then a dotted destination.",
+                "Click an unavailable square to see why that move is illegal.",
+                "Shift-click a destination to confirm even a one-option move.",
+                "Move menus: 1–9 or Up/Down + Enter; Backspace goes back. Esc closes the menu.",
+                "During the computer's turn, click your piece then a destination to queue a premove. Right-click cancels.",
+            ]),
+            ("HISTORY & REVIEW", [
+                "Left/Right: step through the line. Home/End: start/end. Click a move row or graph point to jump.",
+                "Z or Backspace: take back your last move (and the AI reply). A new move keeps the old line as a variation.",
+                "Tab / Shift+Tab: switch between saved variations. F flips the board.",
+                "V starts position review; M / Next ? go to the next marked move, Shift+M goes back. P plays the network's move.",
+            ]),
+        ]
+        right = [
+            ("AI & ANALYSIS", [
+                "A toggles the AI. Use the Black / White / Both buttons to choose which side it plays.",
+                "H toggles move hints; E toggles the evaluation bar; S toggles MCTS look-ahead.",
+                "The think-time slider controls search time and simulation budget. The AI needs a loaded network for analysis.",
+                "Click the network name or press N to choose another .npz / .pt file.",
+            ]),
+            ("SAVE, SHARE & DISPLAY", [
+                "Ctrl+S saves; Ctrl+O loads. Repeated Load cycles through saved games. Drop a .json file onto the window to open it.",
+                "Ctrl+C copies the move list; Ctrl+Shift+C copies game JSON; Ctrl+V pastes either format.",
+                "Ctrl++ / Ctrl+- resize; Ctrl+0 fits the screen; Ctrl+1 sets 100%. C toggles coordinates; U toggles sounds.",
+                "The side panel shows home pieces and off-board pieces that can be returned as gifts. Grey locks are permanent; orange locks are temporary.",
+            ]),
+        ]
+
+        def section(x, y, items):
+            for heading, entries in items:
+                self.text(heading, (x, y), self.font_status, GOOD)
+                y += 31
+                for entry in entries:
+                    lines = wrap(entry, self.font_small, col_w - 22)
+                    self.text("•", (x + 1, y), self.font_small, TEXT)
+                    for line in lines:
+                        self.text(line, (x + 18, y), self.font_small, TEXT)
+                        y += 21
+                    y += 5
+                y += 13
+            return y
+
+        section(left_x, body_y, left)
+        section(right_x, body_y, right)
+        self.text("Press Esc to close this guide. Nothing is changed until you interact with the board again.",
+                  (panel.x + 28, panel.bottom - 29), self.font_small, MUTED)
 
     def draw_coords(self):
         """Rank numbers down the left edge and file letters along the bottom, whichever way the board is
@@ -1969,7 +2134,7 @@ class App:
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
                   "H hint  E eval  A AI  S MCTS  R new",
-                  "N network  C coords  U sound  Ctrl +/- size"]
+                  "N network  C coords  U sound  F1 / ? help"]
         for i, line in enumerate(legend):
             self.text(line, (x0, WIN_H - 6 - (len(legend) - i) * 20), self.font_small, MUTED)
 
@@ -2082,6 +2247,7 @@ class App:
         pygame.draw.rect(self.screen, PANEL_BG, (MOVES_X, 0, MOVES_W, WIN_H))
         pygame.draw.line(self.screen, (22, 22, 26), (MOVES_X, 0), (MOVES_X, WIN_H), 2)
         self.text("Moves", (x0, 8), self.font_big)
+        self.draw_button(L['m_help'], "?", on=self.help_open)
         self.draw_button(L['m_undo'], "Undo", enabled=self.pos > 0)
         self.draw_button(L['m_flip'], "Flip", on=self.flipped)
         self.draw_button(L['m_save'], "Save", enabled=bool(self.line))
@@ -2460,92 +2626,29 @@ def main():
             if event.type == pygame.QUIT:
                 running = False
             elif event.type == pygame.KEYDOWN:
-                ctrl = bool(event.mod & pygame.KMOD_CTRL)
-                if app.picker is not None:
-                    app.picker_key(event.key)
-                elif event.key == pygame.K_ESCAPE:
-                    app.escape()
-                elif ctrl and event.key == pygame.K_s and app.pending is None:
-                    app.save()
-                elif ctrl and event.key == pygame.K_o and app.pending is None:
-                    app.load()
-                elif event.key == pygame.K_r and not ctrl:
-                    app.restart()
-                elif app.pending is None:
-                    if ctrl and event.key == pygame.K_LEFT:
-                        app.next_mistake(-1)
-                    elif ctrl and event.key == pygame.K_RIGHT:
-                        app.next_mistake(1)
-                    elif ctrl and event.key == pygame.K_c:
-                        app.copy_json() if event.mod & pygame.KMOD_SHIFT else app.copy_moves()
-                    elif ctrl and event.key == pygame.K_v:
-                        app.paste()
-                    elif ctrl and event.key in (pygame.K_EQUALS, pygame.K_PLUS, pygame.K_KP_PLUS):
-                        app.zoom(1.1)
-                    elif ctrl and event.key in (pygame.K_MINUS, pygame.K_KP_MINUS):
-                        app.zoom(1 / 1.1)
-                    elif ctrl and event.key in (pygame.K_0, pygame.K_KP0):
-                        app.apply_scale(auto_scale())
-                    elif ctrl and event.key in (pygame.K_1, pygame.K_KP1):
-                        app.apply_scale(1.0)
-                    elif event.key == pygame.K_TAB:
-                        app.swap_variation(-1 if event.mod & pygame.KMOD_SHIFT else 1)
-                    elif event.key == pygame.K_LEFT:
-                        app.step_back()
-                    elif event.key == pygame.K_RIGHT:
-                        app.step_forward()
-                    elif event.key == pygame.K_HOME:
-                        app.jump(0)
-                    elif event.key == pygame.K_END:
-                        app.jump(len(app.line))
-                    elif event.key in (pygame.K_z, pygame.K_BACKSPACE):
-                        app.takeback()
-                    elif event.key == pygame.K_f:
-                        app.flip()
-                    elif event.key == pygame.K_c and not ctrl:
-                        app.toggle_coords()
-                    elif event.key == pygame.K_n and not ctrl:
-                        app.open_picker()
-                    elif event.key == pygame.K_u and not ctrl:
-                        app.toggle_sound()
-                    elif event.key == pygame.K_m:
-                        app.next_mistake(-1 if event.mod & pygame.KMOD_SHIFT else 1)
-                    elif event.key == pygame.K_v:
-                        app.start_review()
-                    elif event.key == pygame.K_p and not ctrl:
-                        app.play_network_move()
-                    elif ctrl:
-                        pass
-                    elif event.key == pygame.K_h:
-                        app.toggle_hint()
-                    elif event.key == pygame.K_e:
-                        app.toggle_eval()
-                    elif event.key == pygame.K_a:
-                        app.toggle_ai()
-                    elif event.key == pygame.K_s:
-                        app.toggle_search()
-                else:                                  # a move menu is open: keys choose from it
-                    app.menu_key(event.key)
-            elif event.type == pygame.DROPFILE and app.pending is None:
+                app.handle_key(event)
+            elif event.type == pygame.DROPFILE and app.pending is None and not app.help_open:
                 app.drop_file(event.file)
-            elif event.type == pygame.DROPTEXT and app.pending is None:
+            elif event.type == pygame.DROPTEXT and app.pending is None and not app.help_open:
                 app.paste_text(event.text)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 # (Shift held: a move with one variant still shows its menu, to confirm)
                 app.handle_click(app.to_logical(event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
-                app.right_click()
+                if not app.help_open:
+                    app.right_click()
             elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
                 app.dragging = None
-            elif event.type == pygame.MOUSEMOTION and app.dragging:
+            elif event.type == pygame.MOUSEMOTION and app.dragging and not app.help_open:
                 app.drag(app.to_logical(event.pos))
-            elif event.type == pygame.MOUSEWHEEL:
+            elif event.type == pygame.MOUSEWHEEL and not app.help_open:
                 if app.picker is not None:
                     app.picker_scroll(event.y)
                 elif app.layout['m_list'].collidepoint(app.mouse()):
                     app.scroll_moves(event.y)
-        app.poll_review()
-        app.update_ai()
+        if not app.help_open:
+            app.poll_review()
+            app.update_ai()
         app.draw()
         app.present()
         clock.tick(30)
