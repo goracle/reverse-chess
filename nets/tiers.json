@@ -1,26 +1,56 @@
 {
   "tiers": [
     {
-      "loss_rate": 0.8633,
-      "target": 0.85,
+      "loss_rate": 0.9817,
+      "target": 0.95,
       "games": 600,
-      "draws": 34,
+      "draws": 6,
       "ci": [
-        0.8335,
-        0.8885
+        0.9675,
+        0.9897
       ],
-      "version": 541,
+      "version": 25,
       "name": "Easy",
       "path": "nets/easy.npz",
       "search": false,
-      "source": "runs/tiers1/cands/v00541.pt"
+      "source": "runs/run4/iter_00025.pt"
     },
     {
+      "loss_rate": 0.86,
+      "target": 0.85,
+      "games": 600,
+      "draws": 54,
+      "ci": [
+        0.8299,
+        0.8855
+      ],
+      "version": 125,
+      "name": "Medium",
+      "path": "nets/medium.npz",
+      "search": false,
+      "source": "runs/run4/iter_00125.pt"
+    },
+    {
+      "loss_rate": 0.7467,
+      "target": 0.7,
+      "games": 600,
+      "draws": 78,
+      "ci": [
+        0.7104,
+        0.7798
+      ],
+      "version": 1650,
       "name": "Hard",
       "path": "nets/hard.npz",
+      "search": false,
+      "source": "runs/run4/iter_01650.pt"
+    },
+    {
+      "name": "Insane",
+      "path": "nets/insane.npz",
       "search": true,
       "loss_rate": 0.5,
-      "source": "runs/tiers1/main_ref.pt"
+      "source": "runs/run4/latest.pt"
     }
   ]
 }

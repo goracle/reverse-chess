@@ -27,7 +27,7 @@ train  A fresh network trained with train.py's ordinary self-play, in chunks of 
        target, installed; training goes on towards the next target and stops after the last one.
        Rerunning the same command resumes.
 install  Installing means: ``nets/NAME.npz`` (what play.py loads) and an entry in ``nets/tiers.json``,
-       which gives play.py its Game > Difficulty menu.  "Hard" is the main AI itself, with search on.
+       which gives play.py its Game > Difficulty menu.  "Insane" is the main AI itself, with search on.
 """
 import argparse
 import glob
@@ -138,7 +138,7 @@ def _write_json(path, data):
 
 
 def install(name, pt, info, main_ref):
-    """nets/NAME.npz from checkpoint ``pt`` plus its entry in nets/tiers.json (and 'Hard' = the main AI, once)."""
+    """nets/NAME.npz from checkpoint ``pt`` plus its entry in nets/tiers.json (and 'Insane' = the main AI, once)."""
     nets = os.path.join(ROOT, "nets")
     os.makedirs(nets, exist_ok=True)
     manifest = os.path.join(nets, "tiers.json")
@@ -149,9 +149,9 @@ def install(name, pt, info, main_ref):
     export_npz(pt, os.path.join(nets, name + ".npz"))
     entry = dict(info, name=name.capitalize(), path="nets/%s.npz" % name, search=False, source=os.path.relpath(pt, ROOT))
     tiers = [t for t in data.get("tiers", []) if t.get("name", "").lower() != name.lower()] + [entry]
-    if not any(t.get("name", "").lower() == "hard" for t in tiers):
-        export_npz(main_ref, os.path.join(nets, "hard.npz"))
-        tiers.append({"name": "Hard", "path": "nets/hard.npz", "search": True, "loss_rate": 0.5,
+    if not any(t.get("name", "").lower() == "insane" for t in tiers):
+        export_npz(main_ref, os.path.join(nets, "insane.npz"))
+        tiers.append({"name": "Insane", "path": "nets/insane.npz", "search": True, "loss_rate": 0.5,
                       "source": os.path.relpath(main_ref, ROOT)})
     tiers.sort(key=lambda t: -float(t.get("loss_rate") or 0.0))
     data["tiers"] = tiers
@@ -220,26 +220,45 @@ def cmd_scan(args):
         raise SystemExit("no snapshots match %r" % args.snapshots)
     print("%d snapshots vs %s, %d games each" % (len(snaps), args.main, args.games), flush=True)
     rows = []
+    done = set()                                          # targets that are settled (installed, or matched without --install)
+
+    def settle(name, target, path, m):
+        """A snapshot within the tolerance of ``target``: confirm it with more games and install it."""
+        if not args.install:
+            print("   -> %s: %s is within %.0f points of %.0f%%" % (name, os.path.relpath(path, ROOT), 100 * args.tol, 100 * target))
+            return True
+        v = match(path, args.main, args.verify_games, args.match_workers, args.match_seed + 7_000_001, args.max_plies,
+                  args.greedy, args.score)
+        print("   re-measured: " + describe(v), flush=True)
+        if abs(v["rate"] - target) > 2 * args.tol:
+            print("   too far from the target after all; scanning on")
+            return False
+        install(name, path, tier_info(v, target, _snapshot_version(path)), args.main)
+        return True
+
     for i, path in enumerate(snaps):
         m = match(path, args.main, args.games, args.match_workers, args.match_seed + 100_003 * i, args.max_plies,
                   args.greedy, args.score)
         rows.append((path, m))
         print("  %-34s %s" % (os.path.relpath(path, ROOT), describe(m)), flush=True)
-    for name, target in targets:
+        for name, target in targets:                      # a hit is installed at once; no need to scan the rest for it
+            if name not in done and abs(m["rate"] - target) <= args.tol:
+                print("\n%s (target %.0f%%): %s is on target" % (name, 100 * target, os.path.relpath(path, ROOT)))
+                if settle(name, target, path, m):
+                    done.add(name)
+        if len(done) == len(targets):
+            print("\nall targets done; %d of %d snapshots scanned" % (i + 1, len(snaps)))
+            return
+    for name, target in targets:                          # nothing hit within the tolerance: the closest one, if it is near
+        if name in done:
+            continue
         path, m = min(rows, key=lambda r: abs(r[1]["rate"] - target))
         print("\n%s (target %.0f%%): closest is %s at %.1f%% [%.1f-%.1f]"
               % (name, 100 * target, os.path.relpath(path, ROOT), 100 * m["rate"], 100 * m["lo"], 100 * m["hi"]))
-        if abs(m["rate"] - target) > args.tol:
-            print("   (more than %.0f points from the target: the snapshots are too far apart here; "
-                  "use `train` for a finer fit)" % (100 * args.tol))
-        if args.install:
-            v = match(path, args.main, args.verify_games, args.match_workers, args.match_seed + 7_000_001, args.max_plies,
-                      args.greedy, args.score)
-            print("   re-measured: " + describe(v), flush=True)
-            if abs(v["rate"] - target) > 2 * args.tol:
-                print("   too far from the target; not installed")
-                continue
-            install(name, path, tier_info(v, target, _snapshot_version(path)), args.main)
+        print("   (more than %.0f points from the target: the snapshots are too far apart here; "
+              "use `train` for a finer fit)" % (100 * args.tol))
+        if args.install and abs(m["rate"] - target) <= 2 * args.tol:
+            settle(name, target, path, m)
 
 
 def _load_state(path):

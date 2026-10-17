@@ -565,6 +565,7 @@ class App:
         self.delay_ms = delay_ms
         self.rng = rng
         self.advisor = advisor        # numpy_net.Advisor or None (no AI file)
+        self.eval_advisor = advisor   # what the eval bar, hints and review use: the main (insane) AI, whatever difficulty plays
         self.ai_note = ai_note        # why there is no advisor, shown in the panel
         self.custom = custom          # {'b': fn|None, 'w': fn|None}: agents given on the command line
         self.ai_on = ai_on
@@ -812,10 +813,13 @@ class App:
         np_rng = np.random.default_rng(rng.randrange(2 ** 32))
         return lambda game: advisor.choose(game, np_rng)
 
-    def set_advisor(self, advisor):
-        """Swap the network that plays, searches, evaluates and reviews."""
+    def set_advisor(self, advisor, tier=False):
+        """Swap the network that plays, searches, evaluates and reviews.  A difficulty level (``tier``) changes
+        only who plays: the eval bar, hints and review keep using the main AI (ai.npz)."""
         self.stop_search()
         self.advisor = advisor
+        if not tier or self.eval_advisor is None:
+            self.eval_advisor = advisor
         self.ai_note = ""
         self.default_ai = self.make_default_ai()
         if self.searcher is None:
@@ -823,11 +827,12 @@ class App:
             self.use_search = True
         else:
             self.searcher.advisor = advisor
-        self.hint = None
-        self.bar_pos = None
-        self.drop_review()                              # those ratings were the old network's
-        for line in self.variations:
-            line["review"] = None
+        if not tier:                                    # (a difficulty level leaves hints, eval and review alone)
+            self.hint = None
+            self.bar_pos = None
+            self.drop_review()                          # those ratings were the old network's
+            for line in self.variations:
+                line["review"] = None
         if self.game.ply > 0 and not self.game.done:
             self.stats_ok = False                       # the opponent changed part-way
         elif self.game.ply == 0:
@@ -1415,7 +1420,7 @@ class App:
             self.message = "Nothing to review yet."
         elif self.reviewer is None:
             self.review = None
-            self.reviewer = reviewlib.Reviewer(self.advisor, self.rules, self.line, self.review_sims)
+            self.reviewer = reviewlib.Reviewer(self.eval_advisor or self.advisor, self.rules, self.line, self.review_sims)
 
     def poll_review(self):
         rv = self.reviewer
@@ -1634,12 +1639,13 @@ class App:
     def white_value_now(self):
         """(value from white's side, simulations behind it): the search once it has enough
         simulations to mean something, the bare network before that."""
-        job = self.search_for_here() if self.use_search else None
+        strong = self.advisor is self.eval_advisor        # (a search of an easier level's network says little)
+        job = self.search_for_here() if self.use_search and strong else None
         if job is not None and (job.solved or job.sims >= 30):
             v = job.white_value()
             if v is not None:
                 return v, job.sims
-        return self.advisor.white_value(self.game), 0
+        return (self.eval_advisor or self.advisor).white_value(self.game), 0
 
     def current_hint(self):
         if self.hint is not None and self.hint["key"] != self.pos_key():
@@ -1663,7 +1669,7 @@ class App:
         elif not self.human_to_move():
             self.message = "Hints are for your own moves; it is the computer's turn."
         else:
-            self.hint = {"key": self.pos_key(), "top": self.advisor.analyse(self.game).top(3)}
+            self.hint = {"key": self.pos_key(), "top": (self.eval_advisor or self.advisor).analyse(self.game).top(3)}
             self.hint_used = True
             self.ensure_search(1800)              # the hint sharpens as the search deepens
             self.message = ""
@@ -1960,7 +1966,7 @@ class App:
         except Exception as err:
             self.message = "Could not load %s: %s" % (os.path.basename(tier["path"]), err)
             return
-        self.set_advisor(advisor)
+        self.set_advisor(advisor, tier=True)
         self.use_search = bool(tier["search"]) and self.searcher is not None
         self.message = "Difficulty: %s." % tier["name"]
 
