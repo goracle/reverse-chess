@@ -115,13 +115,18 @@ The rules are simple...ish.
   as it is your turn if still legal (a move that needs a decision opens its menu).  Right-click or `Esc`
   cancels.
 * **AI think time:** the slider in the move column sets how long the search may think (100 ms - 20 s); the
-  simulation cap scales with it.  Needs MCTS on.
+  simulation cap scales with it.
 * **Sound:** short synthesised move / gift / game-end sounds; `U` or the Sound button toggles, `--no-sound`
   starts without.
 * **Window size:** one ordinary window: the menu bar spans its full width and the game fills the rest at the largest
   size that fits, centred (so a maximised window has equal room left and right).  The window manager owns the size
   while you drag, so the game just re-fits itself.  The window defaults to what fits the screen; `--scale F`,
   `Ctrl +` / `Ctrl -`, `Ctrl+0` (fit the screen), `Ctrl+1` (100%).
+* **Remembered settings:** difficulty (or the network picked with `N`), sound, coordinates, eval bar, search and think
+  time, the move-list setting, who the computer plays, and the window zoom are saved to `settings.json` in the same
+  folder as the win/loss record (`~/.local/share/ReverseChess/` on Linux) and restored next time.  A command-line
+  option (`--no-sound`, `--ai FILE`, `--scale F`, ...) wins over the saved value for that run.  `--no-settings`
+  turns it off, `--settings FILE` moves it.
 * **Network picker:** `N` (or click the AI's name in the panel) lists the network files next to `play.py`, in
   `runs/*/` (including `iter_NNNNN.pt` snapshots) and `nets/`, plus any `--net-dir DIR`.  Choosing one makes
   it the AI (play, search, eval, hints); the current review is dropped and a game under way stops counting in
@@ -141,7 +146,9 @@ python play.py --no-ai          # hot-seat; the AI can be switched on in the win
 The AI looks ahead with a Monte-Carlo tree search (`mcts.py`) by default: every legal move is checked
 exactly for an immediate win/loss, then the network's policy and value guide a PUCT search that runs
 in the background while the window stays responsive.  `--sims N` / `--think-ms MS` set how hard it
-thinks per move, `--no-search` (or the **MCTS** button / `S`) switches back to the plain network.
+thinks per move, `--no-search` (or the **MCTS** button / `S`) switches the *computer* back to the plain network.  That
+switch, and each difficulty level's own setting (Easy and Medium play without search), only affects the opponent: the
+eval bar, hints and review always search with the main AI.
 
 Training uses the same search natively: `native/src/mcts.rs` (PUCT, first-play urgency, exact terminals,
 virtual-loss batches) is called from `nativegame.py` via `rc_game_search`, so a searched self-play decision

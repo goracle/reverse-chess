@@ -133,7 +133,7 @@ import numpy_net
 import review as reviewlib
 from chessassets import TEAMS, PTYPES, image_path
 from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team, pawn_home_row
-from stats import Stats
+from stats import Stats, default_path as stats_default_path
 
 # --------------------------------------------------------------------------
 # Layout and colours
@@ -565,6 +565,8 @@ class App:
         self.delay_ms = delay_ms
         self.rng = rng
         self.advisor = advisor        # numpy_net.Advisor or None (no AI file)
+        self.home_advisor = advisor
+        self.settings_path, self.settings_saved, self.settings_next = None, None, 0.0
         self.eval_advisor = advisor   # what the eval bar, hints and review use: the main (insane) AI, whatever difficulty plays
         self.ai_note = ai_note        # why there is no advisor, shown in the panel
         self.custom = custom          # {'b': fn|None, 'w': fn|None}: agents given on the command line
@@ -575,6 +577,7 @@ class App:
         self.searcher = searcher if advisor is not None else None   # mcts.Searcher or None
         self.use_search = self.searcher is not None
         self.search_job = None
+        self.ana_searcher, self.ana_job = None, None     # the main AI's search for the eval bar / hints (see analysis_searcher)
         self.default_ai = self.make_default_ai()
         self.base_think = self.searcher.think_ms if self.searcher is not None else 2500
         self.base_sims = self.searcher.sims if self.searcher is not None else 600
@@ -820,6 +823,7 @@ class App:
         self.advisor = advisor
         if not tier or self.eval_advisor is None:
             self.eval_advisor = advisor
+            self.ana_searcher = self.ana_job = None
         self.ai_note = ""
         self.default_ai = self.make_default_ai()
         if self.searcher is None:
@@ -879,9 +883,12 @@ class App:
         if self.searcher is not None:
             self.searcher.think_ms = ms
             self.searcher.sims = self.sims_for(ms)
+        if self.ana_searcher is not None:
+            self.ana_searcher.think_ms = ms
+            self.ana_searcher.sims = self.sims_for(ms)
 
     def think_enabled(self):
-        return self.searcher is not None and self.use_search
+        return self.searcher is not None
 
     # -- premove: queue a move while the computer thinks ---------------------
     def premove_possible(self):
@@ -1603,7 +1610,41 @@ class App:
     def stop_search(self):
         if self.searcher is not None:
             self.searcher.stop()
-        self.search_job = None
+        if self.ana_searcher is not None:
+            self.ana_searcher.stop()
+        self.search_job = self.ana_job = None
+
+    def analysis_searcher(self):
+        """The search that feeds the eval bar and the hints: always the main AI's network, whatever level
+        plays.  (The look-ahead switch, S / Game > Difficulty, only decides whether the *computer* searches.)"""
+        if self.searcher is None or self.eval_advisor is None:
+            return None
+        if self.advisor is self.eval_advisor:
+            return self.searcher                                # the computer is the main AI: one search serves both
+        if self.ana_searcher is None or self.ana_searcher.advisor is not self.eval_advisor:
+            self.ana_searcher = mcts.Searcher(self.eval_advisor, sims=self.sims_for(self.think_ms),
+                                              think_ms=self.think_ms)
+        return self.ana_searcher
+
+    def analysis_job_here(self):
+        job = self.search_job if self.advisor is self.eval_advisor else self.ana_job
+        if job is not None and job.key == self.pos_key() and job.error is None:
+            return job
+        return None
+
+    def ensure_analysis(self, ms=None):
+        """Make sure a background analysis search of the current position is running or finished."""
+        searcher = self.analysis_searcher()
+        if searcher is None or self.game.done:
+            return None
+        job = self.analysis_job_here()
+        if job is None:
+            job = searcher.start(self.game, self.pos_key(), ms=ms)
+            if searcher is self.searcher:
+                self.search_job = job
+            else:
+                self.ana_job = job
+        return job
 
     def toggle_search(self):
         if self.searcher is None:
@@ -1611,8 +1652,6 @@ class App:
             return
         self.use_search = not self.use_search
         self.stop_search()
-        self.hint = None
-        self.bar_pos = None
         self.message = ""
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
 
@@ -1639,8 +1678,7 @@ class App:
     def white_value_now(self):
         """(value from white's side, simulations behind it): the search once it has enough
         simulations to mean something, the bare network before that."""
-        strong = self.advisor is self.eval_advisor        # (a search of an easier level's network says little)
-        job = self.search_for_here() if self.use_search and strong else None
+        job = self.analysis_job_here()
         if job is not None and (job.solved or job.sims >= 30):
             v = job.white_value()
             if v is not None:
@@ -1650,8 +1688,8 @@ class App:
     def current_hint(self):
         if self.hint is not None and self.hint["key"] != self.pos_key():
             self.hint = None                      # the position moved on
-        if self.hint is not None and self.use_search:
-            job = self.search_for_here()
+        if self.hint is not None:
+            job = self.analysis_job_here()
             if job is not None and (job.solved or job.sims >= 50):
                 top = job.top(3)
                 if top:                           # swap the policy's guess for the search's
@@ -1671,7 +1709,7 @@ class App:
         else:
             self.hint = {"key": self.pos_key(), "top": (self.eval_advisor or self.advisor).analyse(self.game).top(3)}
             self.hint_used = True
-            self.ensure_search(1800)              # the hint sharpens as the search deepens
+            self.ensure_analysis(1800)            # the hint sharpens as the search deepens
             self.message = ""
 
     def click_reset(self):
@@ -1909,8 +1947,8 @@ class App:
             if self.premove is not None and not self.browsing and self.pending is None:
                 self.run_premove()
                 return
-            if self.use_search and (self.show_eval or self.current_hint() is not None):
-                self.ensure_search(1800)
+            if self.show_eval or self.current_hint() is not None:
+                self.ensure_analysis(1800)
             return
         if self.browsing:                         # looking at an earlier position: the computer waits
             return
@@ -1958,6 +1996,85 @@ class App:
             self.ai_on = True
             self.ai_sides = set(sides)
             self.ai_changed()
+
+    # -- remembered settings (settings.json next to the win/loss record) ---------------------------
+    def settings_snapshot(self):
+        """The choices worth keeping between sessions."""
+        tier = next((t["name"] for t in self.tiers if self.tier_current(t)), None)
+        net = None
+        if tier is None and self.advisor is not None and self.home_advisor is not None:
+            path = getattr(self.advisor, "path", None)
+            if path and os.path.realpath(path) != os.path.realpath(getattr(self.home_advisor, "path", "") or ""):
+                net = path                                  # a network picked with N
+        return {"tier": tier, "net": net, "sound": self.sound_on, "coords": self.coords,
+                "eval": bool(self.show_eval), "search": bool(self.use_search), "think_ms": int(self.think_ms),
+                "moves_mode": self.moves_mode, "ai_on": bool(self.ai_on), "ai_sides": sorted(self.ai_sides),
+                "scale": round(float(self.scale), 3)}
+
+    def save_settings(self, force=False):
+        """Write the settings when they changed (checked about once a second; ``force`` at exit)."""
+        path = self.settings_path
+        if not path:
+            return
+        now = time.time()
+        if not force and now < self.settings_next:
+            return
+        self.settings_next = now + 1.0
+        snap = self.settings_snapshot()
+        if snap == self.settings_saved:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(snap, fh, indent=2)
+            os.replace(tmp, path)
+            self.settings_saved = snap
+        except OSError:
+            self.settings_path = None                       # read-only home or the like: give up quietly
+
+    def load_settings(self, given):
+        """Apply the saved settings, except for the ones a command-line option has already decided (``given``)."""
+        path = self.settings_path
+        try:
+            with open(path, encoding="utf-8") as fh:
+                saved = json.load(fh)
+            assert isinstance(saved, dict)
+        except Exception:
+            return
+        if "net" not in given and "tier" not in given:
+            tier = next((t for t in self.tiers if t["name"] == saved.get("tier")), None)
+            if tier is not None:
+                self.choose_tier(tier)
+            elif saved.get("net") and os.path.isfile(saved["net"]):
+                try:
+                    self.set_advisor(numpy_net.Advisor(saved["net"], self.advisor.max_plies if self.advisor else 300))
+                except Exception:
+                    pass
+        if "sound" not in given and isinstance(saved.get("sound"), bool):
+            self.sound_on = saved["sound"]
+        if "coords" not in given and isinstance(saved.get("coords"), bool):
+            self.coords = saved["coords"]
+        if "eval" not in given and saved.get("eval") and self.advisor is not None:
+            self.show_eval = True
+        if "search" not in given and isinstance(saved.get("search"), bool) and self.searcher is not None:
+            self.use_search = saved["search"]
+        if "think" not in given and isinstance(saved.get("think_ms"), int) and self.searcher is not None:
+            self.set_think(max(100, saved["think_ms"]))
+        if saved.get("moves_mode") in ("auto", "on", "off"):
+            self.moves_mode = saved["moves_mode"]
+        if "ai" not in given and isinstance(saved.get("ai_on"), bool):
+            sides = {x for x in saved.get("ai_sides", []) if x in ("b", "w")}
+            self.ai_on, self.ai_sides = saved["ai_on"] and bool(sides), (sides or self.ai_sides)
+            self.ai_changed()
+        if "scale" not in given and isinstance(saved.get("scale"), (int, float)) and 0.4 <= saved["scale"] <= 4:
+            try:
+                dw, dh = pygame.display.get_desktop_sizes()[0]
+            except Exception:
+                dw, dh = 10 ** 6, 10 ** 6
+            cw, ch = self.content_size()
+            self.apply_scale(min(saved["scale"], (dh - 90 - MENU_H) / float(ch), (dw - 30) / float(cw)))
+        self.settings_saved = self.settings_snapshot()
 
     def choose_tier(self, tier):
         """Game > Difficulty: load that level's network (and switch look-ahead search the way it was calibrated)."""
@@ -2014,7 +2131,7 @@ class App:
             has_marks = self.review is not None and any(self.review["marks"])
             review_label = ("Reviewing... %d%%" % int(100 * self.reviewer.progress) if self.reviewer is not None
                             else "Review game")
-            return [it("Look-ahead search (MCTS)", self.toggle_search, "S", checked=self.use_search,
+            return [it("Computer uses look-ahead search (MCTS)", self.toggle_search, "S", checked=self.use_search,
                        enabled=self.searcher is not None),
                     it("Eval bar", self.toggle_eval, "E", checked=self.show_eval, enabled=have_ai),
                     it("Hint", self.toggle_hint, "H", checked=self.current_hint() is not None, enabled=have_ai),
@@ -2586,7 +2703,7 @@ class App:
             how = "search %d" % sims if sims else "net"
             if self.game.done:
                 how = "final"
-            elif sims and self.search_for_here() is not None and self.search_for_here().solved:
+            elif sims and self.analysis_job_here() is not None and self.analysis_job_here().solved:
                 how = "forced win"
             self.text("Eval %+.2f  (%s, %s)" % (vw, who, how), (hx, L['eval_text_y']),
                       self.font_small, TEXT)
@@ -2981,6 +3098,9 @@ def main():
                     help="another folder of network files for the picker (N); may be repeated.  The picker also "
                          "lists *.npz / *.pt next to play.py, in runs/*/ and in nets/")
     ap.add_argument("--stats", default=None, metavar="FILE", help="where to keep the win/loss record")
+    ap.add_argument("--settings", default=None, metavar="FILE",
+                    help="where to remember your settings (difficulty, sound, ...; default: next to the record)")
+    ap.add_argument("--no-settings", action="store_true", help="do not remember or restore settings")
     ap.add_argument("--no-stats", action="store_true", help="do not keep a win/loss record")
     ap.add_argument("--flip", action="store_true",
                     help="draw the board from black's side and keep it that way (by default the board is "
@@ -3036,6 +3156,16 @@ def main():
               auto_orient=not (args.flip or args.fixed_board))
     if args.no_search:
         app.use_search = False
+    if not args.no_settings:
+        app.settings_path = args.settings or os.path.join(os.path.dirname(stats_default_path()), "settings.json")
+        argv = " ".join(sys.argv[1:])
+        given = set()
+        for key, flags in (("net", ("--ai ",)), ("sound", ("--no-sound",)), ("coords", ("--no-coords",)),
+                           ("eval", ("--eval",)), ("search", ("--no-search", "--sims")), ("think", ("--think-ms",)),
+                           ("ai", ("--ai-color", "--no-ai", "--black", "--white")), ("scale", ("--scale",))):
+            if any(f in argv + " " for f in flags):
+                given.add(key)
+        app.load_settings(given)
     if args.load:
         app.load(args.load)
     elif not args.no_resume:
@@ -3069,6 +3199,7 @@ def main():
                     app.scroll_moves(event.y)
         if resize is not None:
             app.on_resize(resize)
+        app.save_settings()
         if not app.help_open:
             app.poll_review()
             app.update_ai()
@@ -3076,6 +3207,7 @@ def main():
         app.draw()
         app.present()
         clock.tick(30)
+    app.save_settings(force=True)
     pygame.quit()
 
 
