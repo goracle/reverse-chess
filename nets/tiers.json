@@ -1,0 +1,26 @@
+{
+  "tiers": [
+    {
+      "loss_rate": 0.8633,
+      "target": 0.85,
+      "games": 600,
+      "draws": 34,
+      "ci": [
+        0.8335,
+        0.8885
+      ],
+      "version": 541,
+      "name": "Easy",
+      "path": "nets/easy.npz",
+      "search": false,
+      "source": "runs/tiers1/cands/v00541.pt"
+    },
+    {
+      "name": "Hard",
+      "path": "nets/hard.npz",
+      "search": true,
+      "loss_rate": 0.5,
+      "source": "runs/tiers1/main_ref.pt"
+    }
+  ]
+}
