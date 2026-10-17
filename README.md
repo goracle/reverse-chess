@@ -122,6 +122,9 @@ The rules are simple...ish.
   size that fits, centred (so a maximised window has equal room left and right).  The window manager owns the size
   while you drag, so the game just re-fits itself.  The window defaults to what fits the screen; `--scale F`,
   `Ctrl +` / `Ctrl -`, `Ctrl+0` (fit the screen), `Ctrl+1` (100%).
+* **Move input:** click a piece and then a square, or drag the piece to the square (View > Move input: *Click or
+  drag*, the default, *Click to move*, or *Drag to move*).  Dropping a piece on an unavailable square sends it back;
+  Shift held on the drop still shows the move menu for a one-variant move.  The choice is remembered.
 * **Remembered settings:** difficulty (or the network picked with `N`), sound, coordinates, eval bar, search and think
   time, the move-list setting, who the computer plays, and the window zoom are saved to `settings.json` in the same
   folder as the win/loss record (`~/.local/share/ReverseChess/` on Linux) and restored next time.  A command-line

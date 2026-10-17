@@ -577,6 +577,9 @@ class App:
         self.searcher = searcher if advisor is not None else None   # mcts.Searcher or None
         self.use_search = self.searcher is not None
         self.search_job = None
+        self.move_input = 'both'                         # 'both' | 'click' | 'drag' (View > Move input)
+        self.drag_src = self.drag_start = None           # a piece pressed with the mouse, maybe about to be dragged
+        self.dragging, self.drag_pos, self.drag_toggle, self.dropping = False, (0, 0), False, False
         self.ana_searcher, self.ana_job = None, None     # the main AI's search for the eval bar / hints (see analysis_searcher)
         self.default_ai = self.make_default_ai()
         self.base_think = self.searcher.think_ms if self.searcher is not None else 2500
@@ -1873,9 +1876,20 @@ class App:
         sq = self.xy_sq(x, y)
         game = self.game
         piece = game.board[sq]
-        if piece is not None and piece.team == game.turn:
+        can_drag = (self.move_input != 'click' and not self.dropping and not self.browsing
+                    and piece is not None and piece.team == game.turn and sq in self.by_src)
+        if can_drag:
+            self.drag_src, self.drag_start = sq, pos        # (becomes a drag once the pointer moves; see drag_motion)
+        if self.move_input == 'drag' and not self.dropping:
+            if not can_drag:
+                self.message = "Drag one of your blue-outlined pieces to a square to move it."
+            return
+        if piece is not None and piece.team == game.turn and not self.dropping:
             if sq == self.selected:       # click again to deselect
-                self.cancel()
+                if can_drag:
+                    self.drag_toggle = True                 # (a press that turns into a drag must not deselect)
+                else:
+                    self.cancel()
             elif sq in self.by_src:
                 self.selected = sq
                 self.message = ""
@@ -1895,6 +1909,66 @@ class App:
         else:
             self.message = (game.explain_illegal(self.selected, sq)
                             or "That move is not available.")
+
+    def drag_motion(self, pos):
+        """The pointer moved with the left button down: a pressed piece turns into a dragged one."""
+        if self.drag_src is None or pos[0] < -1000:        # (off the canvas: the piece stays where it was)
+            return
+        if not self.dragging:
+            if abs(pos[0] - self.drag_start[0]) + abs(pos[1] - self.drag_start[1]) < 10:
+                return
+            self.dragging = True
+            self.selected = self.drag_src                   # its destinations show while it is carried
+            self.message = ""
+        self.drag_pos = pos
+
+    def release(self, pos, force_menu=False, raw=None):
+        """The left button went up.  After a drag the piece is dropped on the square under the pointer."""
+        dragging, src, toggle = self.dragging, self.drag_src, self.drag_toggle
+        self.drag_src = self.drag_start = None
+        self.dragging = self.drag_toggle = False
+        if src is None or self.pending is not None or self.help_open or self.picker is not None:
+            return
+        if not dragging:
+            if toggle and self.selected == src:             # a click on the selected piece: deselect it
+                self.cancel()
+            return
+        x, y = pos
+        if (0 <= x < BOARD_PX and BOARD_Y <= y < BOARD_Y + BOARD_PX) and self.xy_sq(x, y) != src:
+            dst = self.xy_sq(x, y)
+            piece = self.game.board[dst]
+            if piece is not None and piece.team == self.game.turn:
+                self.message = ""                           # onto another of your own pieces: it goes back
+            else:
+                self.selected = src
+                self.dropping = True
+                try:
+                    self.handle_click(pos, force_menu, raw=raw)
+                finally:
+                    self.dropping = False
+        if self.move_input == 'drag' and self.pending is None:
+            self.selected = None                            # drag mode keeps no selection between moves
+
+    def draw_drag(self):
+        """The piece being carried, under the pointer."""
+        if not self.dragging or self.drag_src is None:
+            return
+        piece = self.game.board[self.drag_src]
+        if piece is None:
+            return
+        size = SQ + 8
+        sprite = self.sprite(piece.team, piece.ptype, size)
+        self.screen.blit(sprite, (self.drag_pos[0] - size // 2, self.drag_pos[1] - size // 2))
+
+    def set_move_input(self, mode):
+        self.move_input = mode
+        self.drag_src = self.drag_start = None
+        self.dragging = self.drag_toggle = False
+        if mode == 'drag':
+            self.selected = None if self.pending is None else self.selected
+        self.message = {"both": "Move by clicking a piece and then a square, or by dragging.",
+                        "click": "Move by clicking a piece and then a square.",
+                        "drag": "Move by dragging a piece to a square."}[mode]
 
     def resolve(self, force_menu=False):
         """Play the move, or open a menu for the next undecided choice.  A move with a single variant
@@ -2008,7 +2082,7 @@ class App:
                 net = path                                  # a network picked with N
         return {"tier": tier, "net": net, "sound": self.sound_on, "coords": self.coords,
                 "eval": bool(self.show_eval), "search": bool(self.use_search), "think_ms": int(self.think_ms),
-                "moves_mode": self.moves_mode, "ai_on": bool(self.ai_on), "ai_sides": sorted(self.ai_sides),
+                "moves_mode": self.moves_mode, "move_input": self.move_input, "ai_on": bool(self.ai_on), "ai_sides": sorted(self.ai_sides),
                 "scale": round(float(self.scale), 3)}
 
     def save_settings(self, force=False):
@@ -2061,6 +2135,8 @@ class App:
             self.use_search = saved["search"]
         if "think" not in given and isinstance(saved.get("think_ms"), int) and self.searcher is not None:
             self.set_think(max(100, saved["think_ms"]))
+        if saved.get("move_input") in ("both", "click", "drag"):
+            self.move_input = saved["move_input"]
         if saved.get("moves_mode") in ("auto", "on", "off"):
             self.moves_mode = saved["moves_mode"]
         if "ai" not in given and isinstance(saved.get("ai_on"), bool):
@@ -2148,6 +2224,10 @@ class App:
                         it("Automatic (review mode)", lambda: self.set_moves_mode('auto'), checked=self.moves_mode == 'auto'),
                         it("Always show", lambda: self.set_moves_mode('on'), checked=self.moves_mode == 'on'),
                         it("Never show", lambda: self.set_moves_mode('off'), checked=self.moves_mode == 'off')]),
+                    it("Move input", sub=[
+                        it("Click or drag", lambda: self.set_move_input('both'), checked=self.move_input == 'both'),
+                        it("Click to move", lambda: self.set_move_input('click'), checked=self.move_input == 'click'),
+                        it("Drag to move", lambda: self.set_move_input('drag'), checked=self.move_input == 'drag')]),
                     None,
                     it("Zoom in", lambda: self.zoom(1.1), "Ctrl++"),
                     it("Zoom out", lambda: self.zoom(1 / 1.1), "Ctrl+-"),
@@ -2319,6 +2399,7 @@ class App:
         self.draw_hint_arrows()
         self.draw_review_arrows()
         self.draw_premove()
+        self.draw_drag()
         self.draw_eval_bar()
         self.draw_panel()
         if self.tall:
@@ -2355,7 +2436,7 @@ class App:
 
         left = [
             ("PLAYING", [
-                "Click a blue-outlined piece, then a dotted destination.",
+                "Click a blue-outlined piece, then a dotted destination, or drag it there (View > Move input).",
                 "Click an unavailable square to see why that move is illegal.",
                 "Shift-click a destination to confirm even a one-option move.",
                 "Move menus: 1–9 or Up/Down + Enter; Backspace goes back. Esc closes the menu.",
@@ -2500,7 +2581,7 @@ class App:
                     colour = SELECT
                 pygame.draw.rect(self.screen, colour, rect)
                 piece = game.board[r, c]
-                if piece is not None:
+                if piece is not None and not (self.dragging and (r, c) == self.drag_src):
                     self.screen.blit(self.sprite(piece.team, piece.ptype, SQ - 12), (x + 6, y + 6))
                     if piece.promoted:   # a pawn wearing another piece's type
                         centre = (x + SQ - 18, y + 18)
@@ -3189,6 +3270,10 @@ def main():
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 # (Shift held: a move with one variant still shows its menu, to confirm)
                 app.handle_click(app.to_logical(event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT), raw=event.pos)
+            elif event.type == pygame.MOUSEMOTION and event.buttons[0]:
+                app.drag_motion(app.to_logical(event.pos))
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                app.release(app.to_logical(event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT), raw=event.pos)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 if not app.help_open:
                     app.right_click()
