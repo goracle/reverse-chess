@@ -19,6 +19,9 @@ How to play
   appears in the window.  *Back* returns to the previous question, the X (or
   Esc) closes the menu and keeps your piece selected; nothing is played until
   the last question is answered.
+* Everything else lives in the menu bar along the top (File, Game, Analysis, View, Help); the window is
+  just the board and one slim side panel, and grows a move-list column only in review mode (or when
+  View > Move list > Always show says so).
 * The panel on the right shows which pieces are still off the board for each
   team (those are the pieces the *other* side can give back) and how many of
   a team's on-board pieces are home.
@@ -43,7 +46,7 @@ With no file the computer moves at random and the eval bar and hints are unavail
   when a winning move was found); before that it is the network's raw estimate ("net").
 * Hint (H): the three favourite moves, as arrows and in the panel (the network's policy at
   first, then the search's most-visited moves as it deepens).
-* AI on/off (A) and which colour(s) the AI plays: buttons in the panel.
+* AI on/off (A) and which colour(s) the AI plays: Game > Computer plays.
 * Your record against the AI (won / lost / drawn, by colour) is kept in a small file in your
   user data folder (see stats.py); a game counts only if the opponent was the AI from the first
   move to the last.  Games where you used hints are counted too, and noted.
@@ -95,7 +98,7 @@ Play feel and window
 * Move menu: keys 1-9, Up / Down + Enter, Backspace.  Shift+click on the destination confirms even a
   single-variant move.  The highlighted option's gift is ghosted on the board.
 * Premove: on the computer's turn click your piece and its destination; right-click / Esc cancels.
-* The slider in the move column sets the AI's think time (the simulation cap scales with it).
+* Game > Think time sets the AI's think time (the simulation cap scales with it).
 
 Custom agents
 -------------
@@ -110,6 +113,7 @@ Only pygame and numpy are needed; there is no tkinter and no pop-up window.
 import argparse
 import glob
 import importlib
+import json
 import math
 import os
 import random
@@ -138,18 +142,23 @@ SQ = 100                         # pixels per square
 BOARD_PX = SQ * SIZE
 BAR_W = 34                       # the eval bar, between the board and the panel
 PANEL_X = BOARD_PX + BAR_W
-PANEL_W = 280
+PANEL_W = 252
 MOVES_X = PANEL_X + PANEL_W
-MOVES_W = 220                    # the move list / game history column
+MOVES_W = 220                    # the move list / game history column (only on screen in review mode)
+MENU_H = 30                      # the menu bar along the top
+BOARD_Y = MENU_H                 # top edge of the board
 ROW_H = 20
 EVAL_COL_W = 34                  # the little eval bar at the right of each move-list row
 MAX_VARIATIONS = 12              # side lines kept by the variation stack (Tab)
 THINK_STEPS = (100, 250, 500, 1000, 2500, 5000, 10000, 20000)   # ms: the AI think-time slider's stops
 PICK_ROWS = 14                   # rows of the network picker that show at once
 PREMOVE_COLOUR = (70, 140, 255, 200)
-STATUS_H = 92
-WIN_W = MOVES_X + MOVES_W
-WIN_H = BOARD_PX + STATUS_H
+STATUS_H = 84
+COMPACT_W = MOVES_X              # window width: board, eval bar and side panel
+WIN_W = MOVES_X + MOVES_W        # ... and with the move-list column (review mode)
+WIN_H = BOARD_Y + BOARD_PX + STATUS_H
+PANEL_SPLIT = 366                 # portrait layout: the side panel is cut here (trays above, controls below)
+MENU_TITLES = ("File", "Game", "Analysis", "View", "Help")
 
 LIGHT = (238, 238, 210)
 DARK = (118, 150, 86)
@@ -184,37 +193,28 @@ DIMENSIONS = ('demote', 'gift', 'en_passant', 'promote')
 
 
 def make_layout():
-    """Rectangles of the panel's controls (fixed; only their labels change)."""
+    """Rectangles of the clickable parts of the side panel and of the move-list column (the latter is only on
+    screen while the window is expanded).  Fixed; only their labels change."""
     x0 = PANEL_X + 14
     w = PANEL_W - 28
-    half = (w - 8) // 2
-    third = (w - 16) // 3   # also used by the AI / Eval / Search row
     R = pygame.Rect
     return {
         'x0': x0, 'w': w,
-        'net': R(x0, 340, w, 38),            # the AI's name: click to pick another network
-        'ai': R(x0, 382, third, 30),
-        'eval': R(x0 + third + 8, 382, third, 30),
-        'search': R(x0 + 2 * (third + 8), 382, third, 30),
-        'side_label_y': 418,
-        'side_b': R(x0, 434, third, 28),
-        'side_w': R(x0 + third + 8, 434, third, 28),
-        'side_both': R(x0 + 2 * (third + 8), 434, third, 28),
-        'hint': R(x0, 470, w, 30),
-        'eval_text_y': 506,
-        'hint_y': 524,
-        'stats_y': 642,
-        'reset': R(x0, 734, w, 24),
-        # the move list column
-        'm_undo': R(MOVES_X + 14, 40, 92, 28), 'm_flip': R(MOVES_X + 114, 40, 92, 28),
-        'm_save': R(MOVES_X + 14, 74, 92, 28), 'm_load': R(MOVES_X + 114, 74, 92, 28),
-        'm_review': R(MOVES_X + 14, 108, 92, 28), 'm_next': R(MOVES_X + 114, 108, 92, 28),
-        'm_help': R(MOVES_X + MOVES_W - 48, 8, 34, 28),
-        'm_sound': R(MOVES_X + 14, 142, 92, 28), 'm_coords': R(MOVES_X + 114, 142, 92, 28),
-        'm_think': R(MOVES_X + 14, 176, MOVES_W - 28, 30),     # the AI think-time slider
-        'm_list': R(MOVES_X + 6, 246, MOVES_W - 12, ROW_H * 25),
-        'm_graph': R(MOVES_X + 14, 246 + ROW_H * 25 + 12, MOVES_W - 28, 66),
+        'net': R(x0, BOARD_Y + 40, w, 38),   # the AI's name: click to pick another network
+        'eval_text_y': BOARD_Y + 372,
+        'hint_y': BOARD_Y + 392,
+        'stats_y': BOARD_Y + 560,
+        # the move-list column
+        'm_prev': R(MOVES_X + 14, BOARD_Y + 44, 92, 28), 'm_next': R(MOVES_X + 114, BOARD_Y + 44, 92, 28),
+        'm_list': R(MOVES_X + 6, BOARD_Y + 134, MOVES_W - 12, ROW_H * 27),
+        'm_graph': R(MOVES_X + 14, BOARD_Y + 134 + ROW_H * 27 + 12, MOVES_W - 28, 66),
     }
+
+
+def menu_item(label, run=None, key="", checked=None, enabled=True, sub=None, keep=False):
+    """One entry of a drop-down menu (a separator is just ``None``).  ``sub``: a list of entries for a sub-menu;
+    ``keep``: leave the menu open after the click."""
+    return {"label": label, "run": run, "key": key, "checked": checked, "enabled": enabled, "sub": sub, "keep": keep}
 
 
 # --------------------------------------------------------------------------
@@ -397,7 +397,7 @@ def app_dir():
 
 
 def auto_scale():
-    """The window scale that fits the desktop (at most 1): the board is 1334 x 892 pixels at 1.0."""
+    """The window scale that fits the desktop (at most 1): 1114 x 914 pixels at 1.0, 1334 x 914 in review mode."""
     try:
         width, height = pygame.display.get_desktop_sizes()[0]
     except Exception:                                  # old pygame, no display: no opinion
@@ -405,6 +405,32 @@ def auto_scale():
     if width <= 0 or height <= 0:
         return 1.0
     return max(0.4, min(1.0, (height - 90) / WIN_H, (width - 30) / WIN_W))
+
+
+def find_tiers(extra_dirs=()):
+    """Difficulty levels written by ``tiers.py``: ``[{name, path, search, loss_rate}]``, easiest first.  Read from
+    ``nets/tiers.json`` next to play.py, in the working directory or in ``extra_dirs``; entries whose file is
+    missing are left out."""
+    for base in [app_dir(), os.getcwd()] + list(extra_dirs):
+        manifest = os.path.join(base or "", "nets", "tiers.json")
+        if not os.path.isfile(manifest):
+            continue
+        try:
+            with open(manifest, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        tiers = []
+        for entry in data.get("tiers", []):
+            path = entry.get("path") or ""
+            path = path if os.path.isabs(path) else os.path.join(base, path)
+            if os.path.isfile(path):
+                tiers.append({"name": str(entry.get("name", os.path.basename(path))), "path": path,
+                              "search": bool(entry.get("search", False)),
+                              "loss_rate": entry.get("loss_rate")})
+        if tiers:
+            return tiers
+    return []
 
 
 def think_label(ms):
@@ -499,12 +525,17 @@ class App:
                  auto_orient=True):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
-        # Everything is drawn on a fixed-size canvas (WIN_W x WIN_H); present() scales it into the
-        # (resizable) window, and to_logical() / mouse() map the pointer back.
-        self.canvas = self.screen = pygame.Surface((WIN_W, WIN_H))
+        # See "the window" below: a scaled canvas under a menu bar drawn at window level.
+        self.expanded = False
+        self.win_w, self.win_h = COMPACT_W, WIN_H
+        self.canvas = self.screen = pygame.Surface((self.win_w, self.win_h), 0, 32)
         self.window = None
+        self.os_window = None
+        self.size_wanted, self.size_deadline = None, 0.0
+        self.last_seen, self.changed_at, self.snap_refused = None, 0.0, None
+        self.regions, self.mode = [], "landscape"
         self.scale = 1.0
-        self.view = pygame.Rect(0, 0, WIN_W, WIN_H)         # where the canvas sits in the window
+        self.view = pygame.Rect(0, MENU_H, self.win_w, self.win_h - MENU_H)   # where the canvas sits in the window
         self.apply_scale(auto_scale() if scale is None else scale)
         self.font = pygame.font.SysFont(None, 28)
         self.font_big = pygame.font.SysFont(None, 38)
@@ -549,48 +580,191 @@ class App:
         self.premove = None           # (src, dst) queued while the computer thinks
         self.pre_src = None           # the piece picked for a premove, waiting for its destination
         self.menu_sel = None          # the menu option highlighted from the keyboard
-        self.dragging = None          # 'think' while the think-time slider is being dragged
+        self.menu_open = None         # index (into MENU_TITLES) of the open drop-down menu, or None
+        self.menu_sub = None          # label of the entry whose sub-menu is open
+        self.moves_mode = 'auto'      # the move-list column: 'auto' (review / browsing), 'on' or 'off'
+        self.tiers = find_tiers(self.net_dirs)
         self.refresh_agents()
         self.new_game()
         self.orient()
         if stats is not None and stats.error:
             self.message = stats.error
 
-    # -- the window: one logical canvas, scaled to whatever size the window has ----------
-    def apply_scale(self, factor):
-        """Open (or resize) the window at ``factor`` times the canvas size (1.0 = 1334 x 892)."""
-        factor = max(0.4, min(2.0, factor))
-        self.window = pygame.display.set_mode((int(WIN_W * factor), int(WIN_H * factor)), pygame.RESIZABLE)
-        self.fit_view()
+    # -- the window: a menu bar at the top, and below it the game, scaled to fit --------------
+    # The game is drawn on a canvas of win_w x win_h logical pixels (COMPACT_W wide normally, WIN_W with the
+    # move-list column, see sync_window).  Its top MENU_H rows are unused: the menu bar is drawn straight onto
+    # the window afterwards, at full window width and at its own fixed size (like any other Linux program's).
+    # present() scales the rest of the canvas to the largest size that fits under the menu bar and extends the
+    # canvas' own background colours into whatever room is left over, so resizing the window never leaves
+    # bars of another colour.
+    def window_size_for(self, factor, win_w=None):
+        """Window pixels that show the canvas at ``factor`` times its size (the menu bar is not scaled)."""
+        win_w = self.win_w if win_w is None else win_w
+        return int(win_w * factor), MENU_H + int((self.win_h - MENU_H) * factor)
 
-    def fit_view(self):
-        """Place the canvas in the window: as large as fits, centred, aspect ratio kept."""
+    def set_window_size(self, size):
+        """Resize the open window.  This resizes the existing SDL window in place; calling set_mode again
+        instead re-creates the window, which blanks / re-animates it (a flicker and a fade on most desktops)."""
+        size = (max(1, int(size[0])), max(1, int(size[1])))
+        if self.window is not None:
+            try:
+                if self.os_window is None:
+                    from pygame._sdl2 import video as sdl_video
+                    self.os_window = sdl_video.Window.from_display_module()
+                if tuple(self.window.get_size()) != size:
+                    self.os_window.size = size
+                    self.size_wanted, self.size_deadline = size, time.time() + 0.5
+                return
+            except Exception:              # no such API / no such window (headless): the old way still works
+                self.os_window = None
+        self.window = pygame.display.set_mode(size, pygame.RESIZABLE)
+        try:
+            from pygame._sdl2 import video as sdl_video
+            self.os_window = sdl_video.Window.from_display_module()
+        except Exception:
+            self.os_window = None
+        try:
+            self.os_window.minimum_size = (320, MENU_H + 240)      # (pygame-ce only)
+        except Exception:
+            pass
+
+    def apply_scale(self, factor):
+        """Resize the window to show the canvas at ``factor`` (1.0 = 1114 x 914, or 1334 x 914 with the
+        move-list column)."""
+        factor = max(0.4, min(2.0, factor))
+        size = self.window_size_for(factor)
+        self.set_window_size(size)
+        self.fit_view(size)
+
+    def fit_view(self, size=None):
+        """Lay the canvas out in the window (see ``compute_regions``)."""
+        ww, wh = size or self.window.get_size()
+        self.compute_regions(ww, max(1, wh - MENU_H))
+
+    def compute_regions(self, ww, ah):
+        """Decide how the window shows the canvas.  The canvas is the landscape picture: board, eval bar and
+        side panel in a row, the status line under the board.  In a window that is taller than that, the
+        same pieces are re-arranged: the board on top at the full window width, the status line under it,
+        and the side panel (cut in two halves) under that, so the board and the text grow with the window
+        instead of leaving empty room.  Every part is a ``(canvas rect, (x, y) in the window, scale)``."""
+        exp = self.expanded
+        land = min(ww / float(self.win_w), ah / float(self.win_h - MENU_H))
+        bottom_h = (self.win_h - BOARD_Y) - PANEL_SPLIT
+        pw = max(PANEL_X + (MOVES_W if exp else 0), 2 * PANEL_W)
+        ph = BOARD_PX + STATUS_H + bottom_h
+        port = min(ww / float(pw), ah / float(ph))
+        R = pygame.Rect
+        if port > land * 1.001 and not getattr(self, 'help_open', False):
+            s = port
+            y0 = MENU_H + int(round((BOARD_PX + STATUS_H) * s))
+            edge = PANEL_X
+            if getattr(self, 'pending', None) is not None:    # (the decision menu is drawn partly over the eval bar)
+                edge = min(PANEL_X, self.menu_geometry(len(self.pending[1]), bool(self.history))[0].x)
+            regions = [(R(0, BOARD_Y, edge, BOARD_PX), (0, MENU_H), s),
+                       (R(0, BOARD_Y + BOARD_PX, PANEL_X, STATUS_H), (0, MENU_H + int(round(BOARD_PX * s))), s)]
+            if getattr(self, 'pending', None) is not None:   # the decision menu takes the place of the side panel
+                mp = self.menu_geometry(len(self.pending[1]), bool(self.history))[0]
+                zw, zh = ww, MENU_H + ah - y0
+                sm = max(0.05, min(s, zw / float(mp.w), zh / float(mp.h)))
+                regions.append((mp, (max(0, int((PANEL_X * s - mp.w * sm) // 2)), y0), sm))
+            else:
+                x0 = max(0, int(round((PANEL_X - 2 * PANEL_W) * s)) // 2)
+                regions.append((R(PANEL_X, BOARD_Y, PANEL_W, PANEL_SPLIT), (x0, y0), s))
+                regions.append((R(PANEL_X, BOARD_Y + PANEL_SPLIT, PANEL_W, self.win_h - BOARD_Y - PANEL_SPLIT),
+                                (x0 + int(round(PANEL_W * s)), y0), s))
+            if exp:
+                regions.append((R(MOVES_X, BOARD_Y, MOVES_W, self.win_h - BOARD_Y), (int(round(PANEL_X * s)), MENU_H), s))
+            self.mode = "portrait"
+        else:
+            s = land
+            regions = [(R(0, MENU_H, self.win_w, self.win_h - MENU_H), (0, MENU_H), s)]
+            self.mode = "landscape"
+        self.regions = regions
+        self.scale = s
+        w = max(int(round(r.w * sc)) + dx for r, (dx, dy), sc in regions)
+        h = max(int(round(r.h * sc)) + dy for r, (dx, dy), sc in regions) - MENU_H
+        self.view = pygame.Rect(0, MENU_H, max(1, w), max(1, h))
+
+    def want_expanded(self):
+        """Is the move-list column needed?  By default only while a review exists or runs, or while an
+        earlier position is on the board (View > Move list overrides this)."""
+        if self.moves_mode == 'on':
+            return True
+        if self.moves_mode == 'off':
+            return False
+        return self.review is not None or self.reviewer is not None or self.browsing
+
+    def sync_window(self):
+        """Make room for the move-list column, or give it back, keeping the zoom and the window's height."""
+        want = self.want_expanded()
+        if want == self.expanded:
+            return
+        old_w = self.win_w
+        self.expanded = want
+        self.win_w = WIN_W if want else COMPACT_W
+        self.canvas = self.screen = pygame.Surface((self.win_w, self.win_h), 0, 32)
         ww, wh = self.window.get_size()
-        s = min(ww / float(WIN_W), wh / float(WIN_H))
-        w, h = max(1, int(WIN_W * s)), max(1, int(WIN_H * s))
-        self.view = pygame.Rect((ww - w) // 2, (wh - h) // 2, w, h)
-        self.scale = w / float(WIN_W)
+        size = (ww + int(round((self.win_w - old_w) * self.scale)), wh) if self.mode == "landscape" else (ww, wh)
+        self.set_window_size(size)
+        self.fit_view(size)
 
     def zoom(self, factor):
         self.apply_scale(self.scale * factor)
         self.message = "Window scale %d%%  (Ctrl +/- resize, Ctrl+0 fit the screen, Ctrl+1 100%%)." % round(100 * self.scale)
 
     def present(self):
-        """Show the finished frame: the canvas, scaled into the window."""
-        self.window = pygame.display.get_surface()
+        """Show the finished frame: the canvas parts arranged and scaled into the window, the menu bar on top."""
+        window = pygame.display.get_surface()
+        if self.size_wanted is not None:
+            # A resize we asked for has not reached the window's surface yet: drawing on the old surface now
+            # would scribble on memory that is about to be replaced (that shows up as garbage), so wait for it.
+            pygame.event.pump()
+            window = pygame.display.get_surface()
+            if window.get_size() != self.size_wanted and time.time() < self.size_deadline:
+                return
+            self.size_wanted = None
+        self.window = window
         self.fit_view()
-        if self.view.size != self.window.get_size():
-            self.window.fill((0, 0, 0))
-        if self.view.size == (WIN_W, WIN_H):
-            self.window.blit(self.canvas, self.view.topleft)
-        else:
-            self.window.blit(pygame.transform.smoothscale(self.canvas, self.view.size), self.view.topleft)
+        window.fill(PANEL_BG)
+        for src, (dx, dy), sc in self.regions:
+            src = src.clip(self.canvas.get_rect())
+            size = (max(1, int(round(src.w * sc))), max(1, int(round(src.h * sc))))
+            part = pygame.Surface(src.size, 0, 32)       # a plain copy: smoothscale on a sub-surface can misread rows
+            part.blit(self.canvas, (0, 0), src)
+            window.blit(part if size == src.size else pygame.transform.smoothscale(part, size), (dx, dy))
+        self.draw_menubar(window)
+        self.draw_dropdown(window)
         pygame.display.flip()
+        self.settle_window()
+
+    def settle_window(self):
+        """The layout has a fixed shape, so a window of another shape would show an empty strip.  A moment after
+        the user stops resizing, the window itself is trimmed to the shape of what it shows (the dimension that
+        had room to spare shrinks), so nothing blank is ever left on screen."""
+        cur = self.window.get_size()
+        now = time.time()
+        if cur != self.last_seen:
+            self.last_seen, self.changed_at = cur, now
+            return
+        target = (self.view.w, MENU_H + self.view.h)
+        if abs(target[0] - cur[0]) <= 1 and abs(target[1] - cur[1]) <= 1:
+            self.snap_refused = None
+            return
+        if now - self.changed_at < 0.25 or cur == self.snap_refused:
+            return
+        self.snap_refused = cur                    # if the window manager ignores this, do not ask again at this size
+        self.set_window_size(target)
 
     def to_logical(self, pos):
-        """A window pixel -> the canvas pixel under it (outside the canvas: outside 0..WIN_W/H)."""
-        return (int(math.floor((pos[0] - self.view.x) / self.scale)),
-                int(math.floor((pos[1] - self.view.y) / self.scale)))
+        """A window pixel -> the canvas pixel under it (nowhere on the canvas: far outside it)."""
+        for src, (dx, dy), sc in self.regions:
+            if dx <= pos[0] < dx + int(round(src.w * sc)) and dy <= pos[1] < dy + int(round(src.h * sc)):
+                return (src.x + int(math.floor((pos[0] - dx) / sc)), src.y + int(math.floor((pos[1] - dy) / sc)))
+        return (-9999, -9999)
+
+    def raw_mouse(self):
+        """The pointer in window pixels (the menu bar and its drop-downs live there, unscaled)."""
+        return pygame.mouse.get_pos()
 
     def mouse(self):
         return self.to_logical(pygame.mouse.get_pos())
@@ -687,27 +861,6 @@ class App:
     def think_enabled(self):
         return self.searcher is not None and self.use_search
 
-    def think_track(self):
-        r = self.layout['m_think']
-        return pygame.Rect(r.x + 6, r.y + 20, r.w - 12, 8)
-
-    def think_frac(self):
-        lo, hi = THINK_STEPS[0], THINK_STEPS[-1]
-        ms = max(lo, min(hi, self.think_ms))
-        return (math.log(ms) - math.log(lo)) / (math.log(hi) - math.log(lo))
-
-    def set_think_from_x(self, x):
-        """Move the slider to the pixel ``x``: the nearest stop on a log scale."""
-        track = self.think_track()
-        frac = max(0.0, min(1.0, (x - track.x) / float(max(track.w, 1))))
-        lo, hi = THINK_STEPS[0], THINK_STEPS[-1]
-        target = math.log(lo) + frac * (math.log(hi) - math.log(lo))
-        self.set_think(min(THINK_STEPS, key=lambda step: abs(math.log(step) - target)))
-
-    def drag(self, pos):
-        if self.dragging == 'think':
-            self.set_think_from_x(pos[0])
-
     # -- premove: queue a move while the computer thinks ---------------------
     def premove_possible(self):
         game = self.game
@@ -718,14 +871,16 @@ class App:
         self.premove = self.pre_src = None
 
     def right_click(self):
-        if self.premove is not None or self.pre_src is not None:
+        if self.menu_open is not None:
+            self.close_menus()
+        elif self.premove is not None or self.pre_src is not None:
             self.clear_premove()
             self.message = "Premove cancelled."
 
     def premove_click(self, pos):
         """A click on the computer's turn: pick one of your pieces, then where it goes."""
         x, y = pos
-        if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX) or not self.premove_possible():
+        if not (0 <= x < BOARD_PX and BOARD_Y <= y < BOARD_Y + BOARD_PX) or not self.premove_possible():
             return
         mine = other_team(self.game.turn)
         sq = self.xy_sq(x, y)
@@ -764,6 +919,7 @@ class App:
 
     # -- the network picker (N) ------------------------------------------------
     def open_picker(self):
+        self.close_menus()
         items = find_nets(self.net_dirs)
         if not items:
             self.message = ("No network files found (looked next to play.py, in runs/*/ and nets/, and in "
@@ -792,7 +948,7 @@ class App:
         n = min(PICK_ROWS, len(self.picker["items"]))
         width, row = 700, 30
         height = 62 + n * row + 30
-        panel = pygame.Rect((BOARD_PX - width) // 2, (BOARD_PX - height) // 2, width, height)
+        panel = pygame.Rect((BOARD_PX - width) // 2, BOARD_Y + (BOARD_PX - height) // 2, width, height)
         rows = [pygame.Rect(panel.x + 14, panel.y + 56 + i * row, width - 28, row - 2) for i in range(n)]
         return panel, rows, pygame.Rect(panel.right - 46, panel.y + 10, 34, 34)
 
@@ -834,6 +990,9 @@ class App:
             return
         self.set_advisor(advisor)
 
+    def menu_geometry(self, n, with_back=False):
+        return menu_rects(n, with_back, self.win_w, self.win_h)
+
     # -- the move menu from the keyboard, and a preview of the highlighted option -----------
     def menu_key(self, key):
         """Keys while a move menu is open: 1-9 choose, Up / Down + Enter choose, Backspace goes back."""
@@ -858,7 +1017,7 @@ class App:
         if self.pending is None:
             return None
         dim, values = self.pending
-        _, rects, _, _ = menu_rects(len(values), bool(self.history))
+        _, rects, _, _ = self.menu_geometry(len(values), bool(self.history))
         mouse = self.mouse()
         index = next((i for i, rect in enumerate(rects) if rect.collidepoint(mouse)), self.menu_sel)
         if index is None or index >= len(values):
@@ -1502,49 +1661,14 @@ class App:
             self.confirm_reset_until = now + 3000
 
     def click_panel(self, pos):
+        """A click right of the board: the network name, or (in review mode) the move-list column."""
         L = self.layout
-        if L['m_help'].collidepoint(pos):
-            self.help_open = not self.help_open
-        elif L['net'].collidepoint(pos):
+        if L['net'].collidepoint(pos):
             self.open_picker()
-        elif L['ai'].collidepoint(pos):
-            self.toggle_ai()
-        elif L['eval'].collidepoint(pos):
-            self.toggle_eval()
-        elif L['search'].collidepoint(pos):
-            self.toggle_search()
-        elif L['side_b'].collidepoint(pos):
-            self.set_sides({'b'})
-        elif L['side_w'].collidepoint(pos):
-            self.set_sides({'w'})
-        elif L['side_both'].collidepoint(pos):
-            self.set_sides({'b', 'w'})
-        elif L['hint'].collidepoint(pos):
-            self.toggle_hint()
-        elif L['reset'].collidepoint(pos):
-            self.click_reset()
-        elif L['m_undo'].collidepoint(pos):
-            self.takeback()
-        elif L['m_flip'].collidepoint(pos):
-            self.flip()
-        elif L['m_save'].collidepoint(pos):
-            self.save()
-        elif L['m_load'].collidepoint(pos):
-            self.load()
-        elif L['m_review'].collidepoint(pos):
-            self.start_review()
+        elif L['m_prev'].collidepoint(pos):
+            self.next_mistake(-1)
         elif L['m_next'].collidepoint(pos):
-            self.next_mistake()
-        elif L['m_sound'].collidepoint(pos):
-            self.toggle_sound()
-        elif L['m_coords'].collidepoint(pos):
-            self.toggle_coords()
-        elif L['m_think'].collidepoint(pos):
-            if self.think_enabled():
-                self.dragging = 'think'
-                self.set_think_from_x(pos[0])
-            else:
-                self.message = "The think-time slider needs the AI file and MCTS switched on (S)."
+            self.next_mistake(1)
         elif L['m_list'].collidepoint(pos):
             row = self.moves_first_row() + (pos[1] - L['m_list'].y) // ROW_H
             if 0 <= row <= len(self.line):
@@ -1565,6 +1689,10 @@ class App:
         key, mod = event.key, event.mod
         ctrl = bool(mod & pygame.KMOD_CTRL)
         help_key = key == pygame.K_F1 or (key == pygame.K_SLASH and bool(mod & pygame.KMOD_SHIFT))
+        if self.menu_open is not None:              # any key closes an open menu; Esc does nothing more
+            self.close_menus()
+            if key == pygame.K_ESCAPE:
+                return
 
         # The guide is a true modal overlay: no hidden move/navigation actions while it is open.
         if self.help_open:
@@ -1651,8 +1779,9 @@ class App:
     def human_to_move(self):
         return not self.game.done and self.agents[self.game.turn] is None
 
-    def handle_click(self, pos, force_menu=False):
-        """A left click at canvas pixel ``pos``.  ``force_menu`` (Shift held): ask even about a move that
+    def handle_click(self, pos, force_menu=False, raw=None):
+        """A left click at canvas pixel ``pos`` (``raw``: the same click in window pixels, which is where the
+        menu bar is; default: the same numbers).  ``force_menu`` (Shift held): ask even about a move that
         has only one variant, with a preview of it, before playing."""
         if self.help_open:
             self.help_open = False
@@ -1660,8 +1789,10 @@ class App:
         if self.picker is not None:               # so is the network picker
             self.click_picker(pos)
             return
-        if self.pending is not None:              # the menu is modal
+        if self.pending is not None:              # the move menu is modal
             self.click_menu(pos)
+            return
+        if self.menu_click(pos if raw is None else raw):   # the menu bar and its drop-downs
             return
         if pos[0] >= BOARD_PX:
             self.click_panel(pos)
@@ -1670,7 +1801,7 @@ class App:
             self.premove_click(pos)               # the computer's turn: queue a move for afterwards
             return
         x, y = pos
-        if not (0 <= x < BOARD_PX and 0 <= y < BOARD_PX):
+        if not (0 <= x < BOARD_PX and BOARD_Y <= y < BOARD_Y + BOARD_PX):
             return
         sq = self.xy_sq(x, y)
         game = self.game
@@ -1727,7 +1858,7 @@ class App:
 
     def click_menu(self, pos):
         dim, values = self.pending
-        panel, rects, x_rect, back_rect = menu_rects(len(values), bool(self.history))
+        panel, rects, x_rect, back_rect = self.menu_geometry(len(values), bool(self.history))
         if x_rect.collidepoint(pos):
             self.close_menu()
         elif back_rect is not None and back_rect.collidepoint(pos):
@@ -1775,13 +1906,249 @@ class App:
             action = self.rng.choice(game.legal_actions())
         self.play(action)
 
+    # -- the menu bar -----------------------------------------------------------
+    def close_menus(self):
+        self.menu_open = None
+        self.menu_sub = None
+
+    def quit(self):
+        pygame.event.post(pygame.event.Event(pygame.QUIT))
+
+    def toggle_help(self):
+        self.help_open = not self.help_open
+
+    def set_moves_mode(self, mode):
+        self.moves_mode = mode
+
+    def set_ai_sides(self, sides):
+        """Game > Computer plays: ``None`` = nobody (two humans), else the set of teams the AI plays."""
+        if sides is None:
+            if self.ai_on:
+                self.toggle_ai()
+        elif not self.ai_on or set(sides) != self.ai_sides:
+            self.ai_on = True
+            self.ai_sides = set(sides)
+            self.ai_changed()
+
+    def choose_tier(self, tier):
+        """Game > Difficulty: load that level's network (and switch look-ahead search the way it was calibrated)."""
+        try:
+            advisor = numpy_net.Advisor(tier["path"], self.advisor.max_plies if self.advisor is not None else 300)
+        except Exception as err:
+            self.message = "Could not load %s: %s" % (os.path.basename(tier["path"]), err)
+            return
+        self.set_advisor(advisor)
+        self.use_search = bool(tier["search"]) and self.searcher is not None
+        self.message = "Difficulty: %s." % tier["name"]
+
+    def tier_current(self, tier):
+        return (self.advisor is not None and
+                os.path.realpath(getattr(self.advisor, "path", "") or "") == os.path.realpath(tier["path"]))
+
+    def menu_items(self, index):
+        """The entries of drop-down ``index``, built fresh (their labels and ticks follow the game's state)."""
+        it = menu_item
+        title = MENU_TITLES[index]
+        have_ai = self.advisor is not None
+        if title == "File":
+            return [it("New game", self.restart, "R"), None,
+                    it("Save game", self.save, "Ctrl+S", enabled=bool(self.line)),
+                    it("Load game", self.load, "Ctrl+O"), None,
+                    it("Copy moves", self.copy_moves, "Ctrl+C", enabled=bool(self.line)),
+                    it("Copy game (JSON)", self.copy_json, "Ctrl+Shift+C", enabled=bool(self.line)),
+                    it("Paste game", self.paste, "Ctrl+V"), None,
+                    it("Quit", self.quit)]
+        if title == "Game":
+            ai_on, sides = self.ai_on, self.ai_sides
+            items = [it("Undo", self.takeback, "Z", enabled=self.pos > 0),
+                     it("Flip board", self.flip, "F", checked=self.flipped), None,
+                     it("Computer plays", sub=[
+                         it("Nobody (two humans)", lambda: self.set_ai_sides(None), checked=not ai_on),
+                         it("Black", lambda: self.set_ai_sides({'b'}), checked=ai_on and sides == {'b'}),
+                         it("White", lambda: self.set_ai_sides({'w'}), checked=ai_on and sides == {'w'}),
+                         it("Both", lambda: self.set_ai_sides({'b', 'w'}), checked=ai_on and sides == {'b', 'w'})]),
+                     it("Network...", self.open_picker, "N")]
+            if self.tiers:
+                items.append(it("Difficulty", sub=[
+                    it("%s%s" % (t["name"], "  (loses %d%%)" % round(100 * t["loss_rate"])
+                                 if isinstance(t.get("loss_rate"), (int, float)) and t["loss_rate"] > 0.5 else ""),
+                       lambda t=t: self.choose_tier(t), checked=self.tier_current(t)) for t in self.tiers]))
+            items.append(it("Think time", enabled=self.think_enabled(), sub=[
+                it(think_label(ms), lambda ms=ms: self.set_think(ms), checked=self.think_ms == ms)
+                for ms in THINK_STEPS]))
+            items.append(None)
+            confirming = pygame.time.get_ticks() < self.confirm_reset_until
+            items.append(it("Click again to erase the record" if confirming else "Reset win / loss record",
+                            self.click_reset, enabled=self.stats is not None and bool(self.stats.games), keep=True))
+            return items
+        if title == "Analysis":
+            has_marks = self.review is not None and any(self.review["marks"])
+            review_label = ("Reviewing... %d%%" % int(100 * self.reviewer.progress) if self.reviewer is not None
+                            else "Review game")
+            return [it("Look-ahead search (MCTS)", self.toggle_search, "S", checked=self.use_search,
+                       enabled=self.searcher is not None),
+                    it("Eval bar", self.toggle_eval, "E", checked=self.show_eval, enabled=have_ai),
+                    it("Hint", self.toggle_hint, "H", checked=self.current_hint() is not None, enabled=have_ai),
+                    None,
+                    it(review_label, self.start_review, "V",
+                       enabled=have_ai and bool(self.line) and self.reviewer is None),
+                    it("Next marked move", lambda: self.next_mistake(1), "M", enabled=has_marks),
+                    it("Previous marked move", lambda: self.next_mistake(-1), "Shift+M", enabled=has_marks),
+                    it("Play the network's move", self.play_network_move, "P", enabled=have_ai)]
+        if title == "View":
+            return [it("Coordinates", self.toggle_coords, "C", checked=self.coords),
+                    it("Sound", self.toggle_sound, "U", checked=self.sound_on), None,
+                    it("Move list", sub=[
+                        it("Automatic (review mode)", lambda: self.set_moves_mode('auto'), checked=self.moves_mode == 'auto'),
+                        it("Always show", lambda: self.set_moves_mode('on'), checked=self.moves_mode == 'on'),
+                        it("Never show", lambda: self.set_moves_mode('off'), checked=self.moves_mode == 'off')]),
+                    None,
+                    it("Zoom in", lambda: self.zoom(1.1), "Ctrl++"),
+                    it("Zoom out", lambda: self.zoom(1 / 1.1), "Ctrl+-"),
+                    it("Fit to screen", lambda: self.apply_scale(auto_scale()), "Ctrl+0"),
+                    it("Actual size", lambda: self.apply_scale(1.0), "Ctrl+1")]
+        return [it("Quick reference", self.toggle_help, "F1")]
+
+    def menu_title_rects(self):
+        rects, x = [], 6
+        for title in MENU_TITLES:
+            w = self.font_btn.size(title)[0] + 26
+            rects.append(pygame.Rect(x, 0, w, MENU_H))
+            x += w
+        return rects
+
+    def dropdown_rects(self, items, x, y):
+        """(panel, [(item or None, row rect)]) of a drop-down whose top-left corner is (x, y)."""
+        label_w = max([self.font_btn.size(i["label"])[0] for i in items if i] or [60])
+        key_w = max([self.font_small.size(i["key"])[0] for i in items if i and i["key"]] or [0])
+        has_sub = any(i and i["sub"] for i in items)
+        width = 24 + label_w + (26 + key_w if key_w else 0) + (20 if has_sub else 0) + 12
+        rows, cy = [], y + 4
+        for item in items:
+            h = 9 if item is None else 26
+            rows.append((item, pygame.Rect(x + 2, cy, width - 4, h)))
+            cy += h
+        return pygame.Rect(x, y, width, cy - y + 4), rows
+
+    def menu_layout(self):
+        """(panel, rows, sub_panel, sub_rows) of the open drop-down and of its open sub-menu (or None, None)."""
+        titles = self.menu_title_rects()
+        items = self.menu_items(self.menu_open)
+        panel, rows = self.dropdown_rects(items, titles[self.menu_open].x, MENU_H)
+        sub_panel = sub_rows = None
+        if self.menu_sub is not None:
+            for item, rect in rows:
+                if item is not None and item["sub"] and item["label"] == self.menu_sub:
+                    sub_panel, sub_rows = self.dropdown_rects(item["sub"], panel.right - 2, rect.y - 4)
+                    if sub_panel.right > self.window.get_width():       # no room on the right: open leftwards
+                        sub_panel, sub_rows = self.dropdown_rects(item["sub"], panel.x - sub_panel.w + 2, rect.y - 4)
+                    break
+        return panel, rows, sub_panel, sub_rows
+
+    def menu_click(self, pos):
+        """A click on the menu bar or in a drop-down.  True when it was used up there (a click anywhere else
+        while a menu is open only closes the menu)."""
+        for i, rect in enumerate(self.menu_title_rects()):
+            if rect.collidepoint(pos):
+                if self.menu_open == i:
+                    self.close_menus()
+                else:
+                    self.menu_open, self.menu_sub = i, None
+                return True
+        if self.menu_open is None:
+            return pos[1] < MENU_H
+        panel, rows, sub_panel, sub_rows = self.menu_layout()
+        for item, rect in list(sub_rows or []) + rows:           # the sub-menu sits on top of the main one
+            if item is None or not rect.collidepoint(pos):
+                continue
+            if not item["enabled"]:
+                return True
+            if item["sub"]:
+                self.menu_sub = None if self.menu_sub == item["label"] else item["label"]
+                return True
+            if not item["keep"]:
+                self.close_menus()
+            item["run"]()
+            return True
+        if panel.collidepoint(pos) or (sub_panel is not None and sub_panel.collidepoint(pos)):
+            return True                                          # on a separator / the border
+        self.close_menus()
+        return True
+
+    def menu_hover(self):
+        """While a menu is open: moving over another title switches menus, moving over an entry with a
+        sub-menu opens it (called once per frame)."""
+        if self.menu_open is None or self.pending is not None:
+            return
+        pos = self.raw_mouse()
+        for i, rect in enumerate(self.menu_title_rects()):
+            if rect.collidepoint(pos) and i != self.menu_open:
+                self.menu_open, self.menu_sub = i, None
+                return
+        panel, rows, sub_panel, sub_rows = self.menu_layout()
+        if sub_panel is not None and sub_panel.collidepoint(pos):
+            return
+        for item, rect in rows:
+            if item is not None and rect.collidepoint(pos):
+                self.menu_sub = item["label"] if item["sub"] and item["enabled"] else None
+                return
+
+    def draw_menubar(self, surf):
+        """The menu bar, on the window itself (window pixels, full width)."""
+        width = surf.get_width()
+        pygame.draw.rect(surf, (28, 28, 32), (0, 0, width, MENU_H))
+        pygame.draw.line(surf, (14, 14, 18), (0, MENU_H - 1), (width, MENU_H - 1))
+        mouse = self.raw_mouse()
+        for i, rect in enumerate(self.menu_title_rects()):
+            if self.menu_open == i:
+                pygame.draw.rect(surf, BUTTON_ON, rect)
+            elif rect.collidepoint(mouse) and self.pending is None:
+                pygame.draw.rect(surf, BUTTON_HOVER, rect)
+            label = self.font_btn.render(MENU_TITLES[i], True, TEXT)
+            surf.blit(label, label.get_rect(center=rect.center))
+
+    def draw_dropdown(self, surf):
+        if self.menu_open is None or self.help_open or self.picker is not None or self.pending is not None:
+            return
+        panel, rows, sub_panel, sub_rows = self.menu_layout()
+        mouse = self.raw_mouse()
+        for pan, rws in ((panel, rows), (sub_panel, sub_rows)):
+            if pan is None:
+                continue
+            pygame.draw.rect(surf, (44, 44, 50), pan, border_radius=6)
+            pygame.draw.rect(surf, (96, 96, 108), pan, 1, border_radius=6)
+            for item, rect in rws:
+                if item is None:
+                    pygame.draw.line(surf, (84, 84, 94), (rect.x + 8, rect.centery), (rect.right - 8, rect.centery))
+                    continue
+                if item["enabled"] and (rect.collidepoint(mouse) or (item["sub"] and item["label"] == self.menu_sub)):
+                    pygame.draw.rect(surf, BUTTON_ON, rect, border_radius=4)
+                colour = TEXT if item["enabled"] else MUTED
+                if item["checked"]:
+                    x, y = rect.x + 6, rect.centery
+                    pygame.draw.lines(surf, colour, False, [(x, y), (x + 4, y + 4), (x + 11, y - 5)], 2)
+                surf.blit(self.font_btn.render(item["label"], True, colour), (rect.x + 22, rect.y + 5))
+                if item["key"]:
+                    key = self.font_small.render(item["key"], True, MUTED)
+                    surf.blit(key, (rect.right - 10 - key.get_width(), rect.y + 7))
+                if item["sub"]:
+                    cx, cy = rect.right - 12, rect.centery
+                    pygame.draw.polygon(surf, colour, [(cx - 3, cy - 5), (cx - 3, cy + 5), (cx + 3, cy)])
+
     # -- drawing ---------------------------------------------------------
     def sq_xy(self, r, c):
         """Top-left pixel of square (r, c), honouring the flip."""
-        return ((SIZE - 1 - c) * SQ, (SIZE - 1 - r) * SQ) if self.flipped else (c * SQ, r * SQ)
+        if self.flipped:
+            return ((SIZE - 1 - c) * SQ, BOARD_Y + (SIZE - 1 - r) * SQ)
+        return (c * SQ, BOARD_Y + r * SQ)
+
+    def board_overlay(self):
+        """A transparent surface covering the canvas down to the bottom of the board (draw on it with the
+        square coordinates of sq_xy / sq_centre, then blit it at (0, 0))."""
+        return pygame.Surface((BOARD_PX, BOARD_Y + BOARD_PX), pygame.SRCALPHA)
 
     def xy_sq(self, x, y):
-        r, c = y // SQ, x // SQ
+        r, c = (y - BOARD_Y) // SQ, x // SQ
         return (SIZE - 1 - r, SIZE - 1 - c) if self.flipped else (r, c)
 
     def sq_centre(self, sq):
@@ -1799,6 +2166,7 @@ class App:
         self.screen.blit((font or self.font).render(string, True, color), pos)
 
     def draw(self):
+        self.sync_window()
         self.screen.fill(STATUS_BG)
         self.draw_board()
         self.draw_coords()
@@ -1820,11 +2188,11 @@ class App:
 
     def draw_help(self):
         """Draw the modal quick reference above the game without disturbing its state."""
-        veil = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
+        veil = pygame.Surface((self.win_w, self.win_h), pygame.SRCALPHA)
         veil.fill((0, 0, 0, 205))
         self.screen.blit(veil, (0, 0))
 
-        panel = pygame.Rect(86, 48, WIN_W - 172, WIN_H - 96)
+        panel = pygame.Rect(60, 48, self.win_w - 120, self.win_h - 96)
         pygame.draw.rect(self.screen, (31, 32, 38), panel, border_radius=14)
         pygame.draw.rect(self.screen, (105, 110, 125), panel, 2, border_radius=14)
         self.text("Reverse Chess — quick reference", (panel.x + 26, panel.y + 18), self.font_big)
@@ -1854,15 +2222,15 @@ class App:
         ]
         right = [
             ("AI & ANALYSIS", [
-                "A toggles the AI. Use the Black / White / Both buttons to choose which side it plays.",
+                "A toggles the AI. Game > Computer plays chooses which side it plays; Game > Difficulty picks a level (when tiers.py has made some).",
                 "H toggles move hints; E toggles the evaluation bar; S toggles MCTS look-ahead.",
-                "The think-time slider controls search time and simulation budget. The AI needs a loaded network for analysis.",
+                "Game > Think time sets the search time and simulation budget. The AI needs a loaded network for analysis.",
                 "Click the network name or press N to choose another .npz / .pt file.",
             ]),
             ("SAVE, SHARE & DISPLAY", [
                 "Ctrl+S saves; Ctrl+O loads. Repeated Load cycles through saved games. Drop a .json file onto the window to open it.",
                 "Ctrl+C copies the move list; Ctrl+Shift+C copies game JSON; Ctrl+V pastes either format.",
-                "Ctrl++ / Ctrl+- resize; Ctrl+0 fits the screen; Ctrl+1 sets 100%. C toggles coordinates; U toggles sounds.",
+                "Ctrl++ / Ctrl+- resize; Ctrl+0 fits the screen; Ctrl+1 sets 100%. C toggles coordinates; U toggles sounds. View > Move list: the move column shows by itself in review mode.",
                 "The side panel shows home pieces and off-board pieces that can be returned as gifts. Grey locks are permanent; orange locks are temporary.",
             ]),
         ]
@@ -1892,11 +2260,11 @@ class App:
         if not self.coords:
             return
         for i in range(SIZE):
-            r, c = self.xy_sq(2, i * SQ + 2)                  # screen row i, left-hand column
+            r, c = self.xy_sq(2, BOARD_Y + i * SQ + 2)        # screen row i, left-hand column
             x, y = self.sq_xy(r, c)
             label = self.font_small.render(str(SIZE - r), True, DARK if (r + c) % 2 == 0 else LIGHT)
             self.screen.blit(label, (x + 4, y + 3))
-            r, c = self.xy_sq(i * SQ + 2, (SIZE - 1) * SQ + 2)  # screen column i, bottom row
+            r, c = self.xy_sq(i * SQ + 2, BOARD_Y + (SIZE - 1) * SQ + 2)  # screen column i, bottom row
             x, y = self.sq_xy(r, c)
             label = self.font_small.render("abcdefgh"[c], True, DARK if (r + c) % 2 == 0 else LIGHT)
             self.screen.blit(label, (x + SQ - label.get_width() - 5, y + SQ - label.get_height() - 3))
@@ -1905,7 +2273,7 @@ class App:
         """The queued premove as a blue arrow; while only its piece is picked, that square is ringed."""
         if self.premove is None and self.pre_src is None:
             return
-        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        overlay = self.board_overlay()
         if self.premove is not None:
             src, dst = self.premove
             draw_arrow(overlay, self.sq_centre(src), self.sq_centre(dst), PREMOVE_COLOUR, 12)
@@ -1920,7 +2288,7 @@ class App:
         action = self.menu_preview_action()
         if action is None or action.gift is None:
             return
-        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        overlay = self.board_overlay()
         self.draw_gift_ghost(overlay, action, HINT_COLOURS[0])
         self.screen.blit(overlay, (0, 0))
 
@@ -1928,7 +2296,7 @@ class App:
         pk = self.picker
         veil = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
         veil.fill((0, 0, 0, 150))
-        self.screen.blit(veil, (0, 0))
+        self.screen.blit(veil, (0, BOARD_Y))
         panel, rows, x_rect = self.picker_rects()
         pygame.draw.rect(self.screen, PANEL_BG, panel, border_radius=12)
         self.text("Choose the AI's network", (panel.x + 20, panel.y + 14), self.font_big)
@@ -1963,7 +2331,7 @@ class App:
         x, y = self.mouse()
         rect = surf.get_rect().inflate(14, 8)
         rect.topright = (x - 10, y + 14)            # left of the pointer: the graph is at the window's right edge
-        rect.clamp_ip(self.screen.get_rect())
+        rect.clamp_ip(pygame.Rect(0, MENU_H, self.win_w, self.win_h - MENU_H))
         pygame.draw.rect(self.screen, (16, 16, 20), rect, border_radius=5)
         pygame.draw.rect(self.screen, (120, 120, 128), rect, 1, border_radius=5)
         self.screen.blit(surf, (rect.x + 7, rect.y + 4))
@@ -2004,7 +2372,7 @@ class App:
         hint = self.current_hint()
         if hint is None:
             return
-        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        overlay = self.board_overlay()
         seen = set()
         for rank, (action, _) in enumerate(hint["top"]):
             if (action.src, action.dst) in seen:
@@ -2021,7 +2389,7 @@ class App:
         if not self.review_here() or self.pending is not None:
             return
         best, played = self.review["best"][self.pos], self.line[self.pos]
-        overlay = pygame.Surface((BOARD_PX, BOARD_PX), pygame.SRCALPHA)
+        overlay = self.board_overlay()
         marked = bool(self.review_mark(self.pos))
         if played == best and not marked:
             draw_arrow(overlay, self.sq_centre(best.src), self.sq_centre(best.dst), REVIEW_BEST, 13)
@@ -2071,12 +2439,12 @@ class App:
         return (max(-1.0, min(1.0, self.white_value_now()[0])) + 1.0) / 2.0
 
     def draw_eval_bar(self):
-        pygame.draw.rect(self.screen, PANEL_BG, (BOARD_PX, 0, BAR_W, BOARD_PX))
+        pygame.draw.rect(self.screen, PANEL_BG, (BOARD_PX, BOARD_Y, BAR_W, BOARD_PX))
         if not self.show_eval or self.advisor is None:
             return
         target = self.eval_target()
         self.bar_pos = target if self.bar_pos is None else self.bar_pos + (target - self.bar_pos) * 0.25
-        bar = pygame.Rect(BOARD_PX + 7, 8, BAR_W - 14, BOARD_PX - 16)
+        bar = pygame.Rect(BOARD_PX + 7, BOARD_Y + 8, BAR_W - 14, BOARD_PX - 16)
         if self.flipped:                  # white's side is at the top now: it fills down from the top
             split = bar.y + int(round(bar.height * self.bar_pos))
             pygame.draw.rect(self.screen, (240, 240, 240), (bar.x, bar.y, bar.w, split - bar.y))
@@ -2108,12 +2476,12 @@ class App:
         game = self.game
         L = self.layout
         x0 = L['x0']
-        pygame.draw.rect(self.screen, PANEL_BG, (PANEL_X, 0, PANEL_W, WIN_H))
-        y = 12
-        self.text("Reverse Chess", (x0, y), self.font_big)
-        y += 34
-        self.text("ply %d" % game.ply, (x0, y), self.font, MUTED)
-        y += 34
+        pygame.draw.rect(self.screen, PANEL_BG, (PANEL_X, BOARD_Y, PANEL_W, self.win_h - BOARD_Y))
+        y = BOARD_Y + 10
+        self.text("Reverse Chess", (x0, y), self.font)
+        ply = self.font_small.render("ply %d" % game.ply, True, MUTED)
+        self.screen.blit(ply, (x0 + L['w'] - ply.get_width(), y + 6))
+        y = BOARD_Y + 90
         for team in TEAMS:
             on_board = game.on_board(team)
             home = sum(1 for p in on_board if p.at_home())
@@ -2133,12 +2501,12 @@ class App:
         self.draw_controls()
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
-                  "H hint  E eval  A AI  S MCTS  R new",
-                  "N network  C coords  U sound  F1 / ? help"]
+                  "menu bar: everything else, F1: help"]
         for i, line in enumerate(legend):
-            self.text(line, (x0, WIN_H - 6 - (len(legend) - i) * 20), self.font_small, MUTED)
+            self.text(line, (x0, self.win_h - 6 - (len(legend) - i) * 20), self.font_small, MUTED)
 
     def draw_controls(self):
+        """The side panel below the piece trays: the AI's name, the eval line, hints, the record."""
         L = self.layout
         x0, w = L['x0'], L['w']
         if self.advisor is not None:
@@ -2153,19 +2521,7 @@ class App:
             self.text(line, (net.x + 9, top + i * 17), self.font_small, TEXT)
         pygame.draw.polygon(self.screen, MUTED, [(net.right - 22, net.centery - 3), (net.right - 10, net.centery - 3),
                                                  (net.right - 16, net.centery + 4)])
-        self.draw_button(L['ai'], "AI ON" if self.ai_on else "AI OFF", on=self.ai_on)
-        self.draw_button(L['eval'], "Eval ON" if self.show_eval else "Eval OFF",
-                         on=self.show_eval, enabled=self.advisor is not None)
-        self.draw_button(L['search'], "MCTS ON" if self.use_search else "MCTS OFF",
-                         on=self.use_search, enabled=self.searcher is not None)
-        self.text("AI plays:", (x0, L['side_label_y']), self.font_small, MUTED)
-        for name, text, sides in (('side_b', "Black", {'b'}), ('side_w', "White", {'w'}),
-                                  ('side_both', "Both", {'b', 'w'})):
-            self.draw_button(L[name], text, on=self.ai_on and self.ai_sides == sides,
-                             enabled=self.ai_on)
         hint = self.current_hint()
-        self.draw_button(L['hint'], "Hide hint" if hint else "Hint",
-                         on=hint is not None, enabled=self.advisor is not None)
         if self.show_eval and self.advisor is not None:
             sims = 0
             if self.game.done:
@@ -2212,7 +2568,7 @@ class App:
         self.text("%d won   %d lost   %d drawn" % (a["won"], a["lost"], a["drawn"]),
                   (x0, y + 24), self.font)
         b, wh = s['b'], s['w']
-        self.text("as black %d-%d-%d    as white %d-%d-%d" % (
+        self.text("black %d-%d-%d   white %d-%d-%d" % (
             b["won"], b["lost"], b["drawn"], wh["won"], wh["lost"], wh["drawn"]),
             (x0, y + 50), self.font_small, MUTED)
         notes = []
@@ -2224,9 +2580,6 @@ class App:
             notes.append("this game is not counted")
         if notes:
             self.text(", ".join(notes), (x0, y + 70), self.font_small, MUTED)
-        confirming = pygame.time.get_ticks() < self.confirm_reset_until
-        self.draw_button(L['reset'], "Click again to erase" if confirming else "Reset record",
-                         on=confirming, enabled=bool(self.stats.games))
 
     def moves_first_row(self):
         """Index of the first move-list row on screen.  Row 0 is the starting position, row k the position
@@ -2242,30 +2595,26 @@ class App:
         self.moves_top = self.moves_first_row() - 3 * dy
 
     def draw_moves(self):
+        """The move-list column: only while the window is expanded (review mode, a browsed game, or
+        View > Move list > Always show)."""
+        if not self.expanded:
+            return
         L = self.layout
         x0 = MOVES_X + 14
-        pygame.draw.rect(self.screen, PANEL_BG, (MOVES_X, 0, MOVES_W, WIN_H))
-        pygame.draw.line(self.screen, (22, 22, 26), (MOVES_X, 0), (MOVES_X, WIN_H), 2)
-        self.text("Moves", (x0, 8), self.font_big)
-        self.draw_button(L['m_help'], "?", on=self.help_open)
-        self.draw_button(L['m_undo'], "Undo", enabled=self.pos > 0)
-        self.draw_button(L['m_flip'], "Flip", on=self.flipped)
-        self.draw_button(L['m_save'], "Save", enabled=bool(self.line))
-        self.draw_button(L['m_load'], "Load")
-        if self.reviewer is not None:
-            review_label = "%d%%" % int(100 * self.reviewer.progress)
-        else:
-            review_label = "Review"
-        self.draw_button(L['m_review'], review_label, on=self.review is not None,
-                         enabled=self.advisor is not None and bool(self.line) and self.reviewer is None)
+        pygame.draw.rect(self.screen, PANEL_BG, (MOVES_X, BOARD_Y, MOVES_W, self.win_h - BOARD_Y))
+        pygame.draw.line(self.screen, (22, 22, 26), (MOVES_X, BOARD_Y), (MOVES_X, self.win_h), 2)
+        self.text("Moves", (x0, BOARD_Y + 8), self.font_big)
         has_marks = self.review is not None and any(self.review["marks"])
+        self.draw_button(L['m_prev'], "Prev ?", enabled=has_marks)
         self.draw_button(L['m_next'], "Next ?", enabled=has_marks)
-        self.draw_button(L['m_sound'], "Sound ON" if self.sound_on else "Sound OFF", on=self.sound_on)
-        self.draw_button(L['m_coords'], "Coords ON" if self.coords else "Coords OFF", on=self.coords)
-        self.draw_think()
-        self.text("<- -> step  Home/End", (x0, 212), self.font_small, MUTED)
+        if self.reviewer is not None:
+            self.text("reviewing... %d%%" % int(100 * self.reviewer.progress), (x0, BOARD_Y + 80),
+                      self.font_small, TEXT)
+        elif self.review is None:
+            self.text("Analysis > Review game (V)", (x0, BOARD_Y + 80), self.font_small, MUTED)
+        self.text("<- -> step  Home/End", (x0, BOARD_Y + 98), self.font_small, MUTED)
         self.text("Tab: other line (%d)" % len(self.variations) if self.variations
-                  else "Z undo  F flip  M next ?", (x0, 228), self.font_small,
+                  else "Z undo  F flip  M next ?", (x0, BOARD_Y + 114), self.font_small,
                   TEXT if self.variations else MUTED)
         box = L['m_list']
         pygame.draw.rect(self.screen, (30, 30, 34), box, border_radius=4)
@@ -2296,22 +2645,6 @@ class App:
                                     self.review["values"][i + 1], i)
         self.draw_graph()
 
-    def draw_think(self):
-        """The AI think-time slider: how long (and, with it, how many simulations) the search may take."""
-        r = self.layout['m_think']
-        on = self.think_enabled()
-        colour = TEXT if on else MUTED
-        self.text("AI thinks: " + (think_label(self.think_ms) if on else "(needs MCTS)"), (r.x, r.y), self.font_small, colour)
-        track = self.think_track()
-        pygame.draw.rect(self.screen, (22, 22, 26), track, border_radius=4)
-        x = track.x + int(round(self.think_frac() * track.w))
-        if on:
-            pygame.draw.rect(self.screen, BUTTON_ON, (track.x, track.y, x - track.x, track.h), border_radius=4)
-        for step in THINK_STEPS:                                  # a tick at every stop
-            tx = track.x + int(round((math.log(step) - math.log(THINK_STEPS[0])) /
-                                     (math.log(THINK_STEPS[-1]) - math.log(THINK_STEPS[0])) * track.w))
-            pygame.draw.line(self.screen, (110, 110, 118), (tx, track.bottom), (tx, track.bottom + 3), 1)
-        pygame.draw.circle(self.screen, (235, 235, 235) if on else (100, 100, 106), (x, track.centery), 7)
 
     def draw_eval_chip(self, rect, white_value, i):
         """A tiny eval bar for the move list: the white part is white's share, centre line = even."""
@@ -2406,14 +2739,14 @@ class App:
             lines = lines[:3]
             lines[-1] = lines[-1].rstrip(" .,;:") + " ..."
         for i, text in enumerate(lines):
-            self.text(text, (14, BOARD_PX + 8 + i * 26), self.font_status, colour)
+            self.text(text, (14, BOARD_Y + BOARD_PX + 8 + i * 26), self.font_status, colour)
 
     def draw_menu(self):
         dim, values = self.pending
         game = self.game
         mover = game.board[self.selected]
         recv = other_team(game.turn)        # the team that receives a gift
-        panel, rects, x_rect, back_rect = menu_rects(len(values), bool(self.history))
+        panel, rects, x_rect, back_rect = self.menu_geometry(len(values), bool(self.history))
         pygame.draw.rect(self.screen, PANEL_BG, panel, border_radius=12)
         titles = {
             'demote': "Un-promote this piece?",
@@ -2423,9 +2756,14 @@ class App:
             'promote': "Promote the gifted pawn?",
             'confirm': "Play this move?",
         }
-        self.text(titles[dim], (panel.x + 20, panel.y + 18), self.font_big)
-        self.text("click, or keys 1-9 / Up Down + Enter;  Backspace back", (panel.x + 20, panel.y + 54),
-                  self.font_small, MUTED)
+        if panel.w >= 440:
+            self.text(titles[dim], (panel.x + 20, panel.y + 18), self.font_big)
+            self.text("click, or keys 1-9 / Up Down + Enter;  Backspace back", (panel.x + 20, panel.y + 54),
+                      self.font_small, MUTED)
+        else:                                       # the narrow menu of the compact window
+            for j, line in enumerate(wrap(titles[dim], self.font, panel.w - 76)[:2]):
+                self.text(line, (panel.x + 20, panel.y + 10 + 26 * j), self.font)
+            self.text("click, or keys 1-9 / arrows + Enter", (panel.x + 20, panel.y + 66), self.font_small, MUTED)
         self.draw_button(x_rect, "X")
         if back_rect is not None:
             self.draw_button(back_rect, "< Back")
@@ -2455,18 +2793,27 @@ class App:
                 team, ptype = recv, value or 'p'
             if not (dim == 'gift' and value is None):
                 self.screen.blit(self.sprite(team, ptype, 56), (rect.x + 8, rect.y + 7))
-            font = self.font if self.font.size(label)[0] <= rect.w - 90 else self.font_small
-            self.text(label, (rect.x + 76, rect.y + 24 if font is self.font else rect.y + 27), font)
+            avail = rect.w - 90
+            if self.font.size(label)[0] <= avail:
+                self.text(label, (rect.x + 76, rect.y + 24), self.font)
+            else:
+                lines = wrap(label, self.font_small, avail)[:3]
+                top = rect.y + (rect.h - 17 * len(lines)) // 2
+                for j, line in enumerate(lines):
+                    self.text(line, (rect.x + 76, top + 17 * j), self.font_small)
 
 
-def menu_rects(n, with_back=False):
+def menu_rects(n, with_back=False, win_w=COMPACT_W, win_h=WIN_H):
     """(background, one rect per option, X button, Back button or None) for a menu of n options.  It sits
-    to the right of the board (over the panel columns), so the board stays in view: the gift preview and the
-    pieces being decided about are never covered."""
-    width, height, gap, head, foot = 480, 70, 10, 60, 56
+    to the right of the board (over the side panel), so the board stays in view: the gift preview and the
+    pieces being decided about are never covered.  In the compact window that strip is narrow, so the menu
+    is too (its text wraps)."""
+    width = min(480, win_w - BOARD_PX - 44)
+    height, gap, foot = 70, 10, 56
+    head = 60 if width >= 400 else 88
     total = head + n * height + (n - 1) * gap + (foot if with_back else 0)
-    left = BOARD_PX + (WIN_W - BOARD_PX - width) // 2
-    top = (WIN_H - total) // 2
+    left = BOARD_PX + (win_w - BOARD_PX - width) // 2
+    top = (win_h - total) // 2
     panel = pygame.Rect(left - 20, top - 10, width + 40, total + 30)
     rects = [pygame.Rect(left, top + head + i * (height + gap), width, height)
              for i in range(n)]
@@ -2551,7 +2898,7 @@ def main():
                     help="do not reopen the unfinished game of the last session, and do not keep this "
                          "one on disk after every move")
     ap.add_argument("--scale", type=float, default=None, metavar="F",
-                    help="window size as a multiple of 1334 x 892 (default: whatever fits the screen, at most 1; "
+                    help="window size as a multiple of 1114 x 914, 1334 x 914 in review mode (default: whatever fits the screen, at most 1; "
                          "Ctrl +/- change it, and the window can be dragged to any size)")
     ap.add_argument("--no-sound", action="store_true", help="start with the move sounds off (U toggles)")
     ap.add_argument("--no-coords", action="store_true", help="start without rank / file labels on the board (C toggles)")
@@ -2633,22 +2980,19 @@ def main():
                 app.paste_text(event.text)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
                 # (Shift held: a move with one variant still shows its menu, to confirm)
-                app.handle_click(app.to_logical(event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT))
+                app.handle_click(app.to_logical(event.pos), bool(pygame.key.get_mods() & pygame.KMOD_SHIFT), raw=event.pos)
             elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
                 if not app.help_open:
                     app.right_click()
-            elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
-                app.dragging = None
-            elif event.type == pygame.MOUSEMOTION and app.dragging and not app.help_open:
-                app.drag(app.to_logical(event.pos))
             elif event.type == pygame.MOUSEWHEEL and not app.help_open:
                 if app.picker is not None:
                     app.picker_scroll(event.y)
-                elif app.layout['m_list'].collidepoint(app.mouse()):
+                elif app.menu_open is None and app.expanded and app.layout['m_list'].collidepoint(app.mouse()):
                     app.scroll_moves(event.y)
         if not app.help_open:
             app.poll_review()
             app.update_ai()
+        app.menu_hover()
         app.draw()
         app.present()
         clock.tick(30)

@@ -14,6 +14,8 @@ ai = os.path.join(here, "ai.npz")
 if not os.path.exists(ai):
     raise SystemExit("ai.npz not found next to reverse_chess.spec")
 datas.append((ai, "."))
+if os.path.isfile(os.path.join(here, "nets", "tiers.json")):      # the Game > Difficulty levels made by tiers.py
+    datas.append((os.path.join(here, "nets"), "nets"))
 
 binaries = [(p, ".") for pat in ("librc_engine.so", "librc_engine.dylib", "rc_engine.dll")
             for p in glob.glob(os.path.join(here, pat))]

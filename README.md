@@ -118,7 +118,9 @@ The rules are simple...ish.
   simulation cap scales with it.  Needs MCTS on.
 * **Sound:** short synthesised move / gift / game-end sounds; `U` or the Sound button toggles, `--no-sound`
   starts without.
-* **Window size:** the window is resizable and defaults to what fits the screen; `--scale F`, `Ctrl +` /
+* **Window size:** one ordinary window: the menu bar spans its full width, the game fills the rest at the largest size that
+  fits.  A window that is taller than the board-and-panel row re-arranges itself (board on top at the full width,
+  the side panel underneath), so the board and the text keep growing; resizing is immediate.  The window defaults to what fits the screen; `--scale F`, `Ctrl +` /
   `Ctrl -`, `Ctrl+0` (fit the screen), `Ctrl+1` (100%).
 * **Network picker:** `N` (or click the AI's name in the panel) lists the network files next to `play.py`, in
   `runs/*/` (including `iter_NNNNN.pt` snapshots) and `nets/`, plus any `--net-dir DIR`.  Choosing one makes

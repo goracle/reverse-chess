@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """Headless checks of the play-feel QoL features of play.py: coordinates, menu keys / Shift-confirm / gift
-preview, premove, think-time slider, sound, window scaling, network picker.
+preview, premove, think time, sound, window scaling, the menu bar, network picker.
 
     python test_qol_play.py
 """
@@ -31,6 +31,26 @@ def make_app(advisor=None, ai_on=False, sides=("w",), **kw):
 def click_move(app, action, force=False):
     app.handle_click(app.sq_centre(action.src))
     app.handle_click(app.sq_centre(action.dst), force)
+
+
+def open_menu(app, title):
+    """Click the menu bar's ``title``; returns the drop-down's rows."""
+    rect = app.menu_title_rects()[play.MENU_TITLES.index(title)]
+    app.handle_click(rect.center)
+    assert app.menu_open == play.MENU_TITLES.index(title)
+    return app.menu_layout()
+
+
+def click_entry(app, title, *labels):
+    """Open menu ``title`` and click the entry ``labels[0]`` (then, in its sub-menu, ``labels[1]``)."""
+    panel, rows, sub_panel, sub_rows = open_menu(app, title)
+    rect = next(r for i, r in rows if i is not None and i["label"] == labels[0])
+    app.handle_click(rect.center)
+    if len(labels) > 1:
+        assert app.menu_sub == labels[0]
+        panel, rows, sub_panel, sub_rows = app.menu_layout()
+        rect = next(r for i, r in sub_rows if i is not None and i["label"] == labels[1])
+        app.handle_click(rect.center)
 
 
 def find_menu_move(app, rng, tries=400):
@@ -162,12 +182,64 @@ def main():
     assert abs(app.scale - 0.5) < 0.01
     cx = (app.view.x + app.view.w // 2, app.view.y + app.view.h // 2)
     lx, ly = app.to_logical(cx)
-    assert abs(lx - play.WIN_W // 2) <= 3 and abs(ly - play.WIN_H // 2) <= 3
+    assert abs(lx - app.win_w // 2) <= 3 and abs(ly - (app.win_h + play.MENU_H) // 2) <= 3
     app.zoom(1.1)
     app.apply_scale(1.0)
     app.present()
-    assert app.view.size == (play.WIN_W, play.WIN_H) and app.to_logical((10, 20)) == (10, 20)
+    assert app.view.size == (app.win_w, app.win_h - play.MENU_H) and app.to_logical((10, 50)) == (10, 50)
     print("ok: window scale")
+
+    # 5b. the menu bar, and the window that only grows for the move list
+    app = make_app()
+    app.draw()
+    assert not app.expanded and app.win_w == play.COMPACT_W and app.canvas.get_width() == play.COMPACT_W
+    assert [t for t in play.MENU_TITLES] == ["File", "Game", "Analysis", "View", "Help"]
+    for title in play.MENU_TITLES:                      # every drop-down builds and draws
+        open_menu(app, title)
+        app.draw()
+        app.handle_key(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_ESCAPE, mod=0))
+        assert app.menu_open is None
+    click_entry(app, "View", "Coordinates")             # a checked entry toggles and closes the menu
+    assert app.coords is False and app.menu_open is None
+    click_entry(app, "Game", "Flip board")
+    assert app.flipped is True
+    click_entry(app, "Game", "Computer plays", "Black")
+    assert app.ai_on and app.ai_sides == {"b"}
+    click_entry(app, "Game", "Computer plays", "Nobody (two humans)")
+    assert not app.ai_on
+    app.play(app.game.legal_actions()[0])
+    click_entry(app, "Game", "Undo")
+    assert app.pos == 0
+    # a click away from an open menu only closes it
+    open_menu(app, "File")
+    app.handle_click(app.sq_centre((3, 3)))
+    assert app.menu_open is None and app.selected is None
+    # the board clicks still land on the right squares below the menu bar
+    sq = (5, 4)
+    x, y = app.sq_centre(sq)
+    assert app.xy_sq(x, y) == sq and y >= play.BOARD_Y
+    # View > Move list: the window grows by the column's width and shrinks back
+    click_entry(app, "View", "Move list", "Always show")
+    app.draw()
+    assert app.expanded and app.win_w == play.WIN_W and app.canvas.get_width() == play.WIN_W
+    app.present()
+    click_entry(app, "View", "Move list", "Automatic (review mode)")
+    app.draw()
+    assert not app.expanded and app.win_w == play.COMPACT_W
+    app.jump(0)                                         # nothing to browse yet: still compact
+    for _ in range(3):
+        app.play(app.game.legal_actions()[0])
+    app.jump(1)                                         # looking at an earlier position: the column appears
+    app.draw()
+    assert app.expanded
+    app.jump(len(app.line))
+    app.draw()
+    assert not app.expanded
+    # the decision menu fits beside the board in the compact window
+    for n in (2, 3, 5, 6):
+        panel = play.menu_rects(n, True, play.COMPACT_W, play.WIN_H)[0]
+        assert panel.left >= play.BOARD_PX and panel.right <= play.COMPACT_W and panel.top >= 0 and panel.bottom <= play.WIN_H
+    print("ok: menu bar and compact window")
 
     # 6. sound toggles without raising (no audio device is fine)
     app = make_app()
@@ -213,15 +285,17 @@ def main():
     app.draw()
     print("ok: start row")
 
-    # 7. think-time slider
+    # 7. think time (Game > Think time is a sub-menu of radio entries)
     app = make_app(advisor)
-    track = app.think_track()
-    app.set_think_from_x(track.x - 50)
+    app.set_think(play.THINK_STEPS[0])
     assert app.think_ms == play.THINK_STEPS[0] and app.searcher.think_ms == play.THINK_STEPS[0]
-    app.set_think_from_x(track.right + 50)
+    app.set_think(play.THINK_STEPS[-1])
     assert app.think_ms == play.THINK_STEPS[-1] and app.searcher.sims > 40
-    app.click_panel((app.layout["m_think"].x + 20, app.layout["m_think"].centery))
-    assert app.dragging == "think"
+    open_menu(app, "Game")
+    sub = next(i for i in app.menu_items(app.menu_open) if i and i["label"] == "Think time")
+    assert sub["enabled"] and [e["checked"] for e in sub["sub"]].count(True) == 1
+    click_entry(app, "Game", "Think time", play.think_label(play.THINK_STEPS[2]))
+    assert app.think_ms == play.THINK_STEPS[2] and app.menu_open is None
     app.draw()
     print("ok: think time")
 
