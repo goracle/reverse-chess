@@ -157,7 +157,7 @@ STATUS_H = 84
 COMPACT_W = MOVES_X              # window width: board, eval bar and side panel
 WIN_W = MOVES_X + MOVES_W        # ... and with the move-list column (review mode)
 WIN_H = BOARD_Y + BOARD_PX + STATUS_H
-PANEL_SPLIT = 366                 # portrait layout: the side panel is cut here (trays above, controls below)
+STRIP_H = 312                    # tall layout: height of the strip of controls under the board
 MENU_TITLES = ("File", "Game", "Analysis", "View", "Help")
 
 LIGHT = (238, 238, 210)
@@ -208,6 +208,19 @@ def make_layout():
         'm_prev': R(MOVES_X + 14, BOARD_Y + 44, 92, 28), 'm_next': R(MOVES_X + 114, BOARD_Y + 44, 92, 28),
         'm_list': R(MOVES_X + 6, BOARD_Y + 134, MOVES_W - 12, ROW_H * 27),
         'm_graph': R(MOVES_X + 14, BOARD_Y + 134 + ROW_H * 27 + 12, MOVES_W - 28, 66),
+    }
+
+
+def make_strip_layout():
+    """Rectangles of the tall layout's control strip.  The strip is part of the canvas, under the landscape
+    picture (y from WIN_H), and is only shown when the window uses the tall layout: the title, the AI's name
+    and the two piece trays across the top, the record on the left and the evaluation / hints on the right."""
+    y = WIN_H
+    R = pygame.Rect
+    return {
+        'x0': 14, 'w': 360, 'hint_x': 430, 'hint_w': PANEL_X - 430 - 14, 'stats_x': 14,
+        'net': R(250, y + 6, PANEL_X - 250 - 14, 38),
+        'eval_text_y': y + 152, 'hint_y': y + 174, 'stats_y': y + 152,
     }
 
 
@@ -396,15 +409,16 @@ def app_dir():
     return getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
 
 
-def auto_scale():
-    """The window scale that fits the desktop (at most 1): 1114 x 914 pixels at 1.0, 1334 x 914 in review mode."""
+def auto_scale(full=(WIN_W, WIN_H)):
+    """The window scale that fits the desktop (at most 1): 1114 x 914 pixels at 1.0, 1334 x 914 in review mode
+    (``full``: the window's size at 1.0)."""
     try:
         width, height = pygame.display.get_desktop_sizes()[0]
     except Exception:                                  # old pygame, no display: no opinion
         return 1.0
     if width <= 0 or height <= 0:
         return 1.0
-    return max(0.4, min(1.0, (height - 90) / WIN_H, (width - 30) / WIN_W))
+    return max(0.4, min(1.0, (height - 90) / full[1], (width - 30) / full[0]))
 
 
 def find_tiers(extra_dirs=()):
@@ -522,21 +536,24 @@ class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
                  stats, show_eval, searcher=None, flipped=False, autosave=False,
                  review_sims=0, session=False, scale=None, sound=True, coords=True, net_dirs=(),
-                 auto_orient=True):
+                 auto_orient=True, tall=False):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         # See "the window" below: a scaled canvas under a menu bar drawn at window level.
         self.expanded = False
         self.win_w, self.win_h = COMPACT_W, WIN_H
-        self.canvas = self.screen = pygame.Surface((self.win_w, self.win_h), 0, 32)
+        self.canvas = self.screen = pygame.Surface((self.win_w, self.win_h + STRIP_H), 0, 32)
         self.window = None
         self.os_window = None
         self.size_wanted, self.size_deadline = None, 0.0
-        self.last_seen, self.changed_at, self.snap_refused = None, 0.0, None
+        self.last_size, self.refused, self.seen_size = None, None, None
+        self.requested, self.resizing_until = set(), 0.0
         self.regions, self.mode = [], "landscape"
+        self.tall = bool(tall)
+        self.strip = make_strip_layout()
         self.scale = 1.0
         self.view = pygame.Rect(0, MENU_H, self.win_w, self.win_h - MENU_H)   # where the canvas sits in the window
-        self.apply_scale(auto_scale() if scale is None else scale)
+        self.fit_screen() if scale is None else self.apply_scale(scale)
         self.font = pygame.font.SysFont(None, 28)
         self.font_big = pygame.font.SysFont(None, 38)
         self.font_small = pygame.font.SysFont(None, 20)
@@ -591,27 +608,38 @@ class App:
             self.message = stats.error
 
     # -- the window: a menu bar at the top, and below it the game, scaled to fit --------------
-    # The game is drawn on a canvas of win_w x win_h logical pixels (COMPACT_W wide normally, WIN_W with the
-    # move-list column, see sync_window).  Its top MENU_H rows are unused: the menu bar is drawn straight onto
-    # the window afterwards, at full window width and at its own fixed size (like any other Linux program's).
-    # present() scales the rest of the canvas to the largest size that fits under the menu bar and extends the
-    # canvas' own background colours into whatever room is left over, so resizing the window never leaves
-    # bars of another colour.
-    def window_size_for(self, factor, win_w=None):
-        """Window pixels that show the canvas at ``factor`` times its size (the menu bar is not scaled)."""
-        win_w = self.win_w if win_w is None else win_w
-        return int(win_w * factor), MENU_H + int((self.win_h - MENU_H) * factor)
+    # The game is drawn on a canvas.  Its top part is the "wide" picture: win_w x win_h logical pixels, the board,
+    # the eval bar and the side panel in a row (COMPACT_W wide, WIN_W with the move-list column, see
+    # sync_window), of which the top MENU_H rows are unused: the menu bar is drawn straight onto the window
+    # afterwards, at full window width and at its own fixed size, like any other Linux program's.  Under it
+    # the canvas holds the control strip of the "tall" layout (View > Layout), the same controls arranged
+    # for a window that is taller than wide.  The window keeps the shape of whichever layout is in use: when
+    # the user drags an edge or a corner, the other dimension follows (on_resize), so there is never a blank
+    # strip, and every resize makes the board, and everything else, bigger or smaller.
+    def content_size(self, tall=None):
+        """(width, height) in canvas pixels of what the layout shows, without the menu bar."""
+        tall = self.tall if tall is None else tall
+        if tall:
+            return PANEL_X + (MOVES_W if self.expanded else 0), BOARD_PX + STATUS_H + STRIP_H
+        return self.win_w, self.win_h - MENU_H
+
+    def window_size_for(self, factor, tall=None):
+        """Window pixels that show the layout at ``factor`` times its size (the menu bar is not scaled)."""
+        cw, ch = self.content_size(tall)
+        return int(round(cw * factor)), MENU_H + int(round(ch * factor))
 
     def set_window_size(self, size):
         """Resize the open window.  This resizes the existing SDL window in place; calling set_mode again
         instead re-creates the window, which blanks / re-animates it (a flicker and a fade on most desktops)."""
         size = (max(1, int(size[0])), max(1, int(size[1])))
+        self.last_size = self.seen_size = size
         if self.window is not None:
             try:
                 if self.os_window is None:
                     from pygame._sdl2 import video as sdl_video
                     self.os_window = sdl_video.Window.from_display_module()
                 if tuple(self.window.get_size()) != size:
+                    self.requested = {size}
                     self.os_window.size = size
                     self.size_wanted, self.size_deadline = size, time.time() + 0.5
                 return
@@ -628,13 +656,37 @@ class App:
         except Exception:
             pass
 
+    def on_resize(self, size):
+        """The user resized (or maximised) the window.  The window manager owns the size while it is being
+        dragged, so nothing is asked of it: the game is simply re-fitted and centred in whatever it gives us."""
+        self.resizing_until = time.time() + 0.35          # (drawing is cheaper while this lasts)
+        self.seen_size = (int(size[0]), int(size[1]))
+
     def apply_scale(self, factor):
-        """Resize the window to show the canvas at ``factor`` (1.0 = 1114 x 914, or 1334 x 914 with the
-        move-list column)."""
-        factor = max(0.4, min(2.0, factor))
+        """Resize the window to show the layout at ``factor`` (1.0 = 1114 x 914, or 1334 x 914 with the
+        move-list column, in the wide layout)."""
+        factor = max(0.4, min(4.0, factor))
         size = self.window_size_for(factor)
         self.set_window_size(size)
         self.fit_view(size)
+
+    def fit_screen(self):
+        """The largest zoom (at most 1) at which the whole window fits the desktop."""
+        self.apply_scale(auto_scale(self.window_size_for(1.0) if self.tall else (WIN_W, WIN_H)))
+
+    def set_tall(self, tall):
+        """View > Layout: the side panel beside the board (wide), or under it (tall)."""
+        if tall == self.tall:
+            return
+        self.tall = tall
+        self.refused = None
+        try:
+            dw, dh = pygame.display.get_desktop_sizes()[0]
+        except Exception:
+            dw, dh = 10 ** 6, 10 ** 6
+        cw, ch = self.content_size()
+        s = min(self.scale, max(0.4, (dh - 90 - MENU_H) / float(ch)), max(0.4, (dw - 30) / float(cw)))
+        self.apply_scale(s)
 
     def fit_view(self, size=None):
         """Lay the canvas out in the window (see ``compute_regions``)."""
@@ -642,42 +694,28 @@ class App:
         self.compute_regions(ww, max(1, wh - MENU_H))
 
     def compute_regions(self, ww, ah):
-        """Decide how the window shows the canvas.  The canvas is the landscape picture: board, eval bar and
-        side panel in a row, the status line under the board.  In a window that is taller than that, the
-        same pieces are re-arranged: the board on top at the full window width, the status line under it,
-        and the side panel (cut in two halves) under that, so the board and the text grow with the window
-        instead of leaving empty room.  Every part is a ``(canvas rect, (x, y) in the window, scale)``."""
+        """Decide how the window shows the canvas.  Wide layout: the landscape picture as it is.  Tall
+        layout: the board and the status line on top at the full window width, and under them the control
+        strip (the canvas rows under WIN_H), with the move-list column, when there is one, at the right.
+        Every part is a ``(canvas rect, (x, y) in the window, scale)``.  (While the quick reference is open
+        the wide picture is always used, fitted into the window: it is a modal page made for it.)"""
+        tall = self.tall and not getattr(self, 'help_open', False)
         exp = self.expanded
-        land = min(ww / float(self.win_w), ah / float(self.win_h - MENU_H))
-        bottom_h = (self.win_h - BOARD_Y) - PANEL_SPLIT
-        pw = max(PANEL_X + (MOVES_W if exp else 0), 2 * PANEL_W)
-        ph = BOARD_PX + STATUS_H + bottom_h
-        port = min(ww / float(pw), ah / float(ph))
         R = pygame.Rect
-        if port > land * 1.001 and not getattr(self, 'help_open', False):
-            s = port
-            y0 = MENU_H + int(round((BOARD_PX + STATUS_H) * s))
-            edge = PANEL_X
-            if getattr(self, 'pending', None) is not None:    # (the decision menu is drawn partly over the eval bar)
-                edge = min(PANEL_X, self.menu_geometry(len(self.pending[1]), bool(self.history))[0].x)
-            regions = [(R(0, BOARD_Y, edge, BOARD_PX), (0, MENU_H), s),
-                       (R(0, BOARD_Y + BOARD_PX, PANEL_X, STATUS_H), (0, MENU_H + int(round(BOARD_PX * s))), s)]
-            if getattr(self, 'pending', None) is not None:   # the decision menu takes the place of the side panel
-                mp = self.menu_geometry(len(self.pending[1]), bool(self.history))[0]
-                zw, zh = ww, MENU_H + ah - y0
-                sm = max(0.05, min(s, zw / float(mp.w), zh / float(mp.h)))
-                regions.append((mp, (max(0, int((PANEL_X * s - mp.w * sm) // 2)), y0), sm))
-            else:
-                x0 = max(0, int(round((PANEL_X - 2 * PANEL_W) * s)) // 2)
-                regions.append((R(PANEL_X, BOARD_Y, PANEL_W, PANEL_SPLIT), (x0, y0), s))
-                regions.append((R(PANEL_X, BOARD_Y + PANEL_SPLIT, PANEL_W, self.win_h - BOARD_Y - PANEL_SPLIT),
-                                (x0 + int(round(PANEL_W * s)), y0), s))
+        if tall:
+            cw, ch = self.content_size(True)
+            s = min(ww / float(cw), ah / float(ch))
+            top_h = BOARD_PX + STATUS_H
+            regions = [(R(0, BOARD_Y, PANEL_X, top_h), (0, MENU_H), s),
+                       (R(0, self.win_h, PANEL_X, STRIP_H), (0, MENU_H + int(round(top_h * s))), s)]
             if exp:
                 regions.append((R(MOVES_X, BOARD_Y, MOVES_W, self.win_h - BOARD_Y), (int(round(PANEL_X * s)), MENU_H), s))
             self.mode = "portrait"
         else:
-            s = land
-            regions = [(R(0, MENU_H, self.win_w, self.win_h - MENU_H), (0, MENU_H), s)]
+            s = min(ww / float(self.win_w), ah / float(self.win_h - MENU_H))
+            ox = max(0, (ww - int(round(self.win_w * s))) // 2)          # centred: spare room is split evenly
+            oy = max(0, (ah - int(round((self.win_h - MENU_H) * s))) // 2)
+            regions = [(R(0, MENU_H, self.win_w, self.win_h - MENU_H), (ox, MENU_H + oy), s)]
             self.mode = "landscape"
         self.regions = regions
         self.scale = s
@@ -695,16 +733,14 @@ class App:
         return self.review is not None or self.reviewer is not None or self.browsing
 
     def sync_window(self):
-        """Make room for the move-list column, or give it back, keeping the zoom and the window's height."""
+        """Make room for the move-list column, or give it back, keeping the zoom."""
         want = self.want_expanded()
         if want == self.expanded:
             return
-        old_w = self.win_w
         self.expanded = want
         self.win_w = WIN_W if want else COMPACT_W
-        self.canvas = self.screen = pygame.Surface((self.win_w, self.win_h), 0, 32)
-        ww, wh = self.window.get_size()
-        size = (ww + int(round((self.win_w - old_w) * self.scale)), wh) if self.mode == "landscape" else (ww, wh)
+        self.canvas = self.screen = pygame.Surface((self.win_w, self.win_h + STRIP_H), 0, 32)
+        size = self.window_size_for(self.scale)
         self.set_window_size(size)
         self.fit_view(size)
 
@@ -716,44 +752,25 @@ class App:
         """Show the finished frame: the canvas parts arranged and scaled into the window, the menu bar on top."""
         window = pygame.display.get_surface()
         if self.size_wanted is not None:
-            # A resize we asked for has not reached the window's surface yet: drawing on the old surface now
-            # would scribble on memory that is about to be replaced (that shows up as garbage), so wait for it.
-            pygame.event.pump()
-            window = pygame.display.get_surface()
-            if window.get_size() != self.size_wanted and time.time() < self.size_deadline:
-                return
-            self.size_wanted = None
+            if window.get_size() == self.size_wanted:
+                self.size_wanted = None
+            elif time.time() > self.size_deadline:        # the window manager said no (maximised, tiled ...)
+                self.refused = self.seen_size = tuple(window.get_size())
+                self.requested = set()
+                self.size_wanted = None
         self.window = window
         self.fit_view()
         window.fill(PANEL_BG)
+        fast = time.time() < self.resizing_until          # while dragging: cheap scaling, smooth once it stops
+        scale_fn = pygame.transform.scale if fast else pygame.transform.smoothscale
         for src, (dx, dy), sc in self.regions:
             src = src.clip(self.canvas.get_rect())
             size = (max(1, int(round(src.w * sc))), max(1, int(round(src.h * sc))))
-            part = pygame.Surface(src.size, 0, 32)       # a plain copy: smoothscale on a sub-surface can misread rows
-            part.blit(self.canvas, (0, 0), src)
-            window.blit(part if size == src.size else pygame.transform.smoothscale(part, size), (dx, dy))
+            part = self.canvas.subsurface(src).copy()
+            window.blit(part if size == src.size else scale_fn(part, size), (dx, dy))
         self.draw_menubar(window)
         self.draw_dropdown(window)
         pygame.display.flip()
-        self.settle_window()
-
-    def settle_window(self):
-        """The layout has a fixed shape, so a window of another shape would show an empty strip.  A moment after
-        the user stops resizing, the window itself is trimmed to the shape of what it shows (the dimension that
-        had room to spare shrinks), so nothing blank is ever left on screen."""
-        cur = self.window.get_size()
-        now = time.time()
-        if cur != self.last_seen:
-            self.last_seen, self.changed_at = cur, now
-            return
-        target = (self.view.w, MENU_H + self.view.h)
-        if abs(target[0] - cur[0]) <= 1 and abs(target[1] - cur[1]) <= 1:
-            self.snap_refused = None
-            return
-        if now - self.changed_at < 0.25 or cur == self.snap_refused:
-            return
-        self.snap_refused = cur                    # if the window manager ignores this, do not ask again at this size
-        self.set_window_size(target)
 
     def to_logical(self, pos):
         """A window pixel -> the canvas pixel under it (nowhere on the canvas: far outside it)."""
@@ -991,6 +1008,8 @@ class App:
         self.set_advisor(advisor)
 
     def menu_geometry(self, n, with_back=False):
+        if self.mode == "portrait":                 # the tall layout: the menu takes the control strip's place
+            return menu_rects_tall(n, with_back)
         return menu_rects(n, with_back, self.win_w, self.win_h)
 
     # -- the move menu from the keyboard, and a preview of the highlighted option -----------
@@ -1736,7 +1755,7 @@ class App:
         elif ctrl and key in (pygame.K_MINUS, pygame.K_KP_MINUS):
             self.zoom(1 / 1.1)
         elif ctrl and key in (pygame.K_0, pygame.K_KP0):
-            self.apply_scale(auto_scale())
+            self.fit_screen()
         elif ctrl and key in (pygame.K_1, pygame.K_KP1):
             self.apply_scale(1.0)
         elif key == pygame.K_TAB:
@@ -1793,6 +1812,10 @@ class App:
             self.click_menu(pos)
             return
         if self.menu_click(pos if raw is None else raw):   # the menu bar and its drop-downs
+            return
+        if pos[1] >= WIN_H:                       # the tall layout's control strip
+            if self.strip['net'].collidepoint(pos):
+                self.open_picker()
             return
         if pos[0] >= BOARD_PX:
             self.click_panel(pos)
@@ -2005,7 +2028,7 @@ class App:
                     None,
                     it("Zoom in", lambda: self.zoom(1.1), "Ctrl++"),
                     it("Zoom out", lambda: self.zoom(1 / 1.1), "Ctrl+-"),
-                    it("Fit to screen", lambda: self.apply_scale(auto_scale()), "Ctrl+0"),
+                    it("Fit to screen", self.fit_screen, "Ctrl+0"),
                     it("Actual size", lambda: self.apply_scale(1.0), "Ctrl+1")]
         return [it("Quick reference", self.toggle_help, "F1")]
 
@@ -2175,6 +2198,8 @@ class App:
         self.draw_premove()
         self.draw_eval_bar()
         self.draw_panel()
+        if self.tall:
+            self.draw_strip()
         self.draw_moves()
         self.draw_status()
         if self.pending is not None:
@@ -2483,21 +2508,7 @@ class App:
         self.screen.blit(ply, (x0 + L['w'] - ply.get_width(), y + 6))
         y = BOARD_Y + 90
         for team in TEAMS:
-            on_board = game.on_board(team)
-            home = sum(1 for p in on_board if p.at_home())
-            self.text("%s: %d/%d home" % (full_name(team).capitalize(), home, len(on_board)),
-                      (x0, y))
-            y += 26
-            self.text("not on the board:", (x0, y), self.font_small, MUTED)
-            y += 20
-            off = Counter(p.ptype for p in game.pieces[team] if not p.ontheboard)
-            for i, ptype in enumerate(('p', 'r', 'n', 'b', 'q')):
-                cx, cy = x0 + (i % 3) * 72, y + (i // 3) * 38
-                self.screen.blit(self.sprite(team, ptype, 32), (cx, cy))
-                count = off.get(ptype, 0)
-                self.text("x%d" % count, (cx + 34, cy + 8), self.font,
-                          TEXT if count else MUTED)
-            y += 2 * 38 + 16
+            y = self.draw_tray(team, x0, y) + 16
         self.draw_controls()
         legend = ["blue outline: can move", "grey lock: locked for good",
                   "orange lock: blocked right now", "gold P: promoted piece",
@@ -2505,10 +2516,47 @@ class App:
         for i, line in enumerate(legend):
             self.text(line, (x0, self.win_h - 6 - (len(legend) - i) * 20), self.font_small, MUTED)
 
-    def draw_controls(self):
+    def draw_tray(self, team, x, y, per_row=3, step=72):
+        """One side's tray: pieces at home, and the pieces that are not on the board (``per_row`` of them
+        per row, ``step`` pixels apart).  Returns the y under it."""
+        game = self.game
+        on_board = game.on_board(team)
+        home = sum(1 for p in on_board if p.at_home())
+        self.text("%s: %d/%d home" % (full_name(team).capitalize(), home, len(on_board)), (x, y))
+        y += 26
+        self.text("not on the board:", (x, y), self.font_small, MUTED)
+        y += 20
+        off = Counter(p.ptype for p in game.pieces[team] if not p.ontheboard)
+        for i, ptype in enumerate(('p', 'r', 'n', 'b', 'q')):
+            cx, cy = x + (i % per_row) * step, y + (i // per_row) * 38
+            self.screen.blit(self.sprite(team, ptype, 32), (cx, cy))
+            count = off.get(ptype, 0)
+            self.text("x%d" % count, (cx + 34, cy + 8), self.font, TEXT if count else MUTED)
+        rows = (5 + per_row - 1) // per_row
+        return y + rows * 38
+
+    def draw_strip(self):
+        """The tall layout's controls (the canvas rows under the wide picture): everything the side panel
+        shows, laid out across the width under the board instead of down beside it."""
+        S = self.strip
+        top = S['net'].y - 6                         # = WIN_H
+        pygame.draw.rect(self.screen, PANEL_BG, (0, top, PANEL_X, STRIP_H))
+        pygame.draw.line(self.screen, (22, 22, 26), (0, top), (PANEL_X, top), 2)
+        self.text("Reverse Chess", (14, top + 12), self.font)
+        ply = self.font_small.render("ply %d" % self.game.ply, True, MUTED)
+        self.screen.blit(ply, (14 + self.font.size("Reverse Chess")[0] + 12, top + 18))
+        for team, x in zip(TEAMS, (14, 424)):
+            self.draw_tray(team, x, top + 56, per_row=5, step=78)
+        pygame.draw.line(self.screen, (60, 60, 66), (14, top + 142), (PANEL_X - 14, top + 142), 1)
+        self.draw_controls(S)
+        self.text("blue outline: can move   grey lock: locked for good   orange lock: blocked right now   "
+                  "gold P: promoted   F1: help", (14, top + STRIP_H - 24), self.font_small, MUTED)
+
+    def draw_controls(self, L=None):
         """The side panel below the piece trays: the AI's name, the eval line, hints, the record."""
-        L = self.layout
+        L = L or self.layout
         x0, w = L['x0'], L['w']
+        hx, hw = L.get('hint_x', x0), L.get('hint_w', w)
         if self.advisor is not None:
             label = "AI: " + self.advisor.name
         else:
@@ -2534,30 +2582,30 @@ class App:
                 how = "final"
             elif sims and self.search_for_here() is not None and self.search_for_here().solved:
                 how = "forced win"
-            self.text("Eval %+.2f  (%s, %s)" % (vw, who, how), (x0, L['eval_text_y']),
+            self.text("Eval %+.2f  (%s, %s)" % (vw, who, how), (hx, L['eval_text_y']),
                       self.font_small, TEXT)
         alts = self.review_alts() if hint is None else None
         if alts is not None:
             y = L['hint_y']
-            self.text(alts["header"], (x0, y), self.font_small, MUTED)
+            self.text(alts["header"], (hx, y), self.font_small, MUTED)
             y += 18
             for rank, line in enumerate(alts["rows"]):
-                self.text(line, (x0, y), self.font_small, HINT_TEXT[rank])
+                self.text(line, (hx, y), self.font_small, HINT_TEXT[rank])
                 y += 17
-            self.text(alts["played"], (x0, y + 3), self.font_small, REVIEW_PLAYED[:3])
+            self.text(alts["played"], (hx, y + 3), self.font_small, REVIEW_PLAYED[:3])
         if hint is not None:
             y = L['hint_y']
             for rank, (action, p) in enumerate(hint["top"]):
                 line = "%d. %d%%  %s" % (rank + 1, round(100 * p), describe(self.game, action))
-                for text in wrap(line, self.font_small, w)[:2]:
-                    self.text(text, (x0, y), self.font_small, HINT_TEXT[rank])
+                for text in wrap(line, self.font_small, hw)[:2]:
+                    self.text(text, (hx, y), self.font_small, HINT_TEXT[rank])
                     y += 17
                 y += 3
-        self.draw_stats()
+        self.draw_stats(L)
 
-    def draw_stats(self):
-        L = self.layout
-        x0, w = L['x0'], L['w']
+    def draw_stats(self, L=None):
+        L = L or self.layout
+        x0, w = L.get('stats_x', L['x0']), L['w']
         y = L['stats_y']
         self.text("You vs the AI", (x0, y), self.font_status)
         if self.stats is None:
@@ -2756,7 +2804,11 @@ class App:
             'promote': "Promote the gifted pawn?",
             'confirm': "Play this move?",
         }
-        if panel.w >= 440:
+        if panel.y >= WIN_H:                        # the tall layout's strip: title and hint on one line
+            self.text(titles[dim], (panel.x + 20, panel.y + 10), self.font_big)
+            self.text("click, or keys 1-9, Enter", (panel.x + 20 + self.font_big.size(titles[dim])[0] + 18, panel.y + 20),
+                      self.font_small, MUTED)
+        elif panel.w >= 440:
             self.text(titles[dim], (panel.x + 20, panel.y + 18), self.font_big)
             self.text("click, or keys 1-9 / Up Down + Enter;  Backspace back", (panel.x + 20, panel.y + 54),
                       self.font_small, MUTED)
@@ -2791,16 +2843,33 @@ class App:
                 label = ("Leave it a pawn" if value is None
                          else "Promote it to a %s" % NAMES[value])
                 team, ptype = recv, value or 'p'
+            size = min(56, rect.h - 8)
             if not (dim == 'gift' and value is None):
-                self.screen.blit(self.sprite(team, ptype, 56), (rect.x + 8, rect.y + 7))
-            avail = rect.w - 90
+                self.screen.blit(self.sprite(team, ptype, size), (rect.x + 8, rect.y + (rect.h - size) // 2))
+            avail = rect.w - 34 - size
             if self.font.size(label)[0] <= avail:
-                self.text(label, (rect.x + 76, rect.y + 24), self.font)
+                self.text(label, (rect.x + 20 + size, rect.centery - 10), self.font)
             else:
                 lines = wrap(label, self.font_small, avail)[:3]
                 top = rect.y + (rect.h - 17 * len(lines)) // 2
                 for j, line in enumerate(lines):
-                    self.text(line, (rect.x + 76, top + 17 * j), self.font_small)
+                    self.text(line, (rect.x + 20 + size, top + 17 * j), self.font_small)
+
+
+def menu_rects_tall(n, with_back=False):
+    """The move menu of the tall layout: it covers the control strip under the board (so the board and the
+    gift preview stay in view), with the options in one or two columns and the Back button in the header."""
+    panel = pygame.Rect(8, WIN_H + 6, PANEL_X - 16, STRIP_H - 12)
+    head, gap = 50, 8
+    cols = 1 if n <= 3 else 2 if n <= 8 else 3
+    rows = (n + cols - 1) // cols
+    height = max(30, min(60, (panel.h - head - 12 - (rows - 1) * gap) // rows))
+    width = (panel.w - 40 - (cols - 1) * 12) // cols
+    rects = [pygame.Rect(panel.x + 20 + (i % cols) * (width + 12), panel.y + head + (i // cols) * (height + gap),
+                         width, height) for i in range(n)]
+    x_rect = pygame.Rect(panel.right - 46, panel.y + 8, 34, 34)
+    back_rect = pygame.Rect(panel.right - 46 - 112, panel.y + 8, 100, 34) if with_back else None
+    return panel, rects, x_rect, back_rect
 
 
 def menu_rects(n, with_back=False, win_w=COMPACT_W, win_h=WIN_H):
@@ -2969,9 +3038,12 @@ def main():
     clock = pygame.time.Clock()
     running = True
     while running:
+        resize = None
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 running = False
+            elif event.type == pygame.VIDEORESIZE:
+                resize = event.size                        # (a drag sends many: only the newest matters)
             elif event.type == pygame.KEYDOWN:
                 app.handle_key(event)
             elif event.type == pygame.DROPFILE and app.pending is None and not app.help_open:
@@ -2989,6 +3061,8 @@ def main():
                     app.picker_scroll(event.y)
                 elif app.menu_open is None and app.expanded and app.layout['m_list'].collidepoint(app.mouse()):
                     app.scroll_moves(event.y)
+        if resize is not None:
+            app.on_resize(resize)
         if not app.help_open:
             app.poll_review()
             app.update_ai()
