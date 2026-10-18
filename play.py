@@ -111,6 +111,7 @@ The function is called as ``function(game)`` and must return one of
 Only pygame and numpy are needed; there is no tkinter and no pop-up window.
 """
 import argparse
+import dataclasses
 import glob
 import importlib
 import json
@@ -132,7 +133,8 @@ import mcts
 import numpy_net
 import review as reviewlib
 from chessassets import TEAMS, PTYPES, image_path
-from engine import SIZE, Game, IllegalActionError, Rules, full_name, other_team, pawn_home_row
+from engine import (SIZE, Game, IllegalActionError, Rules, full_name, other_team, pawn_home_row,
+                    start_problem)
 from stats import Stats, default_path as stats_default_path
 
 # --------------------------------------------------------------------------
@@ -159,6 +161,11 @@ WIN_W = MOVES_X + MOVES_W        # ... and with the move-list column (review mod
 WIN_H = BOARD_Y + BOARD_PX + STATUS_H
 STRIP_H = 312                    # tall layout: height of the strip of controls under the board
 MENU_TITLES = ("File", "Game", "Analysis", "View", "Help")
+UNDO_KEYS = "Cmd+Z" if sys.platform == "darwin" else "Ctrl+Z"
+GIFT_LIMITS = (0, 1, 2, 3, 4, 5, 6, 8, 10)      # Game > Gift limit (--max-gifts takes any number)
+SETUP_MAX = {'k': 1, 'q': 1, 'r': 2, 'b': 2, 'n': 2, 'p': 8}   # most pieces of a kind a side has
+SETUP_ORDER = ('k', 'q', 'r', 'b', 'n', 'p')
+DEFAULT_START = {(3, 5): ('b', 'k'), (4, 3): ('w', 'k')}      # the usual start: just the two kings
 
 LIGHT = (238, 238, 210)
 DARK = (118, 150, 86)
@@ -204,6 +211,8 @@ def make_layout():
         'eval_text_y': BOARD_Y + 372,
         'hint_y': BOARD_Y + 392,
         'stats_y': BOARD_Y + 560,
+        'variant_y': BOARD_Y + 650,
+        'undo': R(x0, BOARD_Y + 690, w, 36),
         # the move-list column
         'm_prev': R(MOVES_X + 14, BOARD_Y + 44, 92, 28), 'm_next': R(MOVES_X + 114, BOARD_Y + 44, 92, 28),
         'm_list': R(MOVES_X + 6, BOARD_Y + 134, MOVES_W - 12, ROW_H * 27),
@@ -221,6 +230,8 @@ def make_strip_layout():
         'x0': 14, 'w': 360, 'hint_x': 430, 'hint_w': PANEL_X - 430 - 14, 'stats_x': 14,
         'net': R(250, y + 6, PANEL_X - 250 - 14, 38),
         'eval_text_y': y + 152, 'hint_y': y + 174, 'stats_y': y + 152,
+        'variant_y': y + 232,
+        'undo': R(14, y + 250, 170, 34),
     }
 
 
@@ -539,6 +550,7 @@ class App:
                  auto_orient=True, tall=False):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
+        self.setup = None             # the custom-start editor (Game > Start position), see open_setup
         # See "the window" below: a scaled canvas under a menu bar drawn at window level.
         self.expanded = False
         self.win_w, self.win_h = COMPACT_W, WIN_H
@@ -706,7 +718,7 @@ class App:
         strip (the canvas rows under WIN_H), with the move-list column, when there is one, at the right.
         Every part is a ``(canvas rect, (x, y) in the window, scale)``.  (While the quick reference is open
         the wide picture is always used, fitted into the window: it is a modal page made for it.)"""
-        tall = self.tall and not getattr(self, 'help_open', False)
+        tall = self.tall and not getattr(self, 'help_open', False) and getattr(self, 'setup', None) is None
         exp = self.expanded
         R = pygame.Rect
         if tall:
@@ -805,6 +817,8 @@ class App:
     def stats_eligible(self):
         """True when this setup is 'a human against the network', the only thing the record counts."""
         if self.stats is None or self.advisor is None or not self.ai_on or len(self.ai_sides) != 1:
+            return False
+        if not self.rules.standard:               # a variant is not the game the record is about
             return False
         return self.custom.get(next(iter(self.ai_sides))) is None
 
@@ -905,6 +919,8 @@ class App:
     def right_click(self):
         if self.menu_open is not None:
             self.close_menus()
+        elif self.setup is not None:
+            self.setup_right_click()
         elif self.premove is not None or self.pre_src is not None:
             self.clear_premove()
             self.message = "Premove cancelled."
@@ -1096,6 +1112,169 @@ class App:
             self.stats_summary = self.stats.summary()
         self.new_game()
 
+    # -- variants: gift limit, custom start ------------------------------------------------
+    def variant_label(self):
+        """Short description of the variant rules in force ('' = the standard game)."""
+        r, parts = self.rules, []
+        if r.max_gifts is not None:
+            parts.append("gift limit %d each" % r.max_gifts)
+        if r.start is not None:
+            parts.append("custom start")
+        if r.start_turn != 'b':
+            parts.append("%s moves first" % full_name(r.start_turn))
+        return " + ".join(parts)
+
+    def set_variant(self, **changes):
+        """Change the variant rules (Rules fields) and start a new game with them."""
+        new = dataclasses.replace(self.rules, **changes)
+        if new == self.rules:
+            return
+        self.rules = new
+        self.restart()
+        label = self.variant_label()
+        self.message = ("New game: %s.  (Game menu to change; Ctrl+S / the record only know the standard game.)" % label
+                        if label else "New game with the standard rules.")
+
+    def set_gift_limit(self, n):
+        self.set_variant(max_gifts=n)
+
+    def set_standard_start(self):
+        self.set_variant(start=None, start_turn='b')
+
+    def open_setup(self):
+        """Game > Start position > Custom setup: place any pieces on the board, then start a game from there."""
+        self.cancel()
+        self.clear_premove()
+        self.stop_search()
+        self.hint = None
+        r = self.rules
+        pieces = {(row, col): (t, p) for t, p, row, col in r.start} if r.start else dict(DEFAULT_START)
+        self.setup = {"pieces": pieces, "turn": r.start_turn, "tool": None, "error": ""}
+        self.message = ""
+
+    def setup_rules(self):
+        """The Rules the editor's board stands for."""
+        st = self.setup
+        start = None if st["pieces"] == DEFAULT_START else tuple(sorted(
+            (t, p, r, c) for (r, c), (t, p) in st["pieces"].items()))
+        return dataclasses.replace(self.rules, start=start, start_turn=st["turn"])
+
+    def setup_layout(self):
+        """Rectangles of the editor's palette and buttons (in the side panel)."""
+        x0, w = self.layout['x0'], self.layout['w']
+        R, cell = pygame.Rect, 37
+        out, y = {}, BOARD_Y + 150
+        for team in ('w', 'b'):
+            out[team + '_y'] = y - 22
+            for i, ptype in enumerate(SETUP_ORDER):
+                out[(team, ptype)] = R(x0 + i * cell, y, cell - 2, cell - 2)
+            y += 80
+        out['erase'] = R(x0, y, w, 30)
+        out['turn'] = R(x0, y + 38, w, 30)
+        out['standard'] = R(x0, y + 76, w // 2 - 4, 30)
+        out['kings'] = R(x0 + w // 2 + 4, y + 76, w // 2 - 4, 30)
+        out['done'] = R(x0, y + 122, w, 36)
+        out['cancel'] = R(x0, y + 166, w, 36)
+        out['msg_y'] = y + 218
+        return out
+
+    def setup_place(self, sq):
+        st = self.setup
+        pieces, tool = st["pieces"], st["tool"]
+        if tool is None:
+            st["error"] = "Pick a piece on the right first (or right-click a piece to remove it)."
+            return
+        if tool == 'erase':
+            self.setup_erase(sq)
+            return
+        team, ptype = tool
+        have = pieces.get(sq)
+        if have == tool:                                   # the same piece again: take it off
+            self.setup_erase(sq)
+            return
+        if ptype == 'p' and sq[0] in (0, SIZE - 1):
+            st["error"] = "A pawn can never stand on the first or last row."
+            return
+        if have is not None and have[1] == 'k':
+            st["error"] = "A king cannot be replaced; put it on another square to move it."
+            return
+        mine = [s for s, piece in pieces.items() if piece == tool]
+        if len(mine) >= SETUP_MAX[ptype]:
+            if SETUP_MAX[ptype] > 1:
+                st["error"] = "All %d %s %s are already on the board (right-click one to remove it)." % (
+                    SETUP_MAX[ptype], full_name(team), NAMES[ptype] + "s")
+                return
+            del pieces[mine[0]]                            # the only king / queen: placing it again moves it
+        pieces[sq] = tool
+        st["error"] = ""
+
+    def setup_erase(self, sq):
+        st = self.setup
+        have = st["pieces"].get(sq)
+        if have is None:
+            return
+        if have[1] == 'k':
+            st["error"] = "Kings stay on the board: pick a king and click another square to move it."
+            return
+        del st["pieces"][sq]
+        st["error"] = ""
+
+    def setup_done(self):
+        rules = self.setup_rules()
+        problem = start_problem(rules)
+        if problem:
+            self.setup["error"] = problem
+            return
+        self.setup = None
+        if rules == self.rules:
+            self.restart()
+            self.message = "New game from the same setup."
+        else:
+            self.set_variant(start=rules.start, start_turn=rules.start_turn)
+            if not self.message.startswith("New game"):
+                self.message = "New game from the custom setup."
+
+    def setup_cancel(self):
+        self.setup = None
+
+    def setup_key(self, key):
+        if key == pygame.K_ESCAPE:
+            self.setup_cancel()
+        elif key in (pygame.K_RETURN, pygame.K_KP_ENTER):
+            self.setup_done()
+
+    def setup_click(self, pos):
+        st = self.setup
+        x, y = pos
+        if 0 <= x < BOARD_PX and BOARD_Y <= y < BOARD_Y + BOARD_PX:
+            self.setup_place(self.xy_sq(x, y))
+            return
+        L = self.setup_layout()
+        for key, rect in L.items():
+            if not isinstance(rect, pygame.Rect) or not rect.collidepoint(pos):
+                continue
+            if key == 'erase':
+                st["tool"] = None if st["tool"] == 'erase' else 'erase'
+            elif key == 'turn':
+                st["turn"] = other_team(st["turn"])
+            elif key == 'standard':
+                st["pieces"], st["turn"], st["error"] = dict(DEFAULT_START), 'b', ""
+            elif key == 'kings':
+                st["pieces"] = {s: p for s, p in st["pieces"].items() if p[1] == 'k'}
+                st["error"] = ""
+            elif key == 'done':
+                self.setup_done()
+            elif key == 'cancel':
+                self.setup_cancel()
+            else:
+                st["tool"] = key
+            return
+
+    def setup_right_click(self):
+        x, y = self.mouse()
+        if 0 <= x < BOARD_PX and BOARD_Y <= y < BOARD_Y + BOARD_PX:
+            self.setup_erase(self.xy_sq(x, y))
+
     def reindex(self):
         """Group the side to move's legal actions by source square."""
         self.by_src = defaultdict(list)
@@ -1184,7 +1363,7 @@ class App:
             self.record_finished()
             if self.autosave:
                 self.save()
-            if self.advisor is not None:
+            if self.advisor is not None and self.rules.standard:
                 self.start_review()
 
     # -- game history: step, undo, flip, save, load, review --------------
@@ -1301,7 +1480,7 @@ class App:
         self.reindex()
         self.message = message
         self.save_session()
-        if review and self.advisor is not None and actions:
+        if review and self.advisor is not None and actions and rules.standard:
             self.start_review()
 
     def paste_text(self, text):
@@ -1426,6 +1605,8 @@ class App:
     def start_review(self):
         if self.advisor is None:
             self.message = "Review needs the AI file (ai.npz or latest.pt next to play.py)."
+        elif not self.rules.standard:
+            self.message = "The review only knows the standard game, not the gift limit / custom start variants."
         elif not self.line:
             self.message = "Nothing to review yet."
         elif self.reviewer is None:
@@ -1620,7 +1801,7 @@ class App:
     def analysis_searcher(self):
         """The search that feeds the eval bar and the hints: always the main AI's network, whatever level
         plays.  (The look-ahead switch, S / Game > Difficulty, only decides whether the *computer* searches.)"""
-        if self.searcher is None or self.eval_advisor is None:
+        if self.searcher is None or self.eval_advisor is None or not self.rules.standard:
             return None
         if self.advisor is self.eval_advisor:
             return self.searcher                                # the computer is the main AI: one search serves both
@@ -1667,7 +1848,7 @@ class App:
 
     def ensure_search(self, ms=None):
         """Make sure a background search of the current position is running or finished."""
-        if not self.use_search or self.searcher is None or self.game.done:
+        if not self.use_search or self.searcher is None or self.game.done or not self.rules.standard:
             return None
         job = self.search_for_here()
         if job is None:
@@ -1731,6 +1912,8 @@ class App:
         L = self.layout
         if L['net'].collidepoint(pos):
             self.open_picker()
+        elif L['undo'].collidepoint(pos):
+            self.takeback()
         elif L['m_prev'].collidepoint(pos):
             self.next_mistake(-1)
         elif L['m_next'].collidepoint(pos):
@@ -1771,8 +1954,18 @@ class App:
         if self.picker is not None:
             self.picker_key(key)
             return
+        if self.setup is not None:                  # the custom-start editor is modal too
+            self.setup_key(key)
+            return
         if key == pygame.K_ESCAPE:
             self.escape()
+            return
+        # Undo: Ctrl+Z, or Cmd+Z on a Mac.  (Shift added = redo, like everywhere else; so is Ctrl/Cmd+Y.)
+        if key in (pygame.K_z, pygame.K_y) and mod & (pygame.KMOD_CTRL | pygame.KMOD_META):
+            if key == pygame.K_y or mod & pygame.KMOD_SHIFT:
+                self.step_forward()
+            else:
+                self.takeback()
             return
         if ctrl and key == pygame.K_s and self.pending is None:
             self.save()
@@ -1819,6 +2012,8 @@ class App:
             self.takeback()
         elif key == pygame.K_f:
             self.flip()
+        elif key == pygame.K_b and not ctrl:
+            self.open_setup()
         elif key == pygame.K_c and not ctrl:
             self.toggle_coords()
         elif key == pygame.K_n and not ctrl:
@@ -1855,6 +2050,10 @@ class App:
         if self.picker is not None:               # so is the network picker
             self.click_picker(pos)
             return
+        if self.setup is not None:                # ... and the custom-start editor
+            if not self.menu_click(pos if raw is None else raw):   # (the menu bar still works over it)
+                self.setup_click(pos)
+            return
         if self.pending is not None:              # the move menu is modal
             self.click_menu(pos)
             return
@@ -1863,6 +2062,8 @@ class App:
         if pos[1] >= WIN_H:                       # the tall layout's control strip
             if self.strip['net'].collidepoint(pos):
                 self.open_picker()
+            elif self.strip['undo'].collidepoint(pos):
+                self.takeback()
             return
         if pos[0] >= BOARD_PX:
             self.click_panel(pos)
@@ -2026,7 +2227,7 @@ class App:
             return
         if self.browsing:                         # looking at an earlier position: the computer waits
             return
-        if self.use_search and agent is self.default_ai:
+        if self.use_search and agent is self.default_ai and self.rules.standard:
             job = self.ensure_search()            # the network, with look-ahead
             if job is None or not job.finished or pygame.time.get_ticks() < self.ai_due:
                 return
@@ -2083,7 +2284,9 @@ class App:
         return {"tier": tier, "net": net, "sound": self.sound_on, "coords": self.coords,
                 "eval": bool(self.show_eval), "search": bool(self.use_search), "think_ms": int(self.think_ms),
                 "moves_mode": self.moves_mode, "move_input": self.move_input, "ai_on": bool(self.ai_on), "ai_sides": sorted(self.ai_sides),
-                "scale": round(float(self.scale), 3)}
+                "scale": round(float(self.scale), 3),
+                "max_gifts": self.rules.max_gifts, "start_turn": self.rules.start_turn,
+                "start": [list(p) for p in self.rules.start] if self.rules.start else None}
 
     def save_settings(self, force=False):
         """Write the settings when they changed (checked about once a second; ``force`` at exit)."""
@@ -2143,6 +2346,16 @@ class App:
             sides = {x for x in saved.get("ai_sides", []) if x in ("b", "w")}
             self.ai_on, self.ai_sides = saved["ai_on"] and bool(sides), (sides or self.ai_sides)
             self.ai_changed()
+        if "variant" not in given:                          # gift limit / custom start, as last left
+            try:
+                new = dataclasses.replace(
+                    self.rules, max_gifts=saved.get("max_gifts"), start_turn=saved.get("start_turn") or "b",
+                    start=tuple(map(tuple, saved["start"])) if saved.get("start") else None)
+                if new != self.rules and (new.start is None or start_problem(new) is None):
+                    self.rules = new
+                    self.new_game()
+            except (ValueError, TypeError):
+                pass
         if "scale" not in given and isinstance(saved.get("scale"), (int, float)) and 0.4 <= saved["scale"] <= 4:
             try:
                 dw, dh = pygame.display.get_desktop_sizes()[0]
@@ -2182,7 +2395,7 @@ class App:
                     it("Quit", self.quit)]
         if title == "Game":
             ai_on, sides = self.ai_on, self.ai_sides
-            items = [it("Undo", self.takeback, "Z", enabled=self.pos > 0),
+            items = [it("Undo", self.takeback, UNDO_KEYS, enabled=self.pos > 0),
                      it("Flip board", self.flip, "F", checked=self.flipped), None,
                      it("Computer plays", sub=[
                          it("Nobody (two humans)", lambda: self.set_ai_sides(None), checked=not ai_on),
@@ -2198,6 +2411,16 @@ class App:
             items.append(it("Think time", enabled=self.think_enabled(), sub=[
                 it(think_label(ms), lambda ms=ms: self.set_think(ms), checked=self.think_ms == ms)
                 for ms in THINK_STEPS]))
+            items.append(None)
+            cap = self.rules.max_gifts
+            items.append(it("Gift limit (new game)", sub=[
+                it("Unlimited", lambda: self.set_gift_limit(None), checked=cap is None)] + [
+                it("%d each%s" % (n, "  (no gifts)" if n == 0 else ""), lambda n=n: self.set_gift_limit(n),
+                   checked=cap == n) for n in GIFT_LIMITS]))
+            items.append(it("Start position (new game)", sub=[
+                it("Standard: two kings", self.set_standard_start,
+                   checked=self.rules.start is None and self.rules.start_turn == 'b'),
+                it("Custom setup...", self.open_setup, "B", checked=self.rules.start is not None)]))
             items.append(None)
             confirming = pygame.time.get_ticks() < self.confirm_reset_until
             items.append(it("Click again to erase the record" if confirming else "Reset win / loss record",
@@ -2292,6 +2515,8 @@ class App:
             if item["sub"]:
                 self.menu_sub = None if self.menu_sub == item["label"] else item["label"]
                 return True
+            if self.setup is not None and not self.menu_keeps_setup(item):
+                self.setup = None                                # anything that touches the game ends the editor
             if not item["keep"]:
                 self.close_menus()
             item["run"]()
@@ -2300,6 +2525,10 @@ class App:
             return True                                          # on a separator / the border
         self.close_menus()
         return True
+
+    def menu_keeps_setup(self, item):
+        """Does running ``item`` leave the custom-start editor open?  (Only display things do.)"""
+        return MENU_TITLES[self.menu_open] in ("View", "Help") or item["label"] == "Flip board"
 
     def menu_hover(self):
         """While a menu is open: moving over another title switches menus, moving over an entry with a
@@ -2394,6 +2623,11 @@ class App:
     def draw(self):
         self.sync_window()
         self.screen.fill(STATUS_BG)
+        if self.setup is not None:
+            self.draw_setup()
+            if self.help_open:
+                self.draw_help()
+            return
         self.draw_board()
         self.draw_coords()
         self.draw_hint_arrows()
@@ -2444,7 +2678,7 @@ class App:
             ]),
             ("HISTORY & REVIEW", [
                 "Left/Right: step through the line. Home/End: start/end. Click a move row or graph point to jump.",
-                "Z or Backspace: take back your last move (and the AI reply). A new move keeps the old line as a variation.",
+                "Undo button, Ctrl+Z (Cmd+Z on a Mac), Z or Backspace: take back your last move (and the AI reply). Ctrl+Shift+Z or Right redoes it. A new move keeps the old line as a variation.",
                 "Tab / Shift+Tab: switch between saved variations. F flips the board.",
                 "V starts position review; M / Next ? go to the next marked move, Shift+M goes back. P plays the network's move.",
             ]),
@@ -2455,6 +2689,9 @@ class App:
                 "H toggles move hints; E toggles the evaluation bar; S toggles MCTS look-ahead.",
                 "Game > Think time sets the search time and simulation budget. The AI needs a loaded network for analysis.",
                 "Click the network name or press N to choose another .npz / .pt file.",
+            ]),
+            ("VARIANTS", [
+                "Game > Gift limit: each side may give back at most N pieces all game (less clutter). Game > Start position, or B: place any pieces for a custom start. Combine them freely; each starts a new game.",
             ]),
             ("SAVE, SHARE & DISPLAY", [
                 "Ctrl+S saves; Ctrl+O loads. Repeated Load cycles through saved games. Drop a .json file onto the window to open it.",
@@ -2597,6 +2834,55 @@ class App:
                 if (r, c) in dests:
                     pygame.draw.circle(self.screen, DOT, rect.center, 11)
 
+    def draw_setup(self):
+        """The custom-start editor: the board as it will start, a palette of pieces, and its buttons."""
+        st, L = self.setup, self.setup_layout()
+        for r in range(SIZE):
+            for c in range(SIZE):
+                x, y = self.sq_xy(r, c)
+                pygame.draw.rect(self.screen, LIGHT if (r + c) % 2 == 0 else DARK, (x, y, SQ, SQ))
+                piece = st["pieces"].get((r, c))
+                if piece is not None:
+                    self.screen.blit(self.sprite(piece[0], piece[1], SQ - 12), (x + 6, y + 6))
+        self.draw_coords()
+        pygame.draw.rect(self.screen, PANEL_BG, (PANEL_X, BOARD_Y, PANEL_W, self.win_h - BOARD_Y))
+        x0, w = self.layout['x0'], self.layout['w']
+        self.text("Custom start", (x0, BOARD_Y + 10), self.font)
+        for i, line in enumerate(wrap("Pick a piece, then click squares to put it down.  Click it again, or "
+                                      "right-click, to remove it.  Kings stay (pick one and click to move it).",
+                                      self.font_small, w)[:4]):
+            self.text(line, (x0, BOARD_Y + 42 + i * 17), self.font_small, MUTED)
+        placed = Counter(st["pieces"].values())
+        for team in ('w', 'b'):
+            self.text(full_name(team).capitalize(), (x0, L[team + '_y']), self.font_small, TEXT)
+            for ptype in SETUP_ORDER:
+                rect = L[(team, ptype)]
+                on = st["tool"] == (team, ptype)
+                pygame.draw.rect(self.screen, BUTTON_ON if on else BUTTON_HOVER if rect.collidepoint(self.mouse())
+                                 else BUTTON, rect, border_radius=5)
+                self.screen.blit(self.sprite(team, ptype, rect.w - 4), (rect.x + 2, rect.y + 2))
+                n = placed.get((team, ptype), 0)
+                self.text("%d/%d" % (n, SETUP_MAX[ptype]), (rect.x + 5, rect.bottom + 1), self.font_small,
+                          GOOD if n else MUTED)
+        self.draw_button(L['erase'], "Eraser", on=st["tool"] == 'erase')
+        self.draw_button(L['turn'], "%s moves first  (click)" % full_name(st["turn"]).capitalize())
+        self.draw_button(L['standard'], "Standard")
+        self.draw_button(L['kings'], "Kings only")
+        self.draw_button(L['done'], "Start game  (Enter)", on=True)
+        self.draw_button(L['cancel'], "Cancel  (Esc)")
+        y = L['msg_y']
+        if self.rules.max_gifts is not None:
+            self.text("Gift limit %d each stays on." % self.rules.max_gifts, (x0, y), self.font_small, MUTED)
+            y += 20
+        if st["error"]:
+            for line in wrap(st["error"], self.font_small, w)[:5]:
+                self.text(line, (x0, y), self.font_small, BAD)
+                y += 18
+        status = ("Custom start: %d pieces on the board, %s to move first." % (
+            len(st["pieces"]), full_name(st["turn"])))
+        for i, line in enumerate(wrap(status, self.font_status, PANEL_X - 28)[:2]):
+            self.text(line, (14, BOARD_Y + BOARD_PX + 8 + i * 26), self.font_status, TEXT)
+
     def draw_hint_arrows(self):
         hint = self.current_hint()
         if hint is None:
@@ -2729,6 +3015,10 @@ class App:
         self.text("%s: %d/%d home" % (full_name(team).capitalize(), home, len(on_board)), (x, y))
         y += 26
         self.text("not on the board:", (x, y), self.font_small, MUTED)
+        left = self.game.gifts_left(team)                  # gifts this side may still give back (gift limit)
+        if left is not None:
+            label = self.font_small.render("gifts left: %d" % left, True, BAD if left == 0 else GOOD)
+            self.screen.blit(label, (x + per_row * step - 6 - label.get_width(), y))
         y += 20
         off = Counter(p.ptype for p in game.pieces[team] if not p.ontheboard)
         for i, ptype in enumerate(('p', 'r', 'n', 'b', 'q')):
@@ -2806,6 +3096,11 @@ class App:
                     y += 17
                 y += 3
         self.draw_stats(L)
+        label = self.variant_label()
+        if label:
+            for i, line in enumerate(wrap("Variant: " + label, self.font_small, L['w'] if 'hint_x' not in L else 390)[:2]):
+                self.text(line, (L.get('stats_x', L['x0']), L['variant_y'] + i * 17), self.font_small, BAD)
+        self.draw_button(L['undo'], "Undo  (%s)" % UNDO_KEYS, enabled=self.pos > 0)
 
     def draw_stats(self, L=None):
         L = L or self.layout
@@ -3162,6 +3457,12 @@ def main():
                     help="most simulations the search runs per move (default 600)")
     ap.add_argument("--think-ms", type=int, default=2500,
                     help="most milliseconds the search thinks per move (default 2500)")
+    ap.add_argument("--max-gifts", type=int, default=None, metavar="N",
+                    help="variant: each side may give back at most N pieces in the whole game")
+    ap.add_argument("--start", default=None, metavar="PIECES",
+                    help='variant: custom start, e.g. "wKd4 bKf5 wQa1 bPe6" (team, piece, square; both kings needed)')
+    ap.add_argument("--start-turn", choices=("b", "w"), default=None,
+                    help="which side moves first (default black; mainly for --start)")
     ap.add_argument("--strict-win", action="store_true",
                     help="experimental: every piece of both teams must be on the board")
     ap.add_argument("--review-sims", type=int, default=reviewlib.DEFAULT_SIMS, metavar="N",
@@ -3227,8 +3528,15 @@ def main():
         ai_on = not args.no_ai
 
     stats = None if args.no_stats else Stats(args.stats)
-    rules = Rules(win_requires_all_pieces_on_board=args.strict_win,
-                  max_plies=args.max_plies)
+    try:
+        start = gamelog.parse_start(args.start) if args.start else None
+        rules = Rules(win_requires_all_pieces_on_board=args.strict_win, max_plies=args.max_plies,
+                      max_gifts=args.max_gifts, start=start, start_turn=args.start_turn or "b")
+        problem = start_problem(rules) if start else None
+    except ValueError as err:
+        raise SystemExit("bad variant option: %s" % err)
+    if problem:
+        raise SystemExit("cannot start from that position: %s" % problem)
     searcher = mcts.Searcher(advisor, sims=args.sims, think_ms=args.think_ms) if advisor else None
     app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
               searcher, flipped=args.flip, autosave=args.autosave,
@@ -3243,7 +3551,8 @@ def main():
         given = set()
         for key, flags in (("net", ("--ai ",)), ("sound", ("--no-sound",)), ("coords", ("--no-coords",)),
                            ("eval", ("--eval",)), ("search", ("--no-search", "--sims")), ("think", ("--think-ms",)),
-                           ("ai", ("--ai-color", "--no-ai", "--black", "--white")), ("scale", ("--scale",))):
+                           ("ai", ("--ai-color", "--no-ai", "--black", "--white")), ("scale", ("--scale",)),
+                           ("variant", ("--max-gifts", "--start"))):
             if any(f in argv + " " for f in flags):
                 given.add(key)
         app.load_settings(given)

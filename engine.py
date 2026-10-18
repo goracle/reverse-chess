@@ -251,11 +251,43 @@ class Rules:
         many times.
     max_plies
         Optional hard cap so self-play games always terminate.
+    max_gifts
+        Variant ("less cluttered" mode): each side may give back at most this
+        many pieces over the whole game.  None (the default) = no limit.  A
+        pawn's diagonal un-capture needs a gift, so it is unavailable once a
+        side has used its allowance.  The count is per side.
+    start
+        Variant (custom start): the pieces that stand on the board at move 0,
+        as ``((team, ptype, row, col), ...)``, instead of just the two kings.
+        Both kings must be listed; everything not listed starts off the board.
+        None (the default) = the usual two-kings start.
+    start_turn
+        Side that moves first (only matters with a custom ``start``).
     """
     win_requires_all_pieces_on_board: bool = False
     fifty_move_limit: int = 50
     repetition_limit: int = 3
     max_plies: Optional[int] = None
+    max_gifts: Optional[int] = None
+    start: Optional[Tuple[Tuple[str, str, int, int], ...]] = None
+    start_turn: str = "b"
+
+    def __post_init__(self):
+        # A game record is JSON, which turns tuples into lists: normalise, so Rules stays hashable.
+        if self.start is not None:
+            object.__setattr__(self, "start", tuple(
+                (str(t), str(p), int(r), int(c)) for t, p, r, c in self.start))
+        if self.max_gifts is not None:
+            if int(self.max_gifts) < 0:
+                raise ValueError("max_gifts must be 0 or more")
+            object.__setattr__(self, "max_gifts", int(self.max_gifts))
+        if self.start_turn not in TEAMS:
+            raise ValueError("start_turn must be 'b' or 'w', not %r" % (self.start_turn,))
+
+    @property
+    def standard(self) -> bool:
+        """True when neither variant is in use (the game the network was trained on)."""
+        return self.max_gifts is None and self.start is None and self.start_turn == "b"
 
 
 @dataclass(frozen=True)
@@ -464,6 +496,11 @@ class Game:
             raise RuntimeError("native engine requested but librc_engine is not built")
         self._use_native = (_LIB is not None) if native is None else bool(native)
         self.rules = rules or Rules()
+        if self.rules.max_gifts is not None:
+            # The Rust generator and rc_losing know nothing of the gift cap.
+            if native:
+                raise RuntimeError("the native engine does not support Rules.max_gifts")
+            self._use_native = False
         self._moves_cache: dict = {}
         self._witness: dict = {}          # team -> [(piece index, dst), ...] recent proofs that it could move
         self._has_move: dict = {}         # (snapshot, team) -> bool, per game (see has_legal_move)
@@ -492,11 +529,17 @@ class Game:
                     uid += 1
             self.pieces[team] = made
             self.kings[team] = next(p for p in made if p.ptype == "k")
-        # Only the kings start on the board, in fixed spots.
-        self.kings["b"].place((3, 5))
-        self.kings["w"].place((4, 3))
+        if self.rules.start is None:
+            # Only the kings start on the board, in fixed spots.
+            self.kings["b"].place((3, 5))
+            self.kings["w"].place((4, 3))
+        else:
+            self._place_custom_start(self.rules.start)
+        # Gifts given so far by a side = the other side's pieces that have appeared since the start
+        # (pieces never leave the board), so the count follows from the board and needs no bookkeeping.
+        self._start_count = {team: len(self.on_board(team)) for team in TEAMS}
 
-        self.turn = "b"
+        self.turn = self.rules.start_turn
         self.ply = 0
         self.quiet_plies = 0              # plies since the last gift / pawn move
         self.seen: Dict[bytes, int] = {}  # position -> occurrences (repetition)
@@ -522,6 +565,38 @@ class Game:
         self._has_move.clear()
         self.actions = {}
         self._raw = None
+
+    def _place_custom_start(self, start):
+        """Put the pieces of ``Rules.start`` on the board (ValueError if the list is not a possible setup)."""
+        for team, ptype, row, col in start:
+            if team not in TEAMS or ptype not in PTYPES:
+                raise ValueError("bad piece in the custom start: %r" % ((team, ptype, row, col),))
+            if not (0 <= row < SIZE and 0 <= col < SIZE):
+                raise ValueError("custom start: square (%d, %d) is off the board" % (row, col))
+            if self.board[row, col] is not None:
+                raise ValueError("custom start: two pieces on square (%d, %d)" % (row, col))
+            if ptype == "p" and row in (0, SIZE - 1):
+                raise ValueError("custom start: a pawn can never stand on the first or last row")
+            spare = next((p for p in self.pieces[team] if p.ptype == ptype and not p.ontheboard), None)
+            if spare is None:
+                raise ValueError("custom start: too many %s %s" % (full_name(team), ptype))
+            spare.place((row, col))
+        for team in TEAMS:
+            if not self.kings[team].ontheboard:
+                raise ValueError("custom start: the %s king must be on the board" % full_name(team))
+
+    def gifts_given(self, team: str) -> int:
+        """How many pieces ``team`` has given back so far."""
+        return len(self.on_board(other_team(team))) - self._start_count[other_team(team)]
+
+    def gifts_left(self, team: str) -> Optional[int]:
+        """Gifts ``team`` may still make under ``Rules.max_gifts`` (None = unlimited)."""
+        cap = self.rules.max_gifts
+        return None if cap is None else max(0, cap - self.gifts_given(team))
+
+    def _gifts_exhausted(self, team: str) -> bool:
+        cap = self.rules.max_gifts
+        return cap is not None and self.gifts_given(team) >= cap
 
     @staticmethod
     def _home_of(team: str, ptype: str):
@@ -721,7 +796,7 @@ class Game:
         forced_give = sideways == 1
         legal = forced_give or sideways == 0
         # A diagonal step un-captures, which needs something to give back.
-        if forced_give and self.all_on_board(other_team(team)):
+        if forced_give and (self.all_on_board(other_team(team)) or self._gifts_exhausted(team)):
             legal = False
         return legal, forced_give
 
@@ -1080,7 +1155,8 @@ class Game:
             out.append(Action(src, opt.dst, opt.demote))
         # Gifts: forced for diagonal pawn steps, optional for every non-pawn
         # piece (the old "right-click"), never while reverse castling.
-        if not offboard or opt.reverse_castle or not (opt.forced_give or piece.ptype != "p"):
+        if (not offboard or opt.reverse_castle or not (opt.forced_give or piece.ptype != "p")
+                or self._gifts_exhausted(piece.team)):
             return out
         for gift, spawn in offboard.items():
             ep_choices = (False, True) if self._reverse_ep_possible(src, opt.dst, piece, spawn) else (False,)
@@ -1588,6 +1664,35 @@ class Game:
             lines.append("%d%s" % (r, "".join(cells)))
         lines.append("  " + "".join(" %d " % c for c in range(SIZE)))
         return "\n".join(lines)
+
+
+def start_problem(rules: Rules) -> Optional[str]:
+    """Why ``rules.start`` cannot be played, or None when it is a sound starting position.
+
+    Sound = every piece placeable, both kings on, nobody already home or already stuck for good, and
+    the side to move has a move.  (The setup editor of play.py asks this before it starts the game.)
+    """
+    try:
+        game = Game(rules)
+    except ValueError as err:
+        return str(err).replace("custom start: ", "")
+    try:
+        for team in TEAMS:
+            bishops = [p for p in game.on_board(team) if p.ptype == "b"]
+            if len(bishops) == 2 and square_color(bishops[0].pos) == square_color(bishops[1].pos):
+                return "%s's two bishops must stand on opposite-coloured squares" % full_name(team).capitalize()
+        for team in TEAMS:
+            if game.check_for_win(team):
+                return "%s would already have every piece home" % full_name(team).capitalize()
+        for team in TEAMS:
+            why = game._losing_reason(team)
+            if why:
+                return "%s could never get home from here (%s)" % (full_name(team).capitalize(), why)
+        if game.done:
+            return "%s has no legal move to start with" % full_name(game.turn).capitalize()
+        return None
+    finally:
+        game.close()
 
 
 if __name__ == "__main__":

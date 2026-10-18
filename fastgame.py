@@ -117,6 +117,9 @@ class _Config:
     __slots__ = ("rules", "fifty", "max_plies", "flags", "rep_limit")
 
     def __init__(self, rules: Rules):
+        if not rules.standard:
+            raise ValueError("the native step (rc_step) only plays the standard game: "
+                             "Rules.max_gifts / Rules.start / Rules.start_turn are not supported")
         self.rules = rules
         self.fifty = int(rules.fifty_move_limit)
         self.max_plies = -1 if rules.max_plies is None else int(rules.max_plies)

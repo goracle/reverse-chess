@@ -119,6 +119,9 @@ _START: Dict[tuple, tuple] = {}
 
 def _start(rules: Rules):
     """(config, packed start position, its legal action rows), cached per rules."""
+    if not rules.standard:
+        raise ValueError("NativeGame only plays the standard game: "
+                         "Rules.max_gifts / Rules.start / Rules.start_turn are not supported")
     key = (rules.win_requires_all_pieces_on_board, rules.fifty_move_limit,
            rules.repetition_limit, rules.max_plies)
     hit = _START.get(key)

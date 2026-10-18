@@ -74,6 +74,32 @@ def action_from_dict(d: Dict) -> Action:
                   d.get("gift"), bool(d.get("en_passant", False)), d.get("promote"))
 
 
+# -- custom starts <-> text ---------------------------------------------------
+
+def parse_sq(text: str):
+    """'d4' -> (row, col); the inverse of sq_name."""
+    text = text.strip().lower()
+    if len(text) != 2 or text[0] not in "abcdefgh" or text[1] not in "12345678":
+        raise ValueError("not a square: %r" % text)
+    return (SIZE - int(text[1]), "abcdefgh".index(text[0]))
+
+
+def parse_start(text: str):
+    """'wKd4 bKf5 wQa1' -> (('w', 'k', 4, 3), ...): team letter, piece letter (P Q R B N K), square."""
+    out = []
+    for tok in text.replace(",", " ").split():
+        if len(tok) != 4 or tok[0].lower() not in "wb" or tok[1].lower() not in "pqrbnk":
+            raise ValueError("expected something like wKd4 (white king d4), got %r" % tok)
+        row, col = parse_sq(tok[2:])
+        out.append((tok[0].lower(), tok[1].lower(), row, col))
+    return tuple(out)
+
+
+def format_start(start) -> str:
+    """The inverse of parse_start."""
+    return " ".join("%s%s%s" % (t, p.upper(), sq_name((r, c))) for t, p, r, c in start)
+
+
 # -- replay ----------------------------------------------------------------
 
 def replay(rules: Rules, actions: List[Action], upto: Optional[int] = None) -> Game:

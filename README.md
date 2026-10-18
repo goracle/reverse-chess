@@ -62,13 +62,32 @@ The rules are simple...ish.
 
 * Strategy - You are trying to force your opponent to make a mistake and trap themselves (leading to a loss) or to clutter the board.
 
+## Variants: gift limit and custom start
+
+Both are in the **Game** menu, both start a new game, and they combine freely.  They are part of the
+game's `Rules`, so undo, save / load / paste and resuming a closed window all keep them.
+
+* **Gift limit** (Game > Gift limit, or `--max-gifts N`): each side may give back at most N pieces in the whole
+  game, which keeps the board uncluttered.  The side panel shows `gifts left` for each side.  A pawn's diagonal
+  step is a gift, so it is not available once a side has used its allowance.  `0` means no gifts at all.
+* **Custom start** (Game > Start position > Custom setup, key `B`, or `--start "wKd4 bKf5 wQa1"`): put any
+  pieces on the board before the first move (kings are required and can only be moved, not removed), and choose
+  who moves first.  A setup that cannot be played (a side already home, two same-coloured bishops, a side
+  with no move, ...) is refused with the reason.  `--start-turn w` picks the side to move from the command line.
+
+Not supported yet: the network, the look-ahead search, the eval bar and the game review only know the standard
+game.  In a variant the computer plays its legal moves from the network alone (no search), the review is off, the
+win / loss record does not count the game, and the native step (`rc_step`, `NativeGame`) refuses variant rules
+rather than silently playing the standard ones, so training cannot pick them up by accident.
+
 ## Game history, undo, save/load and review
 
 `play.py` has a move list (third column) with the usual conveniences:
 
 * **Step / jump:** Left / Right, Home / End, or click a move (the top row, "start position", is the position
   before the first move).  Mouse wheel scrolls the list.
-* **Undo:** `Z` / Backspace takes back your move (and the computer's reply).  Right / End bring it back;
+* **Undo:** the **Undo** button, `Ctrl+Z` (`Cmd+Z` on a Mac), `Z` or Backspace takes back your move (and the
+  computer's reply).  `Ctrl+Shift+Z` / `Ctrl+Y` (or Right) bring it back.  Right / End bring it back;
   playing a different move starts another line and the old one is kept as a variation (see below).
   A game with a take-back is not counted in your record.
 * **Flip board:** with one human side the board is turned by itself so that your colour is at the bottom
