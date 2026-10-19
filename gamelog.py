@@ -85,19 +85,27 @@ def parse_sq(text: str):
 
 
 def parse_start(text: str):
-    """'wKd4 bKf5 wQa1' -> (('w', 'k', 4, 3), ...): team letter, piece letter (P Q R B N K), square."""
+    """'wKd4 bKf5 wQa1' -> (('w', 'k', 4, 3), ...): team letter, piece letter (P Q R B N K), square.
+
+    A ``*`` after the piece letter marks a promoted piece (a pawn wearing that type): 'wQ*d4'
+    -> ('w', 'q', 4, 3, True).  The ``*`` matches the board printout and the move list."""
     out = []
     for tok in text.replace(",", " ").split():
-        if len(tok) != 4 or tok[0].lower() not in "wb" or tok[1].lower() not in "pqrbnk":
-            raise ValueError("expected something like wKd4 (white king d4), got %r" % tok)
-        row, col = parse_sq(tok[2:])
-        out.append((tok[0].lower(), tok[1].lower(), row, col))
+        promoted = len(tok) == 5 and tok[2] == "*"
+        body = tok[:2] + tok[3:] if promoted else tok
+        if len(body) != 4 or body[0].lower() not in "wb" or body[1].lower() not in "pqrbnk":
+            raise ValueError("expected something like wKd4 (white king d4) or wQ*d4 (promoted), got %r" % tok)
+        if promoted and body[1].lower() not in "qrbn":
+            raise ValueError("only a queen, rook, bishop or knight can be promoted, got %r" % tok)
+        row, col = parse_sq(body[2:])
+        out.append((body[0].lower(), body[1].lower(), row, col) + ((True,) if promoted else ()))
     return tuple(out)
 
 
 def format_start(start) -> str:
     """The inverse of parse_start."""
-    return " ".join("%s%s%s" % (t, p.upper(), sq_name((r, c))) for t, p, r, c in start)
+    return " ".join("%s%s%s%s" % (t, p.upper(), "*" if rest and rest[0] else "", sq_name((r, c)))
+                    for t, p, r, c, *rest in start)
 
 
 # -- replay ----------------------------------------------------------------

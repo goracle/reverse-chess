@@ -260,7 +260,10 @@ class Rules:
         Variant (custom start): the pieces that stand on the board at move 0,
         as ``((team, ptype, row, col), ...)``, instead of just the two kings.
         Both kings must be listed; everything not listed starts off the board.
-        None (the default) = the usual two-kings start.
+        A promoted piece (a pawn wearing a queen / rook / bishop / knight type)
+        is written with a fifth element: ``(team, ptype, row, col, True)``.  It
+        is one of its side's eight pawns, so it uses up a pawn, not a piece of
+        its own type.  None (the default) = the usual two-kings start.
     start_turn
         Side that moves first (only matters with a custom ``start``).
     """
@@ -275,8 +278,14 @@ class Rules:
     def __post_init__(self):
         # A game record is JSON, which turns tuples into lists: normalise, so Rules stays hashable.
         if self.start is not None:
-            object.__setattr__(self, "start", tuple(
-                (str(t), str(p), int(r), int(c)) for t, p, r, c in self.start))
+            # Entries are (team, ptype, row, col), plus a trailing True for a promoted piece.
+            def norm(entry):
+                t, p, r, c, *rest = entry
+                if len(rest) > 1:
+                    raise ValueError("bad piece in the custom start: %r" % (tuple(entry),))
+                base = (str(t), str(p), int(r), int(c))
+                return base + (True,) if rest and rest[0] else base
+            object.__setattr__(self, "start", tuple(norm(e) for e in self.start))
         if self.max_gifts is not None:
             if int(self.max_gifts) < 0:
                 raise ValueError("max_gifts must be 0 or more")
@@ -568,19 +577,27 @@ class Game:
 
     def _place_custom_start(self, start):
         """Put the pieces of ``Rules.start`` on the board (ValueError if the list is not a possible setup)."""
-        for team, ptype, row, col in start:
+        for team, ptype, row, col, *rest in start:
+            promoted = bool(rest and rest[0])
             if team not in TEAMS or ptype not in PTYPES:
                 raise ValueError("bad piece in the custom start: %r" % ((team, ptype, row, col),))
+            if promoted and ptype not in PROMOTION_TYPES:
+                raise ValueError("custom start: a promoted piece must be a queen, rook, bishop or knight")
             if not (0 <= row < SIZE and 0 <= col < SIZE):
                 raise ValueError("custom start: square (%d, %d) is off the board" % (row, col))
             if self.board[row, col] is not None:
                 raise ValueError("custom start: two pieces on square (%d, %d)" % (row, col))
             if ptype == "p" and row in (0, SIZE - 1):
                 raise ValueError("custom start: a pawn can never stand on the first or last row")
-            spare = next((p for p in self.pieces[team] if p.ptype == ptype and not p.ontheboard), None)
+            # A promoted piece is a pawn underneath, so it comes out of the pawn pool.
+            pool = "p" if promoted else ptype
+            spare = next((p for p in self.pieces[team] if p.ptype == pool and not p.ontheboard), None)
             if spare is None:
-                raise ValueError("custom start: too many %s %s" % (full_name(team), ptype))
+                raise ValueError("custom start: too many %s %s" % (
+                    full_name(team), "pawns (promoted pieces count as pawns)" if promoted else ptype))
             spare.place((row, col))
+            if promoted:
+                spare.promote(ptype)       # after place(): promote() unlocks, which needs the piece on the board
         for team in TEAMS:
             if not self.kings[team].ontheboard:
                 raise ValueError("custom start: the %s king must be on the board" % full_name(team))
@@ -1678,7 +1695,7 @@ def start_problem(rules: Rules) -> Optional[str]:
         return str(err).replace("custom start: ", "")
     try:
         for team in TEAMS:
-            bishops = [p for p in game.on_board(team) if p.ptype == "b"]
+            bishops = [p for p in game.on_board(team) if p.ptype == "b" and not p.promoted]
             if len(bishops) == 2 and square_color(bishops[0].pos) == square_color(bishops[1].pos):
                 return "%s's two bishops must stand on opposite-coloured squares" % full_name(team).capitalize()
         for team in TEAMS:

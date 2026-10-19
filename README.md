@@ -74,6 +74,9 @@ game's `Rules`, so undo, save / load / paste and resuming a closed window all ke
   pieces on the board before the first move (kings are required and can only be moved, not removed), and choose
   who moves first.  A setup that cannot be played (a side already home, two same-coloured bishops, a side
   with no move, ...) is refused with the reason.  `--start-turn w` picks the side to move from the command line.
+  Promoted pieces can be placed too: switch on **Promoted** in the editor (or write `wQ*d4`, with a `*`, on the
+  command line).  A promoted piece is a pawn in disguise, so it counts against its side's eight pawns, not
+  against its own type (a side can have its real queen *and* a promoted one).
 
 Not supported yet: the network, the look-ahead search, the eval bar and the game review only know the standard
 game.  In a variant the computer plays its legal moves from the network alone (no search), the review is off, the

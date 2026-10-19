@@ -345,6 +345,98 @@ def test_settings_and_resume():
     print("ok: variant remembered between sessions, game resumes")
 
 
+def test_promoted_pieces_in_custom_start():
+    # a promoted piece is a pawn in disguise: it sits next to the real queen, and uses up a pawn
+    start = KINGS + (("w", "q", 5, 1), ("w", "q", 7, 0, True), ("b", "n", 2, 4, True), ("b", "p", 3, 1))
+    assert start_problem(Rules(start=start)) is None
+    g = Game(Rules(start=start))
+    g.validate()
+    assert g.board[7, 0].promoted and g.board[7, 0].ptype == "q" and not g.board[5, 1].promoted
+    assert not g.board[7, 0].locked
+    # on the board, in the text form, and in JSON (tuples become lists) it is the same position
+    assert gamelog.parse_start(gamelog.format_start(Rules(start=start).start)) == Rules(start=start).start
+    assert Rules(start=[list(e) for e in start]) == Rules(start=start)
+    assert Rules(start=KINGS + (("w", "q", 5, 1, False),)) == Rules(start=KINGS + (("w", "q", 5, 1),))
+    # native and pure-python generators agree from such a position
+    for seed in range(4):
+        rng = random.Random(seed)
+        a, b = Game(Rules(start=start, max_plies=120), native=False), Game(Rules(start=start, max_plies=120))
+        while not a.done:
+            assert set(a.legal_actions()) == set(b.legal_actions()), seed
+            act = rng.choice(a.legal_actions())
+            a.step(act)
+            b.step(act)
+        a.validate()
+    # pawn pool: 8 pawns in all, promoted ones included; only Q/R/B/N can be promoted
+    pawns = tuple(("w", "p", 2, c) for c in range(7))
+    assert start_problem(Rules(start=KINGS + pawns + (("w", "r", 5, 0, True),))) is None
+    assert "pawns" in start_problem(Rules(start=KINGS + pawns + (("w", "p", 5, 0), ("w", "r", 5, 1, True))))
+    assert start_problem(Rules(start=KINGS + (("w", "k", 5, 0, True),)))
+    assert start_problem(Rules(start=KINGS + (("w", "p", 5, 0, True),)))
+    # a promoted piece is no bishop of its own: two same-coloured ones are fine if one is promoted
+    assert start_problem(Rules(start=KINGS + (("w", "b", 5, 0), ("w", "b", 5, 2, True)))) is None
+    assert start_problem(Rules(start=KINGS + (("w", "b", 5, 0), ("w", "b", 5, 2))))
+    for bad in ("wQ*", "wK*d4", "wP*d4", "wQ**d4"):
+        try:
+            gamelog.parse_start(bad)
+        except ValueError:
+            continue
+        raise AssertionError("parse_start accepted %r" % bad)
+    print("ok: promoted pieces in a custom start (engine, notation, native agrees)")
+
+
+def test_setup_editor_promoted():
+    app = make_app()
+    app.handle_key(key(pygame.K_b))
+    L = app.setup_layout()
+
+    def pick(k):
+        app.handle_click(L[k].center)
+
+    def sq(r, c):
+        x, y = app.sq_xy(r, c)
+        app.handle_click((x + 50, y + 50))
+
+    pick(("w", "q"))
+    sq(5, 1)
+    pick("promo")
+    assert app.setup["promo"]
+    sq(7, 0)                                    # a second white queen, promoted this time
+    assert app.setup["pieces"][(7, 0)] == ("w", "q", True) and app.setup["error"] == ""
+    sq(7, 0)                                    # same promoted piece again removes it
+    assert (7, 0) not in app.setup["pieces"]
+    sq(7, 0)
+    pick(("w", "k"))
+    sq(6, 6)                                    # kings ignore the promoted switch
+    assert app.setup["pieces"][(6, 6)] == ("w", "k") and (4, 3) not in app.setup["pieces"]
+    pick(("w", "p"))
+    for c in range(1, 8):                       # seven plain pawns + the promoted queen = the full eight
+        sq(2, c)
+    assert app.setup["error"] == "" and (2, 7) in app.setup["pieces"]
+    sq(1, 0)
+    assert "pawns" in app.setup["error"], app.setup["error"]
+    pick(("w", "r"))
+    sq(2, 1)                                    # promoted rook over a pawn: the pool stays at eight
+    assert app.setup["error"] == "" and app.setup["pieces"][(2, 1)] == ("w", "r", True)
+    app.draw()
+    placed = dict(app.setup["pieces"])
+    app.handle_key(key(pygame.K_RETURN))
+    assert app.setup is None, "start refused: %s" % app.rules
+    on_board = {p.pos: (p.team, p.ptype) + ((True,) if p.promoted else ()) for t in "bw" for p in app.game.on_board(t)}
+    assert on_board == placed, (on_board, placed)
+    app.draw()
+    # editing again brings the promoted pieces back; Standard clears the switch with the rest
+    app.handle_key(key(pygame.K_b))
+    assert app.setup["pieces"] == placed
+    app.handle_click(app.setup_layout()["standard"].center)
+    assert not app.setup["promo"] and app.setup["pieces"] == play.DEFAULT_START
+    app.handle_key(key(pygame.K_ESCAPE))
+    # save / load keeps promoted pieces
+    rules, actions, _ = gamelog.parse_game(gamelog.game_dict(app.rules, [], {}))
+    assert rules == app.rules
+    print("ok: custom-start editor places promoted pieces")
+
+
 def test_ai_does_not_crash_on_variants():
     app = make_app(Rules(max_plies=300, max_gifts=1, start=SETUP), ai_on=True)
     app.use_search = True

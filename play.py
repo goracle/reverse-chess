@@ -165,6 +165,14 @@ UNDO_KEYS = "Cmd+Z" if sys.platform == "darwin" else "Ctrl+Z"
 GIFT_LIMITS = (0, 1, 2, 3, 4, 5, 6, 8, 10)      # Game > Gift limit (--max-gifts takes any number)
 SETUP_MAX = {'k': 1, 'q': 1, 'r': 2, 'b': 2, 'n': 2, 'p': 8}   # most pieces of a kind a side has
 SETUP_ORDER = ('k', 'q', 'r', 'b', 'n', 'p')
+PROMOTABLE = ('q', 'r', 'b', 'n')       # what a promoted piece (a pawn in disguise) can look like
+
+
+def setup_pool(piece):
+    """(team, pool) a setup-editor piece counts against: a promoted piece is a pawn, whatever it looks like."""
+    return (piece[0], 'p' if len(piece) > 2 else piece[1])
+
+
 DEFAULT_START = {(3, 5): ('b', 'k'), (4, 3): ('w', 'k')}      # the usual start: just the two kings
 
 LIGHT = (238, 238, 210)
@@ -1148,15 +1156,17 @@ class App:
         self.stop_search()
         self.hint = None
         r = self.rules
-        pieces = {(row, col): (t, p) for t, p, row, col in r.start} if r.start else dict(DEFAULT_START)
-        self.setup = {"pieces": pieces, "turn": r.start_turn, "tool": None, "error": ""}
+        # editor pieces are (team, ptype), or (team, ptype, True) for a promoted one
+        pieces = ({(row, col): (t, p) + ((True,) if rest and rest[0] else ())
+                   for t, p, row, col, *rest in r.start} if r.start else dict(DEFAULT_START))
+        self.setup = {"pieces": pieces, "turn": r.start_turn, "tool": None, "error": "", "promo": False}
         self.message = ""
 
     def setup_rules(self):
         """The Rules the editor's board stands for."""
         st = self.setup
         start = None if st["pieces"] == DEFAULT_START else tuple(sorted(
-            (t, p, r, c) for (r, c), (t, p) in st["pieces"].items()))
+            (piece[0], piece[1], r, c) + piece[2:] for (r, c), piece in st["pieces"].items()))
         return dataclasses.replace(self.rules, start=start, start_turn=st["turn"])
 
     def setup_layout(self):
@@ -1169,7 +1179,8 @@ class App:
             for i, ptype in enumerate(SETUP_ORDER):
                 out[(team, ptype)] = R(x0 + i * cell, y, cell - 2, cell - 2)
             y += 80
-        out['erase'] = R(x0, y, w, 30)
+        out['erase'] = R(x0, y, w // 2 - 4, 30)
+        out['promo'] = R(x0 + w // 2 + 4, y, w // 2 - 4, 30)
         out['turn'] = R(x0, y + 38, w, 30)
         out['standard'] = R(x0, y + 76, w // 2 - 4, 30)
         out['kings'] = R(x0 + w // 2 + 4, y + 76, w // 2 - 4, 30)
@@ -1188,8 +1199,10 @@ class App:
             self.setup_erase(sq)
             return
         team, ptype = tool
+        promoted = bool(st.get("promo")) and ptype in PROMOTABLE   # kings and pawns cannot be promoted
+        piece = (team, ptype, True) if promoted else tool
         have = pieces.get(sq)
-        if have == tool:                                   # the same piece again: take it off
+        if have == piece:                                  # the same piece again: take it off
             self.setup_erase(sq)
             return
         if ptype == 'p' and sq[0] in (0, SIZE - 1):
@@ -1198,14 +1211,19 @@ class App:
         if have is not None and have[1] == 'k':
             st["error"] = "A king cannot be replaced; put it on another square to move it."
             return
-        mine = [s for s, piece in pieces.items() if piece == tool]
-        if len(mine) >= SETUP_MAX[ptype]:
-            if SETUP_MAX[ptype] > 1:
-                st["error"] = "All %d %s %s are already on the board (right-click one to remove it)." % (
-                    SETUP_MAX[ptype], full_name(team), NAMES[ptype] + "s")
+        # What this piece draws from: a promoted piece is a pawn underneath, so it uses the pawn pool.
+        pool = 'p' if promoted else ptype
+        mine = [s for s, pc in pieces.items() if s != sq and setup_pool(pc) == (team, pool)]
+        if len(mine) >= SETUP_MAX[pool]:
+            if SETUP_MAX[pool] > 1:
+                st["error"] = ("All %d %s pawns are already on the board, promoted pieces included "
+                               "(right-click one to remove it)." % (SETUP_MAX[pool], full_name(team))
+                               if pool == 'p' else
+                               "All %d %s %s are already on the board (right-click one to remove it)." % (
+                                   SETUP_MAX[pool], full_name(team), NAMES[ptype] + "s"))
                 return
             del pieces[mine[0]]                            # the only king / queen: placing it again moves it
-        pieces[sq] = tool
+        pieces[sq] = piece
         st["error"] = ""
 
     def setup_erase(self, sq):
@@ -1255,10 +1273,12 @@ class App:
                 continue
             if key == 'erase':
                 st["tool"] = None if st["tool"] == 'erase' else 'erase'
+            elif key == 'promo':
+                st["promo"] = not st["promo"]
             elif key == 'turn':
                 st["turn"] = other_team(st["turn"])
             elif key == 'standard':
-                st["pieces"], st["turn"], st["error"] = dict(DEFAULT_START), 'b', ""
+                st["pieces"], st["turn"], st["error"], st["promo"] = dict(DEFAULT_START), 'b', "", False
             elif key == 'kings':
                 st["pieces"] = {s: p for s, p in st["pieces"].items() if p[1] == 'k'}
                 st["error"] = ""
@@ -2834,6 +2854,13 @@ class App:
                 if (r, c) in dests:
                     pygame.draw.circle(self.screen, DOT, rect.center, 11)
 
+    def draw_promo_badge(self, cx, cy, radius=12):
+        """The gold 'P' marking a promoted piece (a pawn wearing another piece's type)."""
+        pygame.draw.circle(self.screen, (230, 190, 40), (cx, cy), radius)
+        if radius >= 10:
+            label = self.font_small.render("P", True, (20, 20, 20))
+            self.screen.blit(label, label.get_rect(center=(cx, cy)))
+
     def draw_setup(self):
         """The custom-start editor: the board as it will start, a palette of pieces, and its buttons."""
         st, L = self.setup, self.setup_layout()
@@ -2844,15 +2871,17 @@ class App:
                 piece = st["pieces"].get((r, c))
                 if piece is not None:
                     self.screen.blit(self.sprite(piece[0], piece[1], SQ - 12), (x + 6, y + 6))
+                    if len(piece) > 2:
+                        self.draw_promo_badge(x + SQ - 18, y + 18)
         self.draw_coords()
         pygame.draw.rect(self.screen, PANEL_BG, (PANEL_X, BOARD_Y, PANEL_W, self.win_h - BOARD_Y))
         x0, w = self.layout['x0'], self.layout['w']
         self.text("Custom start", (x0, BOARD_Y + 10), self.font)
-        for i, line in enumerate(wrap("Pick a piece, then click squares to put it down.  Click it again, or "
-                                      "right-click, to remove it.  Kings stay (pick one and click to move it).",
+        for i, line in enumerate(wrap("Pick a piece, click squares to place it; right-click removes.  Kings: pick one, click to move.  "
+                                      "Promoted = pawn in disguise.",
                                       self.font_small, w)[:4]):
             self.text(line, (x0, BOARD_Y + 42 + i * 17), self.font_small, MUTED)
-        placed = Counter(st["pieces"].values())
+        placed = Counter(setup_pool(pc) if pc[1] == 'p' or len(pc) > 2 else pc[:2] for pc in st["pieces"].values())
         for team in ('w', 'b'):
             self.text(full_name(team).capitalize(), (x0, L[team + '_y']), self.font_small, TEXT)
             for ptype in SETUP_ORDER:
@@ -2861,10 +2890,13 @@ class App:
                 pygame.draw.rect(self.screen, BUTTON_ON if on else BUTTON_HOVER if rect.collidepoint(self.mouse())
                                  else BUTTON, rect, border_radius=5)
                 self.screen.blit(self.sprite(team, ptype, rect.w - 4), (rect.x + 2, rect.y + 2))
+                if st["promo"] and ptype in PROMOTABLE:
+                    self.draw_promo_badge(rect.right - 8, rect.y + 8, 7)
                 n = placed.get((team, ptype), 0)
                 self.text("%d/%d" % (n, SETUP_MAX[ptype]), (rect.x + 5, rect.bottom + 1), self.font_small,
                           GOOD if n else MUTED)
         self.draw_button(L['erase'], "Eraser", on=st["tool"] == 'erase')
+        self.draw_button(L['promo'], "Promoted", on=st["promo"])
         self.draw_button(L['turn'], "%s moves first  (click)" % full_name(st["turn"]).capitalize())
         self.draw_button(L['standard'], "Standard")
         self.draw_button(L['kings'], "Kings only")
