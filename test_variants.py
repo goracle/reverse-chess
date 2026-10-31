@@ -79,6 +79,21 @@ def test_cap_enforced():
     print("ok: gift limit enforced for every side, every move")
 
 
+def test_pawn_return_respects_gift_total():
+    # Two black pawns stacked in one column: one of them needs a sideways step (a gift) to get home.
+    start = KINGS + (("b", "p", 4, 2), ("b", "p", 3, 2))
+    assert Game(Rules(start=start)).pawn_scan("b")
+    assert Game(Rules(start=start, max_gifts=1)).pawn_scan("b")
+    g = Game(Rules(start=start, max_gifts=0))
+    assert not g.pawn_scan("b") and g._losing_reason("b"), "a pawn that needs a gift the limit forbids"
+    assert start_problem(Rules(start=start, max_gifts=0))
+    # Three stacked pawns need two sideways steps in total; a limit of 1 cannot pay for them.
+    start3 = KINGS + (("b", "p", 4, 2), ("b", "p", 3, 2), ("b", "p", 2, 2))
+    assert Game(Rules(start=start3, max_gifts=2)).pawn_scan("b")
+    assert not Game(Rules(start=start3, max_gifts=1)).pawn_scan("b")
+    print("ok: pawn return is checked against the gift total under a gift limit")
+
+
 def test_custom_start():
     g = Game(Rules(start=SETUP))
     assert g.turn == "b" and len(g.on_board("b")) == 3 and len(g.on_board("w")) == 3
@@ -448,6 +463,22 @@ def test_ai_does_not_crash_on_variants():
         if app.agents[app.game.turn] is None:
             app.play(random.Random(len(app.line)).choice(app.game.legal_actions()))
     print("ok: the computer keeps playing legal moves in the variants (quality: not trained, see README)")
+
+
+def test_move_delay_holds_back_the_reply():
+    app = make_app(Rules(max_plies=300), ai_on=True)          # the computer is white, we are black
+    app.move_delay_ms = 400
+    app.play(app.game.legal_actions()[0])                     # a human move: the computer is up
+    assert app.agents[app.game.turn] is not None
+    app.ai_due = 0
+    ply = app.game.ply
+    app.update_ai()
+    assert app.game.ply == ply, "the computer replied at once despite the move delay"
+    assert 280 <= app._wait[1] - pygame.time.get_ticks() <= 520
+    app._wait = (app._wait[0], 0)                             # the pause is over
+    app.update_ai()
+    assert app.game.ply == ply + 1, "the computer never replied"
+    print("ok: the computer pauses before answering a human")
 
 
 if __name__ == "__main__":

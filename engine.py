@@ -1106,7 +1106,8 @@ class Game:
 
         Each sideways step of a pawn costs one gift, so the cheapest column
         assignment must also fit within the number of opposing pieces that are
-        still off the board.  ``spawn_pos`` adds a hypothetical new pawn.
+        still off the board, and within the gifts ``team`` may still make under
+        ``Rules.max_gifts``.  ``spawn_pos`` adds a hypothetical new pawn.
         """
         pawns: List[Pos] = []
         locked_cols = set()
@@ -1131,6 +1132,9 @@ class Game:
             return False
         needed = sum(options[i][solution[i]] for i in solution)
         spare = sum(1 for p in self.pieces[other_team(team)] if not p.ontheboard)
+        left = self.gifts_left(team)          # the gift limit caps the sideways steps too
+        if left is not None:
+            spare = min(spare, left)
         return needed <= spare
 
     def bishop_wall_check(self, team: str) -> bool:
@@ -1615,8 +1619,8 @@ class Game:
             moving = False  # some pawn still has somewhere to be
             for p in pieces:
                 if not p.ontheboard:
-                    if p.ptype == "p" or p.promoted:
-                        moving = True  # a pawn is still to be given back
+                    if (p.ptype == "p" or p.promoted) and self.gifts_left(other_team(team)) != 0:
+                        moving = True  # a pawn is still to be given back (if the gift limit allows)
                         break
                 elif (p.ptype == "p" or p.promoted) and not p.at_home():
                     moving = True

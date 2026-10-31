@@ -153,6 +153,7 @@ ROW_H = 20
 EVAL_COL_W = 34                  # the little eval bar at the right of each move-list row
 MAX_VARIATIONS = 12              # side lines kept by the variation stack (Tab)
 THINK_STEPS = (100, 250, 500, 1000, 2500, 5000, 10000, 20000)   # ms: the AI think-time slider's stops
+MOVE_DELAY_STEPS = (0, 500, 1000, 1500, 2500, 4000)             # ms: Game > Move delay (the "pretend to think" pause)
 PICK_ROWS = 14                   # rows of the network picker that show at once
 PREMOVE_COLOUR = (70, 140, 255, 200)
 STATUS_H = 84
@@ -555,7 +556,7 @@ class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
                  stats, show_eval, searcher=None, flipped=False, autosave=False,
                  review_sims=0, session=False, scale=None, sound=True, coords=True, net_dirs=(),
-                 auto_orient=True, tall=False):
+                 auto_orient=True, tall=False, move_delay=0):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         self.setup = None             # the custom-start editor (Game > Start position), see open_setup
@@ -583,6 +584,8 @@ class App:
         self.layout = make_layout()
         self.rules = rules
         self.delay_ms = delay_ms
+        self.move_delay_ms = max(0, int(move_delay))   # extra pause before the computer answers a human (jittered)
+        self._wait = None             # (pos_key, due tick): the pause for the position the computer is to move in
         self.rng = rng
         self.advisor = advisor        # numpy_net.Advisor or None (no AI file)
         self.home_advisor = advisor
@@ -914,6 +917,10 @@ class App:
 
     def think_enabled(self):
         return self.searcher is not None
+
+    def set_move_delay(self, ms):
+        self.move_delay_ms = ms
+        self._wait = None
 
     # -- premove: queue a move while the computer thinks ---------------------
     def premove_possible(self):
@@ -2247,6 +2254,15 @@ class App:
             return
         if self.browsing:                         # looking at an earlier position: the computer waits
             return
+        if self.move_delay_ms and self.agents[other_team(game.turn)] is None:
+            # Against a human, hold the reply back as if the computer were thinking about it (the pause
+            # starts when the position first comes up, so a search that finished early still waits).
+            now = pygame.time.get_ticks()
+            if self._wait is None or self._wait[0] != self.pos_key():
+                self._wait = (self.pos_key(), now + int(self.move_delay_ms * random.uniform(0.7, 1.3)))
+            if now < self._wait[1]:
+                self.ensure_search()              # keep the search running meanwhile
+                return
         if self.use_search and agent is self.default_ai and self.rules.standard:
             job = self.ensure_search()            # the network, with look-ahead
             if job is None or not job.finished or pygame.time.get_ticks() < self.ai_due:
@@ -2303,6 +2319,7 @@ class App:
                 net = path                                  # a network picked with N
         return {"tier": tier, "net": net, "sound": self.sound_on, "coords": self.coords,
                 "eval": bool(self.show_eval), "search": bool(self.use_search), "think_ms": int(self.think_ms),
+                "move_delay_ms": int(self.move_delay_ms),
                 "moves_mode": self.moves_mode, "move_input": self.move_input, "ai_on": bool(self.ai_on), "ai_sides": sorted(self.ai_sides),
                 "scale": round(float(self.scale), 3),
                 "max_gifts": self.rules.max_gifts, "start_turn": self.rules.start_turn,
@@ -2358,6 +2375,8 @@ class App:
             self.use_search = saved["search"]
         if "think" not in given and isinstance(saved.get("think_ms"), int) and self.searcher is not None:
             self.set_think(max(100, saved["think_ms"]))
+        if "move_delay" not in given and isinstance(saved.get("move_delay_ms"), int):
+            self.set_move_delay(max(0, saved["move_delay_ms"]))
         if saved.get("move_input") in ("both", "click", "drag"):
             self.move_input = saved["move_input"]
         if saved.get("moves_mode") in ("auto", "on", "off"):
@@ -2431,6 +2450,9 @@ class App:
             items.append(it("Think time", enabled=self.think_enabled(), sub=[
                 it(think_label(ms), lambda ms=ms: self.set_think(ms), checked=self.think_ms == ms)
                 for ms in THINK_STEPS]))
+            items.append(it("Move delay", sub=[
+                it("None" if ms == 0 else think_label(ms), lambda ms=ms: self.set_move_delay(ms),
+                   checked=self.move_delay_ms == ms) for ms in MOVE_DELAY_STEPS]))
             items.append(None)
             cap = self.rules.max_gifts
             items.append(it("Gift limit (new game)", sub=[
@@ -3477,6 +3499,9 @@ def main():
     ap.add_argument("--black", default=None, help="human | ai | random | module:function")
     ap.add_argument("--white", default=None, help="human | ai | random | module:function")
     ap.add_argument("--delay", type=int, default=400, help="ms before a computer moves")
+    ap.add_argument("--move-delay", type=int, default=1500, metavar="MS",
+                    help="extra pause (+-30%%) before the computer answers a human, as if thinking "
+                         "(default 1500; 0 = reply at once)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--max-plies", type=int, default=None, help="draw after this many plies")
     ap.add_argument("--ai-max-plies", type=int, default=300,
@@ -3574,7 +3599,7 @@ def main():
               searcher, flipped=args.flip, autosave=args.autosave,
               review_sims=args.review_sims, session=not args.no_resume, scale=args.scale,
               sound=not args.no_sound, coords=not args.no_coords, net_dirs=args.net_dir,
-              auto_orient=not (args.flip or args.fixed_board))
+              auto_orient=not (args.flip or args.fixed_board), move_delay=args.move_delay)
     if args.no_search:
         app.use_search = False
     if not args.no_settings:
@@ -3582,7 +3607,7 @@ def main():
         argv = " ".join(sys.argv[1:])
         given = set()
         for key, flags in (("net", ("--ai ",)), ("sound", ("--no-sound",)), ("coords", ("--no-coords",)),
-                           ("eval", ("--eval",)), ("search", ("--no-search", "--sims")), ("think", ("--think-ms",)),
+                           ("eval", ("--eval",)), ("search", ("--no-search", "--sims")), ("think", ("--think-ms",)), ("move_delay", ("--move-delay",)),
                            ("ai", ("--ai-color", "--no-ai", "--black", "--white")), ("scale", ("--scale",)),
                            ("variant", ("--max-gifts", "--start"))):
             if any(f in argv + " " for f in flags):

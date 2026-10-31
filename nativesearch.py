@@ -121,6 +121,7 @@ class NativeRoot(mcts.Node):
 
 def eligible(searcher, job, root) -> bool:
     return (searcher.native and AVAILABLE and searcher.light and not root.terminal
+            and job.game.rules.standard          # the Rust rules know nothing of the gift limit / custom start
             and job.sweep_k in (None, 0) and len(root.actions) > 0
             and rust_net_for(searcher.advisor) is not None)
 
