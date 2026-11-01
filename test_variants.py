@@ -506,6 +506,99 @@ def test_replayed_move_after_undo_gets_the_same_reply():
     print("ok: after an undo the same move gets the same reply")
 
 
+def test_undo_replay_across_reverse_en_passant():
+    """Reverse en passant gives the mover a second ply in a row.  Undo then replaying the same moves must
+    never leave the game waiting (no lock-up) and must rebuild exactly the same line, whoever played the ep."""
+    rules = Rules(max_plies=300)
+    tried = 0
+    for seed in range(40):
+        rng = random.Random(seed)
+
+        def pick(g):
+            acts = g.legal_actions()
+            return rng.choice([a for a in acts if a.en_passant] or acts)
+
+        app = make_app(rules, ai_on=True)                     # the computer is white, we are black
+        app.agents["w"] = pick
+        app.move_delay_ms = 0
+        while not app.game.done and not (len(app.line) >= 40 and app.agents[app.game.turn] is None):
+            app.play(pick(app.game))
+        if app.game.done or not any(a.en_passant for a in app.line):
+            continue
+        tried += 1
+        line = list(app.line)
+        for _ in range(6):                                    # undo further and further back
+            before = app.pos
+            app.takeback()
+            if app.pos == before:
+                break
+            for _ in range(3 * len(line) + 5):                # now replay the same moves
+                if app.pos == len(line):
+                    break
+                n = app.pos
+                if app.agents[app.game.turn] is None:
+                    app.play(line[n])                         # the human repeats their move
+                else:
+                    app.ai_due = 0
+                    app.update_ai()                           # the computer must repeat its reply
+                assert app.pos > n, "stuck after undo at ply %d (seed %d)" % (n, seed)
+            assert app.line == line and list(app.game.move_log) == line, "replay changed the game (seed %d)" % seed
+    print("ok: undo/replay around reverse en passant (%d games with an ep)" % tried if tried else
+          "note: no random game reached a reverse en passant, so that test checked nothing")
+
+
+def test_move_animation():
+    app = make_app(Rules(max_plies=300))
+    assert not app.animate, "animations are off under the dummy video driver"
+    app.animate, app.anim_ms = True, 300
+    app.play(app.game.legal_actions()[0])
+    a = app.anim
+    assert a is not None and app.animating(), "a move should start an animation"
+    assert app.ai_due >= a["t0"] + a["end"], "the computer waits for the animation"
+    app.draw()                                       # mid-animation drawing works
+    assert app.animation_hidden(), "the moving piece is drawn by the animation, not the board"
+    a["t0"] -= 10000                                 # fast-forward
+    assert not app.animating() and not app.animation_hidden()
+    app.draw()
+    app.play(app.game.legal_actions()[0])
+    assert app.anim is not None
+    app.takeback()
+    assert app.anim is None, "stepping back drops the animation"
+    app.animate = False
+    app.play(app.game.legal_actions()[0])
+    assert app.anim is None, "no animation when switched off"
+    app.animate = True
+    app.dropping = True                              # a dragged piece is not slid again
+    app.play(app.game.legal_actions()[0])
+    assert app.anim is None or all(item[0] != "slide" or item[1] != app.game.last_move.team
+                                   for item in app.anim["items"]), "a dropped piece must not glide"
+    app.dropping = False
+    app.toggle_animate()
+    assert not app.animate and app.anim is None
+    print("ok: move animations")
+
+
+def test_reverse_en_passant_animation():
+    from types import SimpleNamespace as NS
+    app = make_app(Rules(max_plies=300))
+    app.animate, app.anim_ms = True, 300
+    # a stand-in for the Move a reverse en passant leaves behind (the real thing needs a special position)
+    app.game.last_move = NS(team="w", mover_ptype="n", src=(6, 1), dst=(4, 2), partner=None, partner_src=None,
+                            spawn=NS(team="b", ptype="p"), spawn_pos=(1, 1), extra_turn=True)
+    app.start_animation()
+    kinds = [item[0] for item in app.anim["items"]]
+    assert kinds[0] == "slide" and "fly" in kinds and "ring" in kinds and kinds[-1] == "banner", kinds
+    assert app.animation_hidden() == {(4, 2), (1, 1)}, "the mover and the flying pawn are drawn by the animation"
+    app.draw()
+    for item in app.anim["items"]:                    # draw at several moments, including the banner's
+        app.anim["t0"] = pygame.time.get_ticks() - (item[5] + item[6]) // 2
+        app.draw()
+    assert app.anim["end"] == max(item[6] for item in app.anim["items"]), "the computer waits for the caption too"
+    app.anim["t0"] -= 10000
+    assert not app.animating() and not app.animation_hidden()
+    print("ok: reverse en passant animation")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):

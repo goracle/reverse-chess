@@ -93,7 +93,7 @@ Game history (the third column)
 
 Play feel and window
 --------------------
-* C = rank / file labels (flip-aware), U = move sounds, N = pick another network file for the AI
+* C = rank / file labels (flip-aware), U = move sounds, G = move animations (View > Animation speed), N = pick another network file for the AI
   (next to play.py, runs/*/, nets/, --net-dir), Ctrl +/- / Ctrl+0 / Ctrl+1 = window size (also --scale).
 * Move menu: keys 1-9, Up / Down + Enter, Backspace.  Shift+click on the destination confirms even a
   single-variant move.  The highlighted option's gift is ghosted on the board.
@@ -153,6 +153,7 @@ ROW_H = 20
 EVAL_COL_W = 34                  # the little eval bar at the right of each move-list row
 MAX_VARIATIONS = 12              # side lines kept by the variation stack (Tab)
 THINK_STEPS = (100, 250, 500, 1000, 2500, 5000, 10000, 20000)   # ms: the AI think-time slider's stops
+ANIM_SPEEDS = ((250, "Fast"), (450, "Normal"), (800, "Slow"), (1300, "Very slow"))   # ms a piece takes to glide
 MOVE_DELAY_STEPS = (0, 500, 1000, 1500, 2500, 4000)             # ms: Game > Move delay (the "pretend to think" pause)
 PICK_ROWS = 14                   # rows of the network picker that show at once
 PREMOVE_COLOUR = (70, 140, 255, 200)
@@ -556,7 +557,7 @@ class App:
     def __init__(self, rules, delay_ms, rng, advisor, ai_note, custom, ai_on, ai_sides,
                  stats, show_eval, searcher=None, flipped=False, autosave=False,
                  review_sims=0, session=False, scale=None, sound=True, coords=True, net_dirs=(),
-                 auto_orient=True, tall=False, move_delay=0):
+                 auto_orient=True, tall=False, move_delay=0, animate=True):
         pygame.init()
         pygame.display.set_caption("Reverse Chess")
         self.setup = None             # the custom-start editor (Game > Start position), see open_setup
@@ -621,6 +622,12 @@ class App:
         self.load_index = -1          # which saved game the Load button opened last
         self.coords = coords          # rank / file labels on the board edge (C)
         self.sound_on = sound         # move sounds (U)
+        # Moves glide and gifts fade in (G).  Off under the headless 'dummy' video driver, so the tests
+        # (which have no clock to wait on) never find the computer held back by an animation.
+        self.animate = bool(animate) and pygame.display.get_driver() != "dummy"
+        self.anim_ms = 450            # how long a piece takes to glide (View > Animation speed)
+        self.anim = None              # the animation in progress, see start_animation
+        self._anim_elapsed = None     # ms into it for the frame being drawn
         self.sounds = None            # built on first use (synth_sounds); {} = no audio
         self.net_dirs = list(net_dirs)
         self.picker = None            # the open network picker (N), see open_picker
@@ -879,6 +886,116 @@ class App:
     # -- board coordinates, sound, think time ----------------------------------
     def toggle_coords(self):
         self.coords = not self.coords
+
+    # -- move animation (G) ---------------------------------------------------
+    def toggle_animate(self):
+        self.animate = not self.animate
+        self.anim = None
+        self.message = ""
+
+    def set_anim_ms(self, ms):
+        self.anim_ms = ms
+
+    def start_animation(self):
+        """Called right after a move: the pieces that moved glide from their old squares, and a gifted
+        piece fades in on its square.  The move itself is already made; this is only how it is drawn.
+        The computer's next move waits until the animation is over."""
+        self.anim = None
+        mv = self.game.last_move
+        if not self.animate or mv is None:
+            return
+        slide = max(60, int(self.anim_ms))
+        items = []     # (kind, team, ptype, square, to-square, start ms, end ms)
+        if not self.dropping and mv.src != mv.dst:        # a dragged piece is already where it was dropped
+            items.append(("slide", mv.team, mv.mover_ptype, mv.src, mv.dst, 0, slide))
+        if mv.partner is not None and mv.partner_src is not None and mv.partner_src != mv.partner.pos:
+            items.append(("slide", mv.partner.team, mv.partner.ptype, mv.partner_src, mv.partner.pos, 0, slide))
+        lands = slide if items else 0
+        start = int(lands * 0.85)
+        if mv.spawn is not None and mv.extra_turn:
+            # Reverse en passant: the piece lands, the gifted pawn is handed back on the square it left and
+            # flies to its home row, a ring marks where it settles, and a caption says the same side moves
+            # again (otherwise the other team seems to move twice for no reason).
+            fly_end = start + max(500, slide)
+            items.append(("fly", mv.spawn.team, mv.spawn.ptype, mv.src, mv.spawn_pos, start, fly_end))
+            items.append(("ring", mv.spawn.team, None, mv.spawn_pos, None, fly_end - 150, fly_end + 450))
+        elif mv.spawn is not None:                        # the piece lands, then the gift is handed back
+            items.append(("appear", mv.spawn.team, mv.spawn.ptype, mv.spawn_pos, None,
+                          start, start + max(250, (slide * 7) // 10)))
+        if mv.extra_turn:
+            items.append(("banner", mv.team, None, None, None, start, max(i[6] for i in items) + 700 if items else start + 1500))
+        if not items:
+            return
+        now = pygame.time.get_ticks()
+        end = max(item[6] for item in items)
+        self.anim = {"key": self.pos_key(), "t0": now, "items": items, "end": end}
+        self.ai_due = max(self.ai_due, now + end)
+
+    def live_animation(self):
+        """The animation in progress, or None (it is dropped once it is over or the position has changed)."""
+        a = self.anim
+        if a is None:
+            return None
+        if a["key"] != self.pos_key() or pygame.time.get_ticks() - a["t0"] >= a["end"]:
+            self.anim = None
+            return None
+        return a
+
+    def animating(self):
+        return self.live_animation() is not None
+
+    def animation_hidden(self):
+        """Squares whose piece the animation is drawing for now instead of the board.  This also takes the
+        frame's one clock reading (draw_animation must use the same one, or a piece can be drawn by both
+        the board and the animation, or by neither, for a frame)."""
+        a = self.live_animation()
+        self._anim_elapsed = None if a is None else pygame.time.get_ticks() - a["t0"]
+        if a is None:
+            return ()
+        return {(item[4] if item[0] in ("slide", "fly") else item[3]) for item in a["items"]
+                if item[0] not in ("ring", "banner") and self._anim_elapsed < item[6]}
+
+    def draw_animation(self):
+        a, elapsed = self.anim, self._anim_elapsed
+        if a is None or elapsed is None:
+            return
+        base = SQ - 12
+        for kind, team, ptype, p, q, t0, t1 in a["items"]:
+            if elapsed >= t1:                              # over: the board draws this piece now
+                continue
+            t = max(0.0, min(1.0, (elapsed - t0) / float(max(1, t1 - t0))))
+            sprite = self.sprite(team, ptype, base) if ptype is not None else None
+            if kind == "slide":
+                e = t * t * (3 - 2 * t)                    # ease in and out
+                (x0, y0), (x1, y1) = self.sq_xy(*p), self.sq_xy(*q)
+                self.screen.blit(sprite, (int(x0 + (x1 - x0) * e) + 6, int(y0 + (y1 - y0) * e) + 6))
+            elif kind == "fly" and elapsed >= t0:          # the gifted pawn: appears, then glides home
+                e = max(0.0, (t - 0.2) / 0.8)
+                e = e * e * (3 - 2 * e)
+                (x0, y0), (x1, y1) = self.sq_xy(*p), self.sq_xy(*q)
+                fade = sprite.copy()
+                fade.set_alpha(int(255 * min(1.0, t * 5)))
+                self.screen.blit(fade, (int(x0 + (x1 - x0) * e) + 6, int(y0 + (y1 - y0) * e) + 6))
+            elif kind == "appear" and elapsed >= t0:       # a gift: grows and fades in on its square
+                size = max(8, int(base * (0.6 + 0.4 * t)))
+                pop = pygame.transform.smoothscale(sprite, (size, size))
+                pop.set_alpha(int(255 * min(1.0, t * 1.5)))
+                x, y = self.sq_xy(*p)
+                self.screen.blit(pop, (x + (SQ - size) // 2, y + (SQ - size) // 2))
+            elif kind == "ring" and elapsed >= t0:         # a ring spreading from where the pawn settled
+                x, y = self.sq_xy(*p)
+                ring = pygame.Surface((SQ * 2, SQ * 2), pygame.SRCALPHA)
+                pygame.draw.circle(ring, (230, 190, 40, int(220 * (1.0 - t))), (SQ, SQ),
+                                   int(SQ * (0.25 + 0.55 * t)), 5)
+                self.screen.blit(ring, (x - SQ // 2, y - SQ // 2))
+            elif kind == "banner" and elapsed >= t0:       # the same side moves again
+                text = "Reverse en passant: %s moves again" % full_name(team).capitalize()
+                label = self.font.render(text, True, (255, 255, 255))
+                box = pygame.Surface((label.get_width() + 28, label.get_height() + 14), pygame.SRCALPHA)
+                pygame.draw.rect(box, (20, 20, 20, 225), box.get_rect(), border_radius=8)
+                box.blit(label, (14, 7))
+                box.set_alpha(int(255 * max(0.0, min(1.0, t / 0.12, (1.0 - t) / 0.2))))
+                self.screen.blit(box, ((BOARD_PX - box.get_width()) // 2, BOARD_Y + 8))
 
     def toggle_sound(self):
         if self.sound_on:
@@ -1377,6 +1494,7 @@ class App:
                 self.cancel_keep_message()
                 self.reindex()
                 self.ai_due = pygame.time.get_ticks() + self.delay_ms
+                self.start_animation()
                 return
             if self.pos < len(self.line):      # a different move from an earlier position
                 self.stash_line(self.pos)      # the old line is kept (Tab brings it back)
@@ -1390,6 +1508,7 @@ class App:
         self.cancel_keep_message()
         self.reindex()
         self.ai_due = pygame.time.get_ticks() + self.delay_ms
+        self.start_animation()
         self.save_session()
         if self.game.done:
             self.record_finished()
@@ -1421,6 +1540,7 @@ class App:
         n = max(0, min(len(self.line), n))
         if n == self.pos:
             return
+        self.anim = None
         self.stop_search()
         self.hint = None
         self.clear_premove()
@@ -2059,6 +2179,8 @@ class App:
             self.open_picker()
         elif key == pygame.K_u and not ctrl:
             self.toggle_sound()
+        elif key == pygame.K_g and not ctrl:
+            self.toggle_animate()
         elif key == pygame.K_m:
             self.next_mistake(-1 if mod & pygame.KMOD_SHIFT else 1)
         elif key == pygame.K_v:
@@ -2258,7 +2380,7 @@ class App:
             return
         agent = self.agents[game.turn]
         if agent is None:                         # a human's turn: think ahead for the eval bar / hint
-            if self.premove is not None and not self.browsing and self.pending is None:
+            if self.premove is not None and not self.browsing and self.pending is None and not self.animating():
                 self.run_premove()
                 return
             if self.show_eval or self.current_hint() is not None:
@@ -2340,6 +2462,7 @@ class App:
             if path and os.path.realpath(path) != os.path.realpath(getattr(self.home_advisor, "path", "") or ""):
                 net = path                                  # a network picked with N
         return {"tier": tier, "net": net, "sound": self.sound_on, "coords": self.coords,
+                "animate": bool(self.animate), "anim_ms": int(self.anim_ms),
                 "eval": bool(self.show_eval), "search": bool(self.use_search), "think_ms": int(self.think_ms),
                 "move_delay_ms": int(self.move_delay_ms),
                 "moves_mode": self.moves_mode, "move_input": self.move_input, "ai_on": bool(self.ai_on), "ai_sides": sorted(self.ai_sides),
@@ -2391,6 +2514,10 @@ class App:
             self.sound_on = saved["sound"]
         if "coords" not in given and isinstance(saved.get("coords"), bool):
             self.coords = saved["coords"]
+        if "animate" not in given and isinstance(saved.get("animate"), bool):
+            self.animate = saved["animate"] and pygame.display.get_driver() != "dummy"
+        if isinstance(saved.get("anim_ms"), int) and 50 <= saved["anim_ms"] <= 5000:
+            self.anim_ms = saved["anim_ms"]
         if "eval" not in given and saved.get("eval") and self.advisor is not None:
             self.show_eval = True
         if "search" not in given and isinstance(saved.get("search"), bool) and self.searcher is not None:
@@ -2506,7 +2633,11 @@ class App:
                     it("Play the network's move", self.play_network_move, "P", enabled=have_ai)]
         if title == "View":
             return [it("Coordinates", self.toggle_coords, "C", checked=self.coords),
-                    it("Sound", self.toggle_sound, "U", checked=self.sound_on), None,
+                    it("Sound", self.toggle_sound, "U", checked=self.sound_on),
+                    it("Animations", self.toggle_animate, "G", checked=self.animate),
+                    it("Animation speed", sub=[
+                        it(label, lambda ms=ms: self.set_anim_ms(ms), checked=self.anim_ms == ms)
+                        for ms, label in ANIM_SPEEDS]), None,
                     it("Move list", sub=[
                         it("Automatic (review mode)", lambda: self.set_moves_mode('auto'), checked=self.moves_mode == 'auto'),
                         it("Always show", lambda: self.set_moves_mode('on'), checked=self.moves_mode == 'on'),
@@ -2760,7 +2891,7 @@ class App:
             ("SAVE, SHARE & DISPLAY", [
                 "Ctrl+S saves; Ctrl+O loads. Repeated Load cycles through saved games. Drop a .json file onto the window to open it.",
                 "Ctrl+C copies the move list; Ctrl+Shift+C copies game JSON; Ctrl+V pastes either format.",
-                "Ctrl++ / Ctrl+- resize; Ctrl+0 fits the screen; Ctrl+1 sets 100%. C toggles coordinates; U toggles sounds. View > Move list: the move column shows by itself in review mode.",
+                "Ctrl++ / Ctrl+- resize; Ctrl+0 fits the screen; Ctrl+1 sets 100%. C toggles coordinates; U toggles sounds; G toggles move animations. View > Move list: the move column shows by itself in review mode.",
                 "The side panel shows home pieces and off-board pieces that can be returned as gifts. Grey locks are permanent; orange locks are temporary.",
             ]),
         ]
@@ -2871,6 +3002,7 @@ class App:
         last = game.last_move
         dests = {a.dst for a in self.by_src.get(self.selected, [])}
         movable = self.human_to_move()
+        hidden = self.animation_hidden()          # squares the animation is drawing the piece of
         for r in range(SIZE):
             for c in range(SIZE):
                 x, y = self.sq_xy(r, c)
@@ -2882,7 +3014,7 @@ class App:
                     colour = SELECT
                 pygame.draw.rect(self.screen, colour, rect)
                 piece = game.board[r, c]
-                if piece is not None and not (self.dragging and (r, c) == self.drag_src):
+                if piece is not None and (r, c) not in hidden and not (self.dragging and (r, c) == self.drag_src):
                     self.screen.blit(self.sprite(piece.team, piece.ptype, SQ - 12), (x + 6, y + 6))
                     if piece.promoted:   # a pawn wearing another piece's type
                         centre = (x + SQ - 18, y + 18)
@@ -2897,6 +3029,7 @@ class App:
                     pygame.draw.rect(self.screen, MOVABLE, rect, 4)
                 if (r, c) in dests:
                     pygame.draw.circle(self.screen, DOT, rect.center, 11)
+        self.draw_animation()
 
     def draw_promo_badge(self, cx, cy, radius=12):
         """The gold 'P' marking a promoted piece (a pawn wearing another piece's type)."""
@@ -3554,6 +3687,7 @@ def main():
                     help="window size as a multiple of 1114 x 914, 1334 x 914 in review mode (default: whatever fits the screen, at most 1; "
                          "Ctrl +/- change it, and the window can be dragged to any size)")
     ap.add_argument("--no-sound", action="store_true", help="start with the move sounds off (U toggles)")
+    ap.add_argument("--no-animate", action="store_true", help="start with the move animations off (G toggles)")
     ap.add_argument("--no-coords", action="store_true", help="start without rank / file labels on the board (C toggles)")
     ap.add_argument("--net-dir", action="append", default=[], metavar="DIR",
                     help="another folder of network files for the picker (N); may be repeated.  The picker also "
@@ -3620,7 +3754,7 @@ def main():
     app = App(rules, args.delay, rng, advisor, ai_note, custom, ai_on, sides, stats, args.eval,
               searcher, flipped=args.flip, autosave=args.autosave,
               review_sims=args.review_sims, session=not args.no_resume, scale=args.scale,
-              sound=not args.no_sound, coords=not args.no_coords, net_dirs=args.net_dir,
+              sound=not args.no_sound, coords=not args.no_coords, net_dirs=args.net_dir, animate=not args.no_animate,
               auto_orient=not (args.flip or args.fixed_board), move_delay=args.move_delay)
     if args.no_search:
         app.use_search = False
@@ -3628,7 +3762,7 @@ def main():
         app.settings_path = args.settings or os.path.join(os.path.dirname(stats_default_path()), "settings.json")
         argv = " ".join(sys.argv[1:])
         given = set()
-        for key, flags in (("net", ("--ai ",)), ("sound", ("--no-sound",)), ("coords", ("--no-coords",)),
+        for key, flags in (("net", ("--ai ",)), ("sound", ("--no-sound",)), ("animate", ("--no-animate",)), ("coords", ("--no-coords",)),
                            ("eval", ("--eval",)), ("search", ("--no-search", "--sims")), ("think", ("--think-ms",)), ("move_delay", ("--move-delay",)),
                            ("ai", ("--ai-color", "--no-ai", "--black", "--white")), ("scale", ("--scale",)),
                            ("variant", ("--max-gifts", "--start"))):
@@ -3679,7 +3813,7 @@ def main():
         app.menu_hover()
         app.draw()
         app.present()
-        clock.tick(30)
+        clock.tick(60 if app.animating() else 30)
     app.save_settings(force=True)
     pygame.quit()
 
