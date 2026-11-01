@@ -586,6 +586,7 @@ class App:
         self.delay_ms = delay_ms
         self.move_delay_ms = max(0, int(move_delay))   # extra pause before the computer answers a human (jittered)
         self._wait = None             # (pos_key, due tick): the pause for the position the computer is to move in
+        self.follow_key = None        # pos_key at which the computer may play its recorded reply while browsing
         self.rng = rng
         self.advisor = advisor        # numpy_net.Advisor or None (no AI file)
         self.home_advisor = advisor
@@ -1369,6 +1370,10 @@ class App:
                 # the move that is already next in the line: nothing branches, nothing is lost
                 self.pos += 1
                 self.moves_top = None
+                # A computer is up and its reply is already in the line: update_ai() lets it play that
+                # same reply (after the move delay) instead of waiting for a Redo.
+                self.follow_key = (self.pos_key() if self.pos < len(self.line) and not self.game.done
+                                   and self.agents[self.game.turn] is not None else None)
                 self.cancel_keep_message()
                 self.reindex()
                 self.ai_due = pygame.time.get_ticks() + self.delay_ms
@@ -1439,11 +1444,18 @@ class App:
         if self.pos == 0:
             self.message = "Nothing to take back."
             return
-        target = self.pos - 1
+        target = None
         for n in range(self.pos - 1, -1, -1):
             if self.agents[self.turns[n]] is None:
                 target = n
                 break
+        if target is None:
+            if any(a is None for a in self.agents.values()):
+                # no human move to take back (the computer opened): stepping back one ply would land
+                # on the computer's turn while browsing, where nothing can move
+                self.message = "Nothing to take back."
+                return
+            target = self.pos - 1             # no human side at all: just step back
         self.jump(target)
         self.message = "Taken back; Right / End bring the moves back, a new move starts another line (Tab)."
 
@@ -2252,7 +2264,8 @@ class App:
             if self.show_eval or self.current_hint() is not None:
                 self.ensure_analysis(1800)
             return
-        if self.browsing:                         # looking at an earlier position: the computer waits
+        replaying = self.browsing and self.follow_key == self.pos_key()
+        if self.browsing and not replaying:       # looking at an earlier position: the computer waits
             return
         if self.move_delay_ms and self.agents[other_team(game.turn)] is None:
             # Against a human, hold the reply back as if the computer were thinking about it (the pause
@@ -2261,8 +2274,17 @@ class App:
             if self._wait is None or self._wait[0] != self.pos_key():
                 self._wait = (self.pos_key(), now + int(self.move_delay_ms * random.uniform(0.7, 1.3)))
             if now < self._wait[1]:
-                self.ensure_search()              # keep the search running meanwhile
+                if not replaying:
+                    self.ensure_search()          # keep the search running meanwhile
                 return
+        if replaying:                             # the human replayed their move: the computer repeats its reply
+            if pygame.time.get_ticks() < self.ai_due:
+                return
+            action = self.line[self.pos]
+            self.follow_key = None
+            if action in game.actions:
+                self.play(action)
+            return
         if self.use_search and agent is self.default_ai and self.rules.standard:
             job = self.ensure_search()            # the network, with look-ahead
             if job is None or not job.finished or pygame.time.get_ticks() < self.ai_due:

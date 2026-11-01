@@ -481,6 +481,31 @@ def test_move_delay_holds_back_the_reply():
     print("ok: the computer pauses before answering a human")
 
 
+def test_replayed_move_after_undo_gets_the_same_reply():
+    app = make_app(Rules(max_plies=300), ai_on=True)          # the computer is white, we are black
+    app.agents["w"] = lambda g: g.legal_actions()[0]
+    app.move_delay_ms = 0
+    app.play(app.game.legal_actions()[0])                     # white (the computer) opens
+    mine = app.game.legal_actions()[0]
+    app.play(mine)                                            # black (the human)
+    reply = app.game.legal_actions()[0]
+    app.play(reply)                                           # white's reply
+    app.takeback()
+    assert app.pos == 1, "Undo takes back the move and the reply"
+    app.play(mine)                                            # the same move again
+    assert app.pos == 2 and app.browsing
+    app.ai_due = 0
+    app.update_ai()
+    assert app.pos == 3 and app.line[2] == reply, "the computer should repeat its recorded reply"
+    # the computer opening and nothing of ours to take back
+    app = make_app(Rules(max_plies=300), ai_on=True)
+    app.agents["w"] = lambda g: g.legal_actions()[0]
+    app.play(app.game.legal_actions()[0])
+    app.takeback()
+    assert app.pos == 1 and "Nothing" in app.message, "no lock-up on the computer's turn"
+    print("ok: after an undo the same move gets the same reply")
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_") and callable(fn):
