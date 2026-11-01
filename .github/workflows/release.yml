@@ -18,7 +18,7 @@ jobs:
         include:
           - { os: ubuntu-22.04,    name: linux-x64 }
           - { os: windows-latest,  name: windows-x64 }
-          - { os: macos-14,        name: macos-arm64 }       # Apple Silicon
+          - { os: macos-15,        name: macos-arm64 }       # Apple Silicon
           - { os: macos-15-intel,  name: macos-intel }       # Intel Macs
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -30,9 +30,9 @@ jobs:
       SDL_AUDIODRIVER: dummy
       RC_SELFTEST_LOG: ${{ github.workspace }}/selftest.txt
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -108,7 +108,7 @@ jobs:
           esac
           ls -l out
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: ReverseChess-${{ matrix.name }}
           path: out/*
@@ -118,7 +118,7 @@ jobs:
     needs: build
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           path: out
           merge-multiple: true
